@@ -4,12 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "minimal"
-path = "src/minimal.rs"
-
-[[bin]]
 name = "full"
 path = "src/full.rs"
+required-features = ["s3"]
 
 [dependencies]
 gen-server = { path = "./packages/gen-server", features = ["conversion"] }
@@ -22,14 +19,11 @@ tower-http = { version = "0.6", features = ["compression-full", "cors"] }
 
 tokio = { version = "1", features = ["full"] }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
-
 reqwest = { version = "0.12", features = ["json", "stream"] } # stream for efficient downloads
 image = "0.25" # Core image processing
 
-aws-config = "1.1" # AWS SDK configuration (for MinIO)
-aws-sdk-s3 = "1.16" # AWS S3 client (MinIO compatible)
+aws-config = { version = "1.6", optional = true } # AWS SDK configuration (for MinIO)
+aws-sdk-s3 = { version = "1.90", optional = true } # AWS S3 client (MinIO compatible)
 
 cuid2 = { version = "0" }
 
@@ -63,3 +57,8 @@ inherits = "release"
 lto = true
 opt-level = "z"
 codegen-units = 1
+
+[features]
+default = []
+local_fs = []
+s3 = ["aws-sdk-s3", "aws-config"]

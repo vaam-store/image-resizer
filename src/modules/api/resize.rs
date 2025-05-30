@@ -15,6 +15,7 @@ impl Image for ApiService {
         query_params: &ResizeAnImageQueryParams,
     ) -> Result<ResizeAnImageResponse, ()> {
         let url = self.resize_service.resize(query_params).await;
+        
         match url {
             Ok(url) => Ok(
                 ResizeAnImageResponse::Status302_TheImageWasResizeAndInTheLocationYou {
