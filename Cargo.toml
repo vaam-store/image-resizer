@@ -3,17 +3,40 @@ name = "image-resize"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "minimal"
+path = "src/minimal.rs"
+
+[[bin]]
+name = "full"
+path = "src/full.rs"
+
 [dependencies]
-axum = { version = "0.8" , features = ["macros"]}
-tokio = { version = "1", features = ["full"] } # "full" for convenience; in prod, pick specific features.
+gen-server = { path = "./packages/gen-server", features = ["conversion"] }
+
+axum = { version = "0.8", features = ["tracing", "tokio", "macros"] }
+axum-extra = { version = "0.10", features = ["cookie", "multipart"] }
+axum-otel-metrics = { version = "0.11" }
+axum-tracing-opentelemetry = { version = "0.25" }
+tower-http = { version = "0.6", features = ["compression-full", "cors"] }
+
+tokio = { version = "1", features = ["full"] }
+
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
 reqwest = { version = "0.12", features = ["json", "stream"] } # stream for efficient downloads
 image = "0.25" # Core image processing
+
 aws-config = "1.1" # AWS SDK configuration (for MinIO)
 aws-sdk-s3 = "1.16" # AWS S3 client (MinIO compatible)
-dotenvy = "0.15" # Load environment variables from .env
-uuid = { version = "1", features = ["v4", "serde"] } # Generate unique IDs for filenames
-anyhow = "1.0" # An ergonomic error handling crate, useful with .context()
+
+cuid2 = { version = "0" }
+
+envconfig = { version = "0" }
+derive_builder = { version = "0" }
+anyhow = { version = "1" }
+thiserror = { version = "2" }
 
 # For input validation
 validator = { version = "0", features = ["derive"] }
@@ -25,22 +48,18 @@ hex = "0.4"
 # For async traits
 async-trait = "0.1" # Required for async methods in traits
 
-# For serving static files if using LocalFS
-tower-http = { version = "0", features = ["fs"] } # For ServeDir
+opentelemetry = { version = "0.29" }
+opentelemetry-otlp = { version = "0.29", features = ["tokio", "metrics", "trace", "grpc-tonic", "gzip-tonic"] }
+opentelemetry_sdk = { version = "0.29", features = ["tokio", "metrics", "rt-tokio", "trace"] }
+opentelemetry-prometheus = { version = "0" }
+tracing-subscriber = { version = "0", features = ["env-filter", "fmt"] }
+tracing-opentelemetry = "0.30"
+tracing = { version = "0", features = ["attributes"] }
+prometheus = { version = "0" }
 
-# Telemetry: Structured Logging
-tracing = { version = "0", features = ["default", "async-await"] }
-tracing-subscriber = { version = "0", features = ["env-filter", "json"] } # json for structured logs
 
-# Telemetry: Metrics
-metrics = { version = "0" } # Core metrics library
-metrics-exporter-prometheus = { version = "0" } # Prometheus exporter for metrics
-
-# Telemetry: Distributed Tracing
-opentelemetry = { version = "0", features = ["metrics"] }
-opentelemetry_sdk = { version = "0", features = ["trace", "metrics", "rt-tokio"] }
-opentelemetry-stdout = { version = "0" } # For printing traces to stdout (dev/debug)
-# opentelemetry-jaeger = { version = "0.21", features = ["rt-tokio"] } # For Jaeger exporter (prod)
-opentelemetry-otlp = { version = "0", features = ["tokio", "grpc-tonic", "gzip-tonic"] }
-tonic = "0.13.1"
-thiserror = "1.0.69"
+[profile.prod]
+inherits = "release"
+lto = true
+opt-level = "z"
+codegen-units = 1

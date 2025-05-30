@@ -14,8 +14,6 @@ use std::{env, io::Cursor, net::SocketAddr, path::PathBuf, sync::Arc};
 use validator::Validate;
 
 // Telemetry
-use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator};
 use tracing::{Level, debug, error, info, instrument, span};
@@ -29,13 +27,6 @@ use sha2::{Digest, Sha256};
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
-use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::{
-    Compression, LogExporter, Protocol, SpanExporter, SpanExporterBuilder, WithExportConfig,
-    WithTonicConfig,
-};
-use opentelemetry_sdk::trace::SdkTracerProvider;
-// For static file serving if using LocalFS
 use tower_http::services::ServeDir;
 
 // --- 1. Query Parameters Struct with Validation ---
@@ -256,8 +247,6 @@ impl IntoResponse for AppError {
 // --- 5. Main Function and Server Setup ---
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
-    dotenvy::dotenv().ok(); // Load .env file if it exists
-
     // Initialize Telemetry
     init_telemetry().expect("Failed to initialize telemetry");
     info!("Starting image resizer server...");
@@ -373,91 +362,12 @@ async fn main() -> Result<(), AppError> {
     Ok(())
 }
 
-// --- Telemetry Initialization Functions ---
-fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
-    // Tracing (logging) with JSON format
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer().json()) // Output logs as JSON
-        .init();
-
-    let mut metadata = tonic::metadata::MetadataMap::new();
-    metadata.insert("x-header-key", "header-value".parse().unwrap());
-    let otlp_exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_compression(Compression::Gzip)
-        .with_endpoint(format!("http://{}", "0.0.0.0:4317"))
-        .with_metadata(metadata)
-        .build()?;
-
-    let tracer_provider = SdkTracerProvider::builder()
-        .with_batch_exporter(otlp_exporter)
-        .build();
-
-    let _ = tracer_provider.tracer("image-resizer");
-    global::set_tracer_provider(tracer_provider);
-    global::set_text_map_propagator(TraceContextPropagator::new()); // Enable trace context propagation
-    Ok(())
-}
-
-fn register_metrics() {
-    // Register common metrics at startup
-    describe_counter!(
-        "image_resize_requests_total",
-        "Total number of image resize requests received"
-    );
-    describe_counter!(
-        "image_resize_errors_total",
-        "Total number of errors during image resize requests"
-    );
-    describe_counter!(
-        "image_cache_hits_total",
-        "Total number of image resize cache hits"
-    );
-    describe_counter!(
-        "image_cache_misses_total",
-        "Total number of image resize cache misses"
-    );
-    describe_histogram!(
-        "image_download_duration_seconds",
-        "Duration of image download in seconds"
-    );
-    describe_histogram!(
-        "image_process_duration_seconds",
-        "Duration of image processing in seconds"
-    );
-    describe_histogram!(
-        "image_upload_duration_seconds",
-        "Duration of image upload in seconds"
-    );
-    describe_gauge!(
-        "active_requests",
-        "Number of currently active image resize requests"
-    );
-}
-
-async fn metrics_handler() -> impl IntoResponse {
-    let builder = PrometheusBuilder::new();
-    let recorder = builder.build_recorder();
-    let _ = metrics::set_default_local_recorder(&recorder);
-
-    let metrics_string = recorder.handle().render();
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        metrics_string,
-    )
-}
-
 // --- 6. The Main Resize Handler --
-#[tracing::instrument(skip(state), fields(request_id = %uuid::Uuid::new_v4()))]
+// Simplified handler function
 async fn resize_handler(
     State(state): State<AppState>,
     Query(mut params): Query<ResizeParams>,
-) -> Result<impl IntoResponse, impl IntoResponse> {
-    // Changed return type
+) -> axum::response::Response {
     counter!("image_resize_requests_total").increment(1); // Increment total requests counter
     gauge!("active_requests").increment(1); // Increment active requests
 
@@ -469,7 +379,14 @@ async fn resize_handler(
 
     // 6.1. Input Validation
     let validation_span = span!(Level::DEBUG, "input_validation").entered();
-    params.validate()?; // Perform validation after capping
+    if let Err(e) = params.validate() {
+        drop(validation_span);
+        let error_msg = format!("Input validation failed: {:?}", e);
+        error!("{}", error_msg);
+        counter!("image_resize_errors_total", "type" => "validation_failed").increment(1);
+        gauge!("active_requests").decrement(1);
+        return (StatusCode::BAD_REQUEST, error_msg).into_response();
+    }
     drop(validation_span);
     debug!("Input parameters validated (capped): {:?}", params);
 
@@ -495,7 +412,7 @@ async fn resize_handler(
             counter!("image_cache_hits_total").increment(1);
             gauge!("active_requests").decrement(1); // Decrement active requests
             let cdn_url = format!("{}/{}", state.cdn_base_url.trim_end_matches('/'), cache_key);
-            return Ok(Redirect::to(&cdn_url));
+            return Redirect::to(&cdn_url).into_response();
         }
         Ok(false) => {
             info!(
@@ -515,9 +432,17 @@ async fn resize_handler(
     // 6.4. Download Image
     let download_timer = std::time::Instant::now();
     let download_span = span!(Level::DEBUG, "download_image", url = %params.url).entered();
-    let response = reqwest::get(&params.url)
-        .await
-        .context("Failed to initiate image download")?;
+    let response = match reqwest::get(&params.url).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let error_msg = format!("Failed to initiate image download: {}", e);
+            error!("{}", error_msg);
+            counter!("image_resize_errors_total", "type" => "download_failed").increment(1);
+            gauge!("active_requests").decrement(1);
+            return (StatusCode::BAD_GATEWAY, error_msg).into_response();
+        }
+    };
+
     if !response.status().is_success() {
         let status = response.status();
         let error_msg = format!(
@@ -526,13 +451,19 @@ async fn resize_handler(
         );
         error!("{}", error_msg);
         counter!("image_resize_errors_total", "type" => "download_failed").increment(1);
-        gauge!("active_requests").decrement(1); // Decrement active requests
-        return Err(AppError::Anyhow(anyhow::anyhow!(error_msg)));
+        gauge!("active_requests").decrement(1);
+        return (StatusCode::BAD_GATEWAY, error_msg).into_response();
     }
-    let image_bytes = response
-        .bytes()
-        .await
-        .context("Failed to read image bytes")?;
+    let image_bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let error_msg = format!("Failed to read image bytes: {}", e);
+            error!("{}", error_msg);
+            counter!("image_resize_errors_total", "type" => "download_failed").increment(1);
+            gauge!("active_requests").decrement(1);
+            return (StatusCode::BAD_GATEWAY, error_msg).into_response();
+        }
+    };
     drop(download_span);
     histogram!("image_download_duration_seconds").record(download_timer.elapsed().as_secs_f64());
     info!("Image downloaded, {} bytes", image_bytes.len());
@@ -540,7 +471,16 @@ async fn resize_handler(
     // 6.5. Decode and Process Image
     let process_timer = std::time::Instant::now();
     let process_span = span!(Level::DEBUG, "process_image").entered();
-    let img = image::load_from_memory(&image_bytes).context("Failed to decode image")?;
+    let img = match image::load_from_memory(&image_bytes) {
+        Ok(img) => img,
+        Err(e) => {
+            let error_msg = format!("Failed to decode image: {}", e);
+            error!("{}", error_msg);
+            counter!("image_resize_errors_total", "type" => "image_decode_failed").increment(1);
+            gauge!("active_requests").decrement(1);
+            return (StatusCode::UNPROCESSABLE_ENTITY, error_msg).into_response();
+        }
+    };
     debug!(
         "Image decoded. Original dimensions: {}x{}",
         img.width(),
@@ -570,15 +510,21 @@ async fn resize_handler(
             // This case should ideally be caught by `validate_format` earlier
             counter!("image_resize_errors_total", "type" => "invalid_format_encoding").increment(1);
             gauge!("active_requests").decrement(1); // Decrement active requests
-            return Err(AppError::Anyhow(anyhow::anyhow!(
-                "Invalid output image format specified for encoding"
-            )));
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Invalid output image format specified for encoding",
+            )
+                .into_response();
         }
     };
 
-    resized_img
-        .write_to(&mut output_bytes, output_format)
-        .context(format!("Failed to encode image to {:?}", output_format))?;
+    if let Err(e) = resized_img.write_to(&mut output_bytes, output_format) {
+        let error_msg = format!("Failed to encode image to {:?}: {}", output_format, e);
+        error!("{}", error_msg);
+        counter!("image_resize_errors_total", "type" => "image_encode_failed").increment(1);
+        gauge!("active_requests").decrement(1);
+        return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
+    }
     let final_image_bytes = output_bytes.into_inner();
     drop(process_span);
     histogram!("image_process_duration_seconds").record(process_timer.elapsed().as_secs_f64());
@@ -595,15 +541,17 @@ async fn resize_handler(
         "Uploading processed image to storage backend with key: {}",
         cache_key
     );
-    state
+    if let Err(e) = state
         .storage
         .upload_image(&cache_key, content_type, final_image_bytes)
         .await
-        .map_err(|e| {
-            counter!("image_resize_errors_total", "type" => "storage_upload_failed").increment(1);
-            e // AppError already provides context
-        })
-        .context("Failed to upload image to storage backend")?; // Add context from Anyhow
+    {
+        counter!("image_resize_errors_total", "type" => "storage_upload_failed").increment(1);
+        gauge!("active_requests").decrement(1);
+        let error_msg = format!("Failed to upload image to storage backend: {}", e);
+        error!("{}", error_msg);
+        return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
+    }
     drop(upload_span);
     histogram!("image_upload_duration_seconds").record(upload_timer.elapsed().as_secs_f64());
     info!("Upload successful");
@@ -613,5 +561,5 @@ async fn resize_handler(
     info!("Redirecting to CDN URL: {}", cdn_url);
     gauge!("active_requests").decrement(1); // Decrement active requests
 
-    Ok(Redirect::to(&cdn_url))
+    Redirect::to(&cdn_url).into_response()
 }

@@ -1,0 +1,116 @@
+openapi: 3.0.3
+info:
+  title: EmgR OpenApi
+  description: |
+    LMS app. More at [official doc](https://vymalo.github.io/image-resize)
+  contact:
+    email: selastlambou@gmail.com
+    name: Stephane Segning
+  license:
+    name: MIT
+  version: 0.1.0
+externalDocs:
+  description: |
+    Find out more about Managing your Course from afar. Let's meet on 
+    our website 😉.
+  url: https://blog.ssegning.com
+servers:
+  - url: 'https://emgr.test'
+    description: Production server
+  - url: 'http://localhost:3000'
+    description: Development server
+  - url: '{scheme}://{host}:{port}'
+    description: Custom server
+    variables:
+      scheme:
+        enum:
+          - http
+          - https
+        default: http
+      host:
+        default: localhost
+      port:
+        default: '3000'
+
+tags:
+  - name: Images
+    description: All about image transorfmation
+paths:
+  ##########################################################################
+  # COURSES
+  ##########################################################################
+  /api/resize:
+    get:
+      summary: Resize an image
+      operationId: resize an image
+      tags:
+        - Image
+      parameters:
+        - $ref: '#/components/parameters/url'
+        - $ref: '#/components/parameters/width'
+        - $ref: '#/components/parameters/height'
+        - $ref: '#/components/parameters/format'
+      responses:
+        '302':
+          description: The image was resize and in the location you'll get the link to it
+          headers:
+            Location:
+              description: URI where the image can be downloaded
+              schema:
+                type: string
+                format: uri
+
+components:
+
+
+  ##########################################################################
+  # Params
+  ##########################################################################
+  parameters:
+    url:
+      name: url
+      in: query
+      required: true
+      description: The url of the image to be resized
+      schema:
+        $ref: '#/components/schemas/Url'
+    width:
+      name: width
+      in: query
+      required: true
+      description: The width of the final image
+      schema:
+        $ref: '#/components/schemas/Size'
+    height:
+      name: height
+      in: query
+      required: true
+      description: The height of the final image
+      schema:
+        $ref: '#/components/schemas/Size'
+    format:
+      name: format
+      in: query
+      required: true
+      description: The format of the final image
+      schema:
+        $ref: '#/components/schemas/ImageFormat'
+
+
+  ##########################################################################
+  # SCHEMAS (Data Models)
+  ##########################################################################
+  schemas:
+    Url:
+      type: string
+      format: uri
+    Size:
+      type: number
+      default: 200
+    ImageFormat:
+      type: string
+      default: webp
+      enum:
+        - png
+        - webp
+        - jpg
