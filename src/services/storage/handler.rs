@@ -1,6 +1,7 @@
 use crate::services::storage::core::StorageBackend;
 use anyhow::Result;
 use derive_builder::Builder;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Factory for creating storage backends based on configuration
@@ -45,6 +46,22 @@ impl StorageService {
 
         Ok(Self {
             storage: Arc::new(local_fs_storage_adapter),
+            cdn_base_url,
+        })
+    }
+
+    /// Create a new in-memory storage backend
+    ///
+    /// # Note
+    /// This storage backend is intended for development and testing purposes only.
+    /// Data is stored in memory and will be lost when the application restarts.
+    #[cfg(feature = "in_memory")]
+    pub fn new_in_memory(cdn_base_url: String) -> Result<Self> {
+        let in_memory_storage_adapter =
+            crate::services::storage::in_memory_handler::InMemoryStorage::new();
+
+        Ok(Self {
+            storage: Arc::new(in_memory_storage_adapter),
             cdn_base_url,
         })
     }

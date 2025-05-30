@@ -59,6 +59,7 @@ opt-level = "z"
 codegen-units = 1
 
 [features]
-default = []
+default = ["in_memory"]
 local_fs = []
 s3 = ["aws-sdk-s3", "aws-config"]
+in_memory = []
