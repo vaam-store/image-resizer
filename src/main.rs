@@ -17,7 +17,7 @@ use validator::Validate;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use opentelemetry::{KeyValue, global};
-use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::TracerProvider};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator};
 use tracing::{Level, debug, error, info, instrument, span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt}; // For stdout exporter in dev
 
@@ -29,12 +29,17 @@ use sha2::{Digest, Sha256};
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
-use opentelemetry_otlp::{new_exporter, LogExporter, SpanExporter, SpanExporterBuilder, WithExportConfig};
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::{
+    Compression, LogExporter, Protocol, SpanExporter, SpanExporterBuilder, WithExportConfig,
+    WithTonicConfig,
+};
+use opentelemetry_sdk::trace::SdkTracerProvider;
 // For static file serving if using LocalFS
 use tower_http::services::ServeDir;
 
 // --- 1. Query Parameters Struct with Validation ---
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Validate, Default)]
 struct ResizeParams {
     #[validate(url)]
     url: String,
@@ -158,7 +163,7 @@ struct AppState {
 
 // --- 4. Custom Error Handling ---
 // This enum defines all possible errors and how they map to HTTP responses.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum AppError {
     Validation(validator::ValidationErrors),
     Reqwest(reqwest::Error),
@@ -179,20 +184,6 @@ impl std::fmt::Display for AppError {
             AppError::Io(e) => write!(f, "I/O error: {}", e),
             AppError::Config(e) => write!(f, "Configuration error: {}", e),
             AppError::Anyhow(e) => write!(f, "Internal error: {}", e),
-        }
-    }
-}
-
-impl std::error::Error for AppError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            AppError::Validation(e) => Some(e),
-            AppError::Reqwest(e) => Some(e),
-            AppError::Image(e) => Some(e),
-            AppError::S3(e) => Some(e.as_ref()),
-            AppError::Io(e) => Some(e),
-            AppError::Config(_) => None,
-            AppError::Anyhow(e) => Some(e.as_ref()),
         }
     }
 }
@@ -268,7 +259,7 @@ async fn main() -> Result<(), AppError> {
     dotenvy::dotenv().ok(); // Load .env file if it exists
 
     // Initialize Telemetry
-    init_telemetry();
+    init_telemetry().expect("Failed to initialize telemetry");
     info!("Starting image resizer server...");
 
     // Register Metrics
@@ -383,7 +374,7 @@ async fn main() -> Result<(), AppError> {
 }
 
 // --- Telemetry Initialization Functions ---
-async fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
+fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
     // Tracing (logging) with JSON format
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -392,25 +383,23 @@ async fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().json()) // Output logs as JSON
         .init();
 
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert("x-header-key", "header-value".parse().unwrap());
     let otlp_exporter = SpanExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
+        .with_tonic()
+        .with_compression(Compression::Gzip)
+        .with_endpoint(format!("http://{}", "0.0.0.0:4317"))
+        .with_metadata(metadata)
         .build()?;
 
-    let tracer_provider = opentelemetry_otlp::SpanExporter::builder()
-        .tracing()
-        .with_exporter(
-            new_exporter()
-                .tonic()
-                .with_endpoint(format!("http://{}", "0.0.0.0:4317")) // Default OTLP endpoint
-                .with_metadata(metadata)
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)
-        .expect("failed to install");
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(otlp_exporter)
+        .build();
 
-    let tracer = tracer_provider.tracer("image-resizer");
+    let _ = tracer_provider.tracer("image-resizer");
     global::set_tracer_provider(tracer_provider);
     global::set_text_map_propagator(TraceContextPropagator::new()); // Enable trace context propagation
+    Ok(())
 }
 
 fn register_metrics() {
@@ -452,18 +441,23 @@ fn register_metrics() {
 async fn metrics_handler() -> impl IntoResponse {
     let builder = PrometheusBuilder::new();
     let recorder = builder.build_recorder();
-    metrics::set_boxed_recorder(Box::new(recorder)).unwrap();
+    let _ = metrics::set_default_local_recorder(&recorder);
 
-    let metrics_string = recorder.render();
-    (StatusCode::OK, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], metrics_string)
+    let metrics_string = recorder.handle().render();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        metrics_string,
+    )
 }
 
-// --- 6. The Main Resize Handler ---
-#[instrument(skip(state), fields(request_id = %uuid::Uuid::new_v4()))]
+// --- 6. The Main Resize Handler --
+#[tracing::instrument(skip(state), fields(request_id = %uuid::Uuid::new_v4()))]
 async fn resize_handler(
     State(state): State<AppState>,
-    Query(mut params): Query<ResizeParams>, // `mut` to cap dimensions
-) -> Result<Redirect, AppError> {
+    Query(mut params): Query<ResizeParams>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+    // Changed return type
     counter!("image_resize_requests_total").increment(1); // Increment total requests counter
     gauge!("active_requests").increment(1); // Increment active requests
 

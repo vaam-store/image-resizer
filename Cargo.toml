@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0" }
+axum = { version = "0.8" , features = ["macros"]}
 tokio = { version = "1", features = ["full"] } # "full" for convenience; in prod, pick specific features.
 serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "stream"] } # stream for efficient downloads
@@ -41,5 +41,6 @@ opentelemetry = { version = "0", features = ["metrics"] }
 opentelemetry_sdk = { version = "0", features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-stdout = { version = "0" } # For printing traces to stdout (dev/debug)
 # opentelemetry-jaeger = { version = "0.21", features = ["rt-tokio"] } # For Jaeger exporter (prod)
-opentelemetry-otlp = { version = "0", features = ["tokio", "http-proto", "http"] }
-tonic = { version = "0" } # For OTLP exporter (prod)
+opentelemetry-otlp = { version = "0", features = ["tokio", "grpc-tonic", "gzip-tonic"] }
+tonic = "0.13.1"
+thiserror = "1.0.69"
