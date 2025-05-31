@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::services::storage::core::StorageBackend;
 
@@ -36,5 +36,13 @@ impl StorageBackend for LocalFSStorage {
     async fn check_cache(&self, key: &str) -> Result<bool> {
         let file_path = self.base_path.join(key);
         Ok(tokio::fs::metadata(&file_path).await.is_ok())
+    }
+
+    async fn get_image(&self, key: &str) -> Result<Vec<u8>> {
+        let file_path = self.base_path.join(key);
+        tokio::fs::read(&file_path).await.context(format!(
+            "Failed to read image from local file system: {}",
+            file_path.display()
+        ))
     }
 }

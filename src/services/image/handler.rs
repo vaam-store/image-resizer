@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use derive_builder::Builder;
-use image::{ImageFormat};
+use image::ImageFormat;
 use std::io::Cursor;
-use tracing::{debug};
+use tracing::debug;
 
 #[derive(Clone, Builder)]
 pub struct ImageService {
@@ -67,6 +67,9 @@ impl ImageService {
             gen_server::models::ImageFormat::Jpg => (ImageFormat::Jpeg, "image/jpeg"),
             gen_server::models::ImageFormat::Png => (ImageFormat::Png, "image/png"),
             gen_server::models::ImageFormat::Webp => (ImageFormat::WebP, "image/webp"),
+            // This pattern is unreachable since we've covered all variants,
+            // but we'll keep it with an annotation for future-proofing
+            #[allow(unreachable_patterns)]
             _ => return Err(anyhow::anyhow!("Unsupported image format: {}", format)),
         };
 

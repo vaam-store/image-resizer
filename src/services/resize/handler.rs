@@ -1,15 +1,16 @@
 use crate::services::cache::handler::CacheService;
 use crate::services::image::handler::ImageService;
 use crate::services::storage::handler::StorageService;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use derive_builder::Builder;
 use gen_server::models::{DownloadPathParams, ImageFormat, ResizeQueryParams};
 use std::time::Instant;
-use tracing::{debug, error, info, instrument, span, Level};
+use tracing::{debug, error, info, instrument};
 use validator::Validate;
 
 /// Validation struct for resize parameters
 #[derive(Debug, Validate)]
+#[allow(dead_code)]
 struct ResizeParams {
     #[validate(url)]
     url: String,
@@ -111,9 +112,26 @@ impl ResizeService {
     #[instrument(skip(self), fields(url = %params.key))]
     pub async fn download(&self, params: &DownloadPathParams) -> Result<Vec<u8>> {
         let download_timer = Instant::now();
-        let f = self.image_service.download_image(&params.key).await;
-        info!("download successful");
-        debug!("Image download took {:?}", download_timer.elapsed());
-        f
+
+        // First check if the image exists in the cache
+        if !self.storage_service.check_cache(&params.key).await? {
+            return Err(anyhow::anyhow!(
+                "Image not found in storage: {}",
+                params.key
+            ));
+        }
+
+        // Get the image from storage
+        match self.storage_service.get_image(&params.key).await {
+            Ok(data) => {
+                info!("download successful");
+                debug!("Image download took {:?}", download_timer.elapsed());
+                Ok(data)
+            }
+            Err(e) => {
+                error!("download failed: {}", e);
+                Err(e)
+            }
+        }
     }
 }

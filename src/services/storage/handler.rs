@@ -2,7 +2,6 @@ use crate::services::storage::core::StorageBackend;
 use anyhow::{Result, anyhow};
 use derive_builder::Builder;
 use std::env;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Factory for creating storage backends based on configuration
@@ -127,7 +126,8 @@ impl StorageService {
         #[cfg(feature = "in_memory")]
         return Ok(StorageType::InMemory);
 
-        // This should never happen due to the check above
+        // This code is unreachable due to the checks above, but kept for completeness
+        #[allow(unreachable_code)]
         Err(anyhow!("No storage features are enabled"))
     }
 
@@ -190,15 +190,25 @@ impl StorageService {
     pub fn get_cdn_url(&self, key: &str) -> String {
         format!("{}/{}", self.cdn_base_url.trim_end_matches('/'), key)
     }
+
+    /// Get an image from storage
+    pub async fn get_image(&self, key: &str) -> Result<Vec<u8>> {
+        self.storage.get_image(key).await
+    }
 }
 
 /// Configuration for S3 storage
 #[derive(Debug, Clone)]
 pub struct S3Config {
+    #[allow(dead_code)]
     pub endpoint_url: String,
+    #[allow(dead_code)]
     pub access_key: String,
+    #[allow(dead_code)]
     pub secret_key: String,
+    #[allow(dead_code)]
     pub bucket: String,
+    #[allow(dead_code)]
     pub region: String,
 }
 
@@ -213,6 +223,7 @@ pub struct LocalFsConfig {
 pub struct StorageConfig {
     pub storage_type: Option<String>,
     pub cdn_base_url: String,
+    #[allow(dead_code)]
     pub s3_config: Option<S3Config>,
     pub local_fs_config: Option<LocalFsConfig>,
 }
@@ -235,6 +246,7 @@ impl StorageConfig {
     }
 
     /// Set the S3 configuration
+    #[allow(dead_code)]
     pub fn with_s3_config(
         mut self,
         endpoint_url: String,
@@ -254,7 +266,7 @@ impl StorageConfig {
     }
 
     /// Set the local file system configuration
-    pub fn with_local_fs_config(mut self, base_path: impl AsRef<Path>) -> Self {
+    pub fn with_local_fs_config(mut self, base_path: impl AsRef<std::path::Path>) -> Self {
         self.local_fs_config = Some(LocalFsConfig {
             base_path: base_path.as_ref().to_path_buf(),
         });

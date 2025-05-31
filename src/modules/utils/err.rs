@@ -5,6 +5,7 @@ use std::io;
 use thiserror::Error;
 use tracing::error;
 
+#[allow(dead_code)]
 pub fn app_panic<T: Into<String> + Display>(message: T) -> ! {
     let msg = format!("{}: {}", "Panic", message);
     error!("{}", msg);

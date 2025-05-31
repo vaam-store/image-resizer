@@ -40,6 +40,18 @@ impl StorageBackend for InMemoryStorage {
         let storage = self.storage.read().unwrap();
         Ok(storage.contains_key(key))
     }
+
+    async fn get_image(&self, key: &str) -> Result<Vec<u8>> {
+        // Retrieve the image data from in-memory storage
+        let storage = self.storage.read().unwrap();
+        match storage.get(key) {
+            Some((_, data)) => Ok(data.clone()),
+            None => Err(anyhow::anyhow!(
+                "Image not found in memory storage: {}",
+                key
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

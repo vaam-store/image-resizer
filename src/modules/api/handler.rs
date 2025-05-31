@@ -1,13 +1,12 @@
-use crate::services::cache::handler::{CacheService, CacheServiceBuilder};
-use crate::services::image::handler::{ImageService, ImageServiceBuilder};
+use crate::modules::env::env::EnvConfig;
+use crate::services::cache::handler::CacheServiceBuilder;
+use crate::services::image::handler::ImageServiceBuilder;
 use crate::services::resize::handler::{ResizeService, ResizeServiceBuilder};
-use crate::services::storage::handler::{StorageConfig, StorageService, StorageServiceBuilder};
+use crate::services::storage::handler::StorageService;
 use anyhow::Result;
 use derive_builder::Builder;
 use gen_server::apis::ErrorHandler;
 use std::env;
-use std::path::PathBuf;
-use crate::modules::env::env::EnvConfig;
 
 #[derive(Clone, Builder)]
 pub struct ApiService {
@@ -33,7 +32,7 @@ impl ApiService {
             .max_width(max_width)
             .max_height(max_height)
             .build()?;
-        
+
         // Create storage config
         let mut storage_config =
             crate::services::storage::handler::StorageConfig::new(config.cdn_base_url);

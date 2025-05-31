@@ -73,4 +73,24 @@ impl StorageBackend for MinIOStorage {
             },
         }
     }
+
+    async fn get_image(&self, key: &str) -> Result<Vec<u8>> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("S3 error: {}", e))
+            .context(format!("Failed to get image from S3: {}", key))?;
+
+        let data = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read S3 response body: {}", e))?;
+
+        Ok(data.into_bytes().to_vec())
+    }
 }
