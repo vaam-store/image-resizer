@@ -15,11 +15,20 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
 
-    name: Docker image build
+    name: Docker build for ${{ matrix.flavor }}
 
     permissions:
       packages: write
       contents: read
+
+    strategy:
+      matrix:
+        flavor: [fs, s3,]
+        include:
+          - flavor: fs
+            docker_target: fs_deploy
+          - flavor: s3
+            docker_target: s3_deploy
 
     steps:
       # Checkout the repository code
@@ -56,15 +65,12 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}}
-            type=semver,enable=true,priority=900,prefix=,suffix=,pattern=,value=
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix={{branch}}-
-            type=sha,format=long
-            type=sha,format=long,prefix={{branch}}
+            type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}},suffix=${{ matrix.flavor }}
+            type=semver,enable=true,priority=900,prefix=,suffix=${{ matrix.flavor }},pattern=,value=
+            type=semver,pattern={{version}},suffix=${{ matrix.flavor }}
+            type=semver,pattern={{major}}.{{minor}},suffix=${{ matrix.flavor }}
+            type=semver,pattern={{major}},suffix=${{ matrix.flavor }}
+            type=sha,prefix={{branch}}-${{ matrix.flavor }}
           flavor: |
             latest=auto
           images: "${{ env.REGISTRY }}/${{ steps.string.outputs.lowercase }}"
@@ -85,6 +91,7 @@ jobs:
           context: .
           file: "Dockerfile"
           push: "true"
+          target: ${{ matrix.docker_target }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
