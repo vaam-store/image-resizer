@@ -80,9 +80,9 @@ jobs:
         if: always()
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          key: ${{ runner.os }}-buildx-${{ matrix.flavor }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-buildx-
+            ${{ runner.os }}-buildx-${{ matrix.flavor }}-
 
       - name: Build and push
         uses: docker/build-push-action@v6
