@@ -38,17 +38,10 @@ pub struct EnvConfig {
     #[envconfig(from = "CDN_BASE_URL", default = "http://localhost:9000/image-cache")]
     pub cdn_base_url: String,
 
-    #[envconfig(from = "MAX_IMAGE_WIDTH", default = "2000")]
-    pub max_image_width: u32,
-
-    #[envconfig(from = "MAX_IMAGE_HEIGHT", default = "2000")]
-    pub max_image_height: u32,
-
-
     #[cfg(feature = "otel")]
     #[envconfig(from = "LOG_LEVEL", default = "debug")]
     pub log_level: String,
-    
+
     #[cfg(feature = "otel")]
     #[envconfig(from = "OTLP_SPAN_ENDPOINT", default = "http://localhost:4317")]
     pub otlp_span_endpoint: String,
