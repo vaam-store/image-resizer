@@ -8,6 +8,8 @@ FROM base as builder
 
 ENV CARGO_TERM_COLOR=always
 
+FROM builder as local_fs_builder
+
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
@@ -17,10 +19,10 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
-  cargo build --profile prod --locked \
-  && cp ./target/release/$APP_NAME $APP_NAME
+  cargo build --profile prod --locked --features="local_fs" \
+  && cp ./target/prod/$APP_NAME $APP_NAME
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Resize images with this image"
@@ -32,8 +34,11 @@ ENV HOST=0.0.0.0
 
 WORKDIR /app
 
-COPY --from=builder /app/$APP_NAME /app/emgr
+COPY --from=local_fs_builder /app/$APP_NAME /app/emgr
 
 EXPOSE $PORT
 
 ENTRYPOINT ["/app/emgr"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s \
+  CMD curl -f http://localhost:$PORT/health || exit 1
