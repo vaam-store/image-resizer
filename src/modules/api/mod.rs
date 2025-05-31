@@ -1,2 +1,2 @@
-pub mod resize;
 pub mod handler;
+pub mod resize;

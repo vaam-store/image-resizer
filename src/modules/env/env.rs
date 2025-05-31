@@ -15,7 +15,6 @@ pub struct EnvConfig {
         from = "RUST_LOG",
         default = "emgr=debug,tower_http=info,reqwest=info,aws_sdk_s3=info,hyper=info"
     )]
-    #[allow(dead_code)]
     pub rust_log: String,
 
     #[envconfig(from = "STORAGE_TYPE")]
@@ -49,11 +48,9 @@ pub struct EnvConfig {
     pub cdn_base_url: String,
 
     #[envconfig(from = "MAX_IMAGE_WIDTH", default = "2000")]
-    #[allow(dead_code)]
     pub max_image_width: u32,
 
     #[envconfig(from = "MAX_IMAGE_HEIGHT", default = "2000")]
-    #[allow(dead_code)]
     pub max_image_height: u32,
 
     #[cfg(feature = "otel")]

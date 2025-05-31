@@ -16,7 +16,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize tracing and OpenTelemetry
     #[cfg(feature = "otel")]
-    let (metrics, provider, meter_provider) = crate::modules::tracer::init_tracing(config.clone()).await?;
+    let (metrics, provider, meter_provider) =
+        crate::modules::tracer::init_tracing(config.clone()).await?;
 
     // Get address to listen on
     let addr = format!("{}:{:?}", config.http_host, config.http_port).parse::<SocketAddr>()?;
@@ -34,7 +35,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the server
     info!("Server running on http://{:?}", listener.local_addr()?);
     axum::serve(listener, app).await?;
-
 
     #[cfg(feature = "otel")]
     {

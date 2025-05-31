@@ -65,11 +65,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           tags: |
-            type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}},suffix=${{ matrix.flavor }}
-            type=semver,enable=true,priority=900,prefix=,suffix=${{ matrix.flavor }},pattern=,value=
-            type=semver,pattern={{version}},suffix=${{ matrix.flavor }}
-            type=semver,pattern={{major}}.{{minor}},suffix=${{ matrix.flavor }}
-            type=semver,pattern={{major}},suffix=${{ matrix.flavor }}
+            type=schedule,pattern={{date 'YYYYMMDD-hhmmss' tz='Europe/Berlin'}},suffix=${{ matrix.flavor }}-
+            type=semver,enable=true,priority=900,prefix=,suffix=${{ matrix.flavor }}-,pattern=,value=
+            type=semver,pattern={{version}},suffix=${{ matrix.flavor }}-
+            type=semver,pattern={{major}}.{{minor}},suffix=${{ matrix.flavor }}-
+            type=semver,pattern={{major}},suffix=${{ matrix.flavor }}-
             type=sha,prefix={{branch}}-${{ matrix.flavor }}
           flavor: |
             latest=auto

@@ -1,5 +1,5 @@
-use axum::http::Method;
 use axum::Router;
+use axum::http::Method;
 use tower_http::compression::predicate::{NotForContentType, SizeAbove};
 use tower_http::compression::{CompressionLayer, DefaultPredicate, Predicate};
 use tower_http::cors::{Any, CorsLayer};

@@ -199,16 +199,12 @@ impl StorageService {
 
 /// Configuration for S3 storage
 #[derive(Debug, Clone)]
+#[cfg(feature = "s3")]
 pub struct S3Config {
-    #[allow(dead_code)]
     pub endpoint_url: String,
-    #[allow(dead_code)]
     pub access_key: String,
-    #[allow(dead_code)]
     pub secret_key: String,
-    #[allow(dead_code)]
     pub bucket: String,
-    #[allow(dead_code)]
     pub region: String,
 }
 
@@ -220,14 +216,22 @@ pub struct LocalFsConfig {
 
 /// Configuration for storage service
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "s3")]
 pub struct StorageConfig {
     pub storage_type: Option<String>,
     pub cdn_base_url: String,
-    #[allow(dead_code)]
     pub s3_config: Option<S3Config>,
     pub local_fs_config: Option<LocalFsConfig>,
 }
 
+#[cfg(not(feature = "s3"))]
+pub struct StorageConfig {
+    pub storage_type: Option<String>,
+    pub cdn_base_url: String,
+    pub local_fs_config: Option<LocalFsConfig>,
+}
+
+#[cfg(feature = "s3")]
 impl StorageConfig {
     /// Create a new storage configuration
     pub fn new(cdn_base_url: String) -> Self {
@@ -238,7 +242,22 @@ impl StorageConfig {
             local_fs_config: None,
         }
     }
+}
 
+#[cfg(not(feature = "s3"))]
+impl StorageConfig {
+    /// Create a new storage configuration
+    pub fn new(cdn_base_url: String) -> Self {
+        Self {
+            storage_type: None,
+            cdn_base_url,
+            local_fs_config: None,
+        }
+    }
+}
+
+// Common implementation for StorageConfig
+impl StorageConfig {
     /// Set the storage type
     pub fn with_storage_type(mut self, storage_type: impl Into<String>) -> Self {
         self.storage_type = Some(storage_type.into());
@@ -246,7 +265,7 @@ impl StorageConfig {
     }
 
     /// Set the S3 configuration
-    #[allow(dead_code)]
+    #[cfg(feature = "s3")]
     pub fn with_s3_config(
         mut self,
         endpoint_url: String,

@@ -57,7 +57,7 @@ impl ApiService {
         // Configure local FS storage
         #[cfg(feature = "local_fs")]
         {
-            let path = PathBuf::from(config.local_fs_storage_path);
+            let path = std::path::PathBuf::from(config.local_fs_storage_path);
 
             storage_config = storage_config.with_local_fs_config(path);
         }

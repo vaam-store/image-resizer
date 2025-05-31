@@ -6,20 +6,6 @@ use derive_builder::Builder;
 use gen_server::models::{DownloadPathParams, ImageFormat, ResizeQueryParams};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
-use validator::Validate;
-
-/// Validation struct for resize parameters
-#[derive(Debug, Validate)]
-#[allow(dead_code)]
-struct ResizeParams {
-    #[validate(url)]
-    url: String,
-    #[validate(range(min = 1))]
-    width: u32,
-    #[validate(range(min = 1))]
-    height: u32,
-    format: ImageFormat,
-}
 
 /// Main service for image resizing
 #[derive(Clone, Builder)]
