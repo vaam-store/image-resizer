@@ -5,10 +5,7 @@ use std::io::Cursor;
 use tracing::debug;
 
 #[derive(Clone, Builder)]
-pub struct ImageService {
-    max_width: u32,
-    max_height: u32,
-}
+pub struct ImageService {}
 
 impl ImageService {
     /// Download an image from a URL
@@ -41,10 +38,6 @@ impl ImageService {
         height: u32,
         format: &gen_server::models::ImageFormat,
     ) -> Result<(Vec<u8>, String)> {
-        // Cap dimensions to configured maximums
-        let width = width.min(self.max_width);
-        let height = height.min(self.max_height);
-
         // Decode image
         let img = image::load_from_memory(image_bytes).context("Failed to decode image")?;
 

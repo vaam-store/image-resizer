@@ -16,7 +16,7 @@ THIS_FILE := $(lastword $(MAKEFILE_LIST))
 ##   Author: @stephane-segning
 ## ==========================================================
 
-.PHONY: help init build up start down destroy stop restart logs logs-api ps login-timescale login-api db-shell
+.PHONY: help init build up up-app start pull down destroy stop restart logs logs-app ps stats git-pull
 
 init: 				## Initialize the project
 	rm -rf packages/gen-server && docker compose -p emgr run --rm openapi-generator-cli $(c)

@@ -1,7 +1,11 @@
 [package]
 name = "emgr"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+
+[[bin]]
+name = "healthcheck"
+path = "src/healthcheck.rs"
 
 [dependencies]
 gen-server = { path = "./packages/gen-server", features = ["conversion"] }
@@ -19,8 +23,6 @@ image = "0.25" # Core image processing
 
 aws-config = { version = "1.6", optional = true } # AWS SDK configuration (for MinIO)
 aws-sdk-s3 = { version = "1.90", optional = true } # AWS S3 client (MinIO compatible)
-
-cuid2 = { version = "0" }
 
 envconfig = { version = "0" }
 derive_builder = { version = "0" }

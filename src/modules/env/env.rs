@@ -8,15 +8,6 @@ pub struct EnvConfig {
     #[envconfig(from = "PORT", default = "3000")]
     pub http_port: u16,
 
-    #[envconfig(from = "LOG_LEVEL", default = "debug")]
-    pub log_level: String,
-
-    #[envconfig(
-        from = "RUST_LOG",
-        default = "emgr=debug,tower_http=info,reqwest=info,aws_sdk_s3=info,hyper=info"
-    )]
-    pub rust_log: String,
-
     #[envconfig(from = "STORAGE_TYPE")]
     pub storage_type: Option<String>,
 
@@ -53,6 +44,11 @@ pub struct EnvConfig {
     #[envconfig(from = "MAX_IMAGE_HEIGHT", default = "2000")]
     pub max_image_height: u32,
 
+
+    #[cfg(feature = "otel")]
+    #[envconfig(from = "LOG_LEVEL", default = "debug")]
+    pub log_level: String,
+    
     #[cfg(feature = "otel")]
     #[envconfig(from = "OTLP_SPAN_ENDPOINT", default = "http://localhost:4317")]
     pub otlp_span_endpoint: String,

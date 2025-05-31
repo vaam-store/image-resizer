@@ -13,29 +13,57 @@ services:
       - "16686:16686" # Jaeger UI
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
-  
+
+  volume_init:
+    image: busybox:latest
+    volumes:
+      - files:/app/data/images
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -ex
+        
+        # Ensure the directory exists
+        chown -R 65532:65532 /app/data/images 
+        chmod -R 775 /app/data/images
+    # Optional: If you want to make it executable by others too, use 777 (less secure)
+    # command: sh -c "chown -R 65532:65532 /app/data/images && chmod -R 777 /app/data/images"
+    # Ensure this container runs and exits successfully
+    restart: "no" # Don't restart after it completes its job
+    deploy:
+      resources: # Minimal resources for this ephemeral task
+        limits:
+          memory: 10M
+          cpus: "0.01"
+
   app:
     restart: unless-stopped
     deploy:
       replicas: 1
       resources:
         limits:
-          memory: 1G
-          cpus: "1"
+          memory: 125M
+          cpus: "0.125"
     build:
       context: .
       dockerfile: Dockerfile
+      target: fs_deploy
+    volumes:
+      - files:/app/data/images
     environment:
-      CDN_BASE_URL: http://localhost:13001
+      CDN_BASE_URL: http://localhost:13001/api/images/files
       LOG_LEVEL: ${LOG_LEVEL:-info}
       OTLP_SPAN_ENDPOINT: http://tracking:4317
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
-      OTLP_SERVICE_NAME: giss
-      DB_MAX_THREAD_POOL: ${DB_MAX_THREAD_POOL:-20}
+      OTLP_SERVICE_NAME: image-resizer
     ports:
       - "13001:3000"
     depends_on:
-      - tracking
+      tracking:
+        condition: service_started
+      volume_init:
+        condition: service_completed_successfully
 
   openapi-generator-cli:
     image: openapitools/openapi-generator-cli
@@ -52,3 +80,6 @@ services:
       - /packages/gen-server
       - --package-name
       - gen-server
+
+volumes:
+  files:

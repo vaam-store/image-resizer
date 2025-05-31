@@ -18,20 +18,8 @@ impl ApiService {
         // Initialize cache service
         let cache_service = CacheServiceBuilder::default().build()?;
 
-        // Initialize image service
-        let max_width: u32 = env::var("MAX_IMAGE_WIDTH")
-            .unwrap_or_else(|_| "2000".to_string())
-            .parse()
-            .unwrap_or(2000);
-        let max_height: u32 = env::var("MAX_IMAGE_HEIGHT")
-            .unwrap_or_else(|_| "2000".to_string())
-            .parse()
-            .unwrap_or(2000);
-
-        let image_service = ImageServiceBuilder::default()
-            .max_width(max_width)
-            .max_height(max_height)
-            .build()?;
+        // Image service
+        let image_service = ImageServiceBuilder::default().build()?;
 
         // Create storage config
         let mut storage_config =
