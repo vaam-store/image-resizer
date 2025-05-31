@@ -19,7 +19,7 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
-  cargo build --profile prod --locked --features="local_fs" \
+  cargo build --profile prod --locked --features="local_fs otel" \
   && cp ./target/prod/$APP_NAME $APP_NAME
 
 FROM gcr.io/distroless/cc-debian12:nonroot
@@ -27,7 +27,7 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Resize images with this image"
 
-ENV RUST_LOG=warn
+#ENV RUST_LOG=warn
 ENV APP_NAME=emgr
 ENV PORT=3000
 ENV HOST=0.0.0.0
@@ -38,7 +38,9 @@ COPY --from=local_fs_builder /app/$APP_NAME /app/emgr
 
 EXPOSE $PORT
 
-ENTRYPOINT ["/app/emgr"]
+VOLUME ["/app/data/images"]
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s \
   CMD curl -f http://localhost:$PORT/health || exit 1
+
+ENTRYPOINT ["/app/emgr"]

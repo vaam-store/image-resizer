@@ -39,12 +39,12 @@ paths:
   ##########################################################################
   # COURSES
   ##########################################################################
-  /api/resize:
+  /api/images/resize:
     get:
       summary: Resize an image
-      operationId: resize an image
+      operationId: resize
       tags:
-        - Image
+        - Images
       parameters:
         - $ref: '#/components/parameters/url'
         - $ref: '#/components/parameters/width'
@@ -59,6 +59,34 @@ paths:
               schema:
                 type: string
                 format: uri
+  /api/images/files/{key}:
+    get:
+      summary: Resize an image
+      operationId: download
+      tags:
+        - Images
+      parameters:
+        - $ref: '#/components/parameters/key'
+      responses:
+        '200':
+          description: Operation performed successfully.
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
 
 components:
 
@@ -95,12 +123,21 @@ components:
       description: The format of the final image
       schema:
         $ref: '#/components/schemas/ImageFormat'
+    key:
+      name: key
+      in: path
+      required: true
+      description: The key of the final image
+      schema:
+        $ref: '#/components/schemas/Key'
 
 
   ##########################################################################
   # SCHEMAS (Data Models)
   ##########################################################################
   schemas:
+    Key:
+      type: string
     Url:
       type: string
       format: uri

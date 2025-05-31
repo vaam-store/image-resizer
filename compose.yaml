@@ -33,7 +33,7 @@ services:
       OTLP_SERVICE_NAME: giss
       DB_MAX_THREAD_POOL: ${DB_MAX_THREAD_POOL:-20}
     ports:
-      - ${APP_PORT:-13001-13005}:3000
+      - "13001:3000"
     depends_on:
       - tracking
 
