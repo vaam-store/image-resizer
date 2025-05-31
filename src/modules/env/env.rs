@@ -17,24 +17,30 @@ pub struct EnvConfig {
     )]
     pub rust_log: String,
 
-    #[envconfig(from = "STORAGE_TYPE", default = "LOCAL_FS")]
-    pub storage_type: String,
-
+    #[envconfig(from = "STORAGE_TYPE")]
+    pub storage_type: Option<String>,
+    
+    #[cfg(feature = "s3")]
     #[envconfig(from = "MINIO_ENDPOINT_URL", default = "http://localhost:9000")]
     pub minio_endpoint_url: String,
 
+    #[cfg(feature = "s3")]
     #[envconfig(from = "MINIO_ACCESS_KEY_ID", default = "minioadmin")]
     pub minio_access_key_id: String,
 
+    #[cfg(feature = "s3")]
     #[envconfig(from = "MINIO_SECRET_ACCESS_KEY", default = "minioadmin")]
     pub minio_secret_access_key: String,
 
+    #[cfg(feature = "s3")]
     #[envconfig(from = "MINIO_BUCKET", default = "image-cache")]
     pub minio_bucket: String,
 
+    #[cfg(feature = "s3")]
     #[envconfig(from = "MINIO_REGION", default = "us-east-1")]
     pub minio_region: String,
 
+    #[cfg(feature = "local_fs")]
     #[envconfig(from = "LOCAL_FS_STORAGE_PATH", default = "./data/images")]
     pub local_fs_storage_path: String,
 
@@ -47,21 +53,18 @@ pub struct EnvConfig {
     #[envconfig(from = "MAX_IMAGE_HEIGHT", default = "2000")]
     pub max_image_height: u32,
 
-    #[envconfig(from = "PROMETHEUS_METRICS_PORT", default = "9001")]
-    pub prometheus_metrics_port: u16,
-
+    #[cfg(feature = "otel")]
     #[envconfig(from = "OTLP_SPAN_ENDPOINT", default = "http://localhost:4317")]
     pub otlp_span_endpoint: String,
 
+    #[cfg(feature = "otel")]
     #[envconfig(
         from = "OTLP_METRIC_ENDPOINT",
         default = "http://localhost:4318/v1/metrics"
     )]
     pub otlp_metric_endpoint: String,
 
+    #[cfg(feature = "otel")]
     #[envconfig(from = "OTLP_SERVICE_NAME", default = "rust-app-example")]
     pub otlp_service_name: String,
-
-    #[envconfig(from = "OTLP_VERSION", default = "0.1.0")]
-    pub otlp_version: String,
 }

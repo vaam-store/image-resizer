@@ -1,7 +1,5 @@
-use std::sync::Arc;
 use crate::modules::env::env::EnvConfig;
 use anyhow::Result;
-use axum::handler::Handler;
 use axum_otel_metrics::{HttpMetricsLayer, HttpMetricsLayerBuilder, PathSkipper};
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
@@ -11,6 +9,7 @@ use opentelemetry_sdk::trace::{
     RandomIdGenerator, Sampler, SdkTracerProvider, TracerProviderBuilder,
 };
 use opentelemetry_sdk::Resource;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -85,7 +84,6 @@ pub async fn init_tracing(
         otlp_metric_endpoint,
         otlp_span_endpoint,
         otlp_service_name,
-        otlp_version,
         log_level,
         ..
     }: EnvConfig,
@@ -94,12 +92,14 @@ pub async fn init_tracing(
     let meter_provider = init_meter_provider(otlp_metric_endpoint, otlp_service_name)?;
 
     let metrics = HttpMetricsLayerBuilder::default()
-        .with_skipper(PathSkipper::new_with_fn(Arc::new(|s: &str| s.starts_with("/health") || s.starts_with("/metrics"))))
+        .with_skipper(PathSkipper::new_with_fn(Arc::new(|s: &str| {
+            s.starts_with("/health") || s.starts_with("/metrics")
+        })))
         .with_provider(meter_provider.clone())
         .build();
 
     // Set up Tracing with OpenTelemetry
-    let tracer = tracer_provider.tracer(format!("image-resize-{}", otlp_version));
+    let tracer = tracer_provider.tracer("emgr");
     let layer = tracing_opentelemetry::layer()
         .with_error_records_to_exceptions(true)
         .with_tracer(tracer);

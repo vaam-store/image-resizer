@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use derive_builder::Builder;
-use image::{DynamicImage, ImageFormat};
+use image::{ImageFormat};
 use std::io::Cursor;
-use tracing::{debug, error};
+use tracing::{debug};
 
 #[derive(Clone, Builder)]
 pub struct ImageService {

@@ -1285,6 +1285,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "emgr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "axum",
+ "axum-extra",
+ "axum-otel-metrics",
+ "axum-tracing-opentelemetry",
+ "cuid2",
+ "derive_builder",
+ "envconfig",
+ "gen-server",
+ "hex",
+ "image",
+ "opentelemetry 0.29.1",
+ "opentelemetry-otlp",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk 0.29.0",
+ "prometheus",
+ "reqwest",
+ "sha2",
+ "thiserror 2.0.12",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry 0.30.0",
+ "tracing-subscriber",
+ "validator",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2121,40 +2155,6 @@ dependencies = [
  "tiff",
  "zune-core",
  "zune-jpeg",
-]
-
-[[package]]
-name = "image-resize"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "axum",
- "axum-extra",
- "axum-otel-metrics",
- "axum-tracing-opentelemetry",
- "cuid2",
- "derive_builder",
- "envconfig",
- "gen-server",
- "hex",
- "image",
- "opentelemetry 0.29.1",
- "opentelemetry-otlp",
- "opentelemetry-prometheus",
- "opentelemetry_sdk 0.29.0",
- "prometheus",
- "reqwest",
- "sha2",
- "thiserror 2.0.12",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-opentelemetry 0.30.0",
- "tracing-subscriber",
- "validator",
 ]
 
 [[package]]

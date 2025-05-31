@@ -29,7 +29,6 @@ services:
       OTLP_SPAN_ENDPOINT: http://tracking:4317
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: giss
-      OTLP_VERSION: 1.0.0-rc1
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DB_MAX_THREAD_POOL: ${DB_MAX_THREAD_POOL:-20}
     ports:
