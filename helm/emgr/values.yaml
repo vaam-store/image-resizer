@@ -9,7 +9,7 @@ defaultPodOptions:
 controllers:
   main:
     type: deployment
-    replicas: 1
+    replicas: 2
     labels:
       main: main-app
     initContainers:
@@ -93,7 +93,7 @@ configMaps:
       description: 'Common configuration for the emgr.'
     data:
       LOCAL_FS_STORAGE_PATH: /tmp/data/images
-      CDN_BASE_URL: https://emgr.com/api/images/files
+      CDN_BASE_URL: https://emgr.com
 
 persistence:
   data:
