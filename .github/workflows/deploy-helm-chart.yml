@@ -26,6 +26,10 @@ jobs:
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
 
+      - name: Install Helm things
+        run: |
+          helm repo add bjw-s https://bjw-s-labs.github.io/helm-charts
+
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.7.0
         with:
