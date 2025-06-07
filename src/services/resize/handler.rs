@@ -1,3 +1,4 @@
+use crate::models::params::ResizeQuery;
 use crate::services::cache::handler::CacheService;
 use crate::services::image::handler::ImageService;
 use crate::services::storage::handler::StorageService;
@@ -18,14 +19,9 @@ pub struct ResizeService {
 impl ResizeService {
     /// Main resize method that orchestrates the entire process
     #[instrument(skip(self), fields(url = %params.url))]
-    pub async fn resize(&self, params: &ResizeQueryParams) -> Result<String> {
+    pub async fn resize(&self, params: &ResizeQuery) -> Result<String> {
         // Generate cache key
-        let cache_key = self.cache_service.generate_key(
-            &params.url,
-            params.width as u32,
-            params.height as u32,
-            &params.format,
-        );
+        let cache_key = self.cache_service.generate_key(params);
         debug!("Generated cache key: {}", cache_key);
 
         // Check cache
@@ -60,12 +56,10 @@ impl ResizeService {
 
         // Process image
         let process_timer = Instant::now();
-        let (processed_image, content_type) = match self.image_service.process_image(
-            &image_bytes,
-            params.width as u32,
-            params.height as u32,
-            &params.format,
-        ) {
+        let (processed_image, content_type) = match self
+            .image_service
+            .process_image(&image_bytes, params)
+        {
             Ok(result) => result,
             Err(e) => {
                 error!("Failed to process image: {}", e);

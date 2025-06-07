@@ -2,13 +2,13 @@ openapi: 3.0.3
 info:
   title: EmgR OpenApi
   description: |
-    LMS app. More at [official doc](https://vymalo.github.io/image-resize)
+    EmgR app. More at [official doc](https://vymalo.github.io/image-resize)
   contact:
     email: selastlambou@gmail.com
     name: Stephane Segning
   license:
     name: MIT
-  version: 0.1.0
+  version: 0.1.1
 externalDocs:
   description: |
     Find out more about Managing your Course from afar. Let's meet on 
@@ -50,6 +50,8 @@ paths:
         - $ref: '#/components/parameters/width'
         - $ref: '#/components/parameters/height'
         - $ref: '#/components/parameters/format'
+        - $ref: '#/components/parameters/blur_sigma'
+        - $ref: '#/components/parameters/grayscale'
       responses:
         '302':
           description: The image was resize and in the location you'll get the link to it
@@ -105,21 +107,35 @@ components:
     width:
       name: width
       in: query
-      required: true
+      required: false
       description: The width of the final image
       schema:
         $ref: '#/components/schemas/Size'
     height:
       name: height
       in: query
-      required: true
+      required: false
       description: The height of the final image
       schema:
         $ref: '#/components/schemas/Size'
+    blur_sigma:
+      name: blur_sigma
+      in: query
+      required: false
+      description: How deep the image should be blured
+      schema:
+        $ref: '#/components/schemas/BlurSigma'
+    grayscale:
+      name: grayscale
+      in: query
+      required: false
+      description: Should the image be in grayscale?
+      schema:
+        $ref: '#/components/schemas/Grayscale'
     format:
       name: format
       in: query
-      required: true
+      required: false
       description: The format of the final image
       schema:
         $ref: '#/components/schemas/ImageFormat'
@@ -146,10 +162,18 @@ components:
       format: int32
       default: 200
       maximum: 2048
-      minimum: 100
+      minimum: 10
+    BlurSigma:
+      type: number
+      format: float
+      default: 5
+      maximum: 100
+      minimum: 0
+    Grayscale:
+      type: boolean
     ImageFormat:
       type: string
-      default: webp
+      default: jpg
       enum:
         - png
         - webp

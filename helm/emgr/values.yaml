@@ -1,0 +1,110 @@
+global:
+  version: fs-latest
+
+defaultPodOptions:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+
+controllers:
+  main:
+    type: deployment
+    replicas: 1
+    labels:
+      main: main-app
+    initContainers:
+      migrations:
+        image:
+          repository: busybox
+          tag: latest
+          pullPolicy: IfNotPresent
+        command:
+          - /bin/sh
+          - -c
+          - |
+            set -ex
+            
+            # Ensure the directory exists
+            chown -R 65532:65532 /tmp/data/images
+            chmod -R 775 /tmp/data/images
+        resources:
+          requests:
+            cpu: 50m
+            memory: 10Mi
+          limits:
+            cpu: 100m
+            memory: 50Mi
+    containers:
+      app:
+        image:
+          repository: ghcr.io/vymalo/image-resize
+          tag: '{{ .Values.global.version }}'
+          pullPolicy: IfNotPresent
+        
+        resources:
+          requests:
+            cpu: 125m
+            memory: 256Mi
+          limits:
+            cpu: 400m
+            memory: 512Mi
+        
+        # -- ConfigMap to be loaded as environment variables
+        envFrom:
+          - configMapRef:
+              name: '{{ .Release.Name }}-config'
+
+service:
+  app:
+    enabled: true
+    annotations: {}
+    nameOverride: service
+    type: ClusterIP
+    controller: main
+    ports:
+      http:
+        enabled: true
+        port: 3000
+        targetPort: 3000
+
+ingress:
+  app:
+    enabled: true
+    annotations: {}
+    nameOverride: ingress
+    #className: 'nginx'
+    hosts:
+      - host: emgr.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              identifier: app
+              port: http
+    tls:
+      - secretName: emgr-example-com-secret
+        hosts:
+          - emgr.example.com
+
+configMaps:
+  config:
+    enabled: true
+    annotations:
+      description: 'Common configuration for the emgr.'
+    data:
+      LOCAL_FS_STORAGE_PATH: /tmp/data/images
+      CDN_BASE_URL: https://emgr.com/api/images/files
+
+persistence:
+  data:
+    enabled: true
+    type: persistentVolumeClaim
+    accessMode: ReadWriteMany
+    size: 10Gi
+    storageClass: ~
+    advancedMounts:
+      main:
+        migrations:
+          - path: /tmp/data/images
+        app:
+          - path: /tmp/data/images
