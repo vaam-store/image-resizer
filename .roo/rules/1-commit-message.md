@@ -1,4 +1,0 @@
-- Always use conventional commit to commit the code.
-- Always scan all changes before doing a commit message.
-- Use always commit message body as list.
-- Use github tool and bash to check git changes
