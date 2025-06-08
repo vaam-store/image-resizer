@@ -4,7 +4,7 @@ use crate::services::image::handler::ImageService;
 use crate::services::storage::handler::StorageService;
 use anyhow::Result;
 use derive_builder::Builder;
-use gen_server::models::{DownloadPathParams, ImageFormat, ResizeQueryParams};
+use gen_server::models::DownloadPathParams;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 
@@ -56,16 +56,14 @@ impl ResizeService {
 
         // Process image
         let process_timer = Instant::now();
-        let (processed_image, content_type) = match self
-            .image_service
-            .process_image(&image_bytes, params)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Failed to process image: {}", e);
-                return Err(e);
-            }
-        };
+        let (processed_image, content_type) =
+            match self.image_service.process_image(&image_bytes, params) {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("Failed to process image: {}", e);
+                    return Err(e);
+                }
+            };
         debug!("Image processing took {:?}", process_timer.elapsed());
         info!("Image processed, {} bytes", processed_image.len());
 

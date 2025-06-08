@@ -6,7 +6,6 @@ use crate::services::storage::handler::StorageService;
 use anyhow::Result;
 use derive_builder::Builder;
 use gen_server::apis::ErrorHandler;
-use std::env;
 
 #[derive(Clone, Builder)]
 pub struct ApiService {

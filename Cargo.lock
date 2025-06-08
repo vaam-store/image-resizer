@@ -1295,7 +1295,6 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry 0.30.0",
  "tracing-subscriber",
- "validator",
 ]
 
 [[package]]

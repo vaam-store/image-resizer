@@ -19,18 +19,22 @@ impl Images for ApiService {
         let byte_array = self.resize_service.download(path_params).await;
 
         match byte_array {
-            Ok(data) => Ok(DownloadResponse::Status200_OperationPerformedSuccessfully(
-                ByteArray(data),
-            )),
+            Ok(data) => Ok(DownloadResponse::Status200_OperationPerformedSuccessfully {
+                body: ByteArray(data),
+                cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                e_tag: None,
+            }),
             Err(e) => {
                 // Log the error but return a generic error to the client
                 tracing::error!("Failed to download image: {}", e);
 
                 // Since we don't have a 404 variant, we'll return an empty 200 response
                 // This is better than returning a generic error that causes unhandled errors
-                Ok(DownloadResponse::Status200_OperationPerformedSuccessfully(
-                    ByteArray(Vec::new()),
-                ))
+                Ok(DownloadResponse::Status200_OperationPerformedSuccessfully {
+                    body: ByteArray(Vec::new()),
+                    cache_control: None,
+                    e_tag: None,
+                })
             }
         }
     }
@@ -47,7 +51,7 @@ impl Images for ApiService {
 
         match url {
             Ok(url) => Ok(
-                ResizeResponse::Status302_TheImageWasResizeAndInTheLocationYou {
+                ResizeResponse::Status301_TheImageWasResizeAndInTheLocationYou {
                     location: Some(url),
                 },
             ),

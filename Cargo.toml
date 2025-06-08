@@ -30,10 +30,7 @@ derive_builder = { version = "0" }
 anyhow = { version = "1" }
 thiserror = { version = "2" }
 
-o2o = {version =  "0.5.4", features = ["default"] }
-
-# For input validation
-validator = { version = "0", features = ["derive"] }
+o2o = { version = "0.5.4", features = ["default"] }
 
 # For hashing the cache key
 sha2 = "0"
