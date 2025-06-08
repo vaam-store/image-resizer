@@ -9,29 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  determine_changes:
-    runs-on: ubuntu-latest
-    outputs:
-      chart_changed: ${{ steps.changed_files.outputs.chart_yaml_changed }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Needed to diff against previous commits accurately
-
-      - name: Get changed files
-        id: changed_files
-        uses: tj-actions/changed-files@v46
-        with:
-          base_sha: ${{ github.event.before }}
-          sha: ${{ github.sha }}
-          files_yaml: |
-            chart_yaml:
-              - helm/**
-
   deploy:
-    needs: determine_changes
-    if: ${{ needs.determine_changes.outputs.chart_changed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
