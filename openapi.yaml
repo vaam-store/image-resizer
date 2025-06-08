@@ -72,6 +72,12 @@ paths:
       responses:
         '200':
           description: Operation performed successfully.
+          headers:
+            Cache-Control:
+              description: Cache control header
+              schema:
+                type: string
+                example: "public, max-age=31536000, immutable"
           content:
             image/png:
               schema:
@@ -143,7 +149,7 @@ components:
       name: key
       in: path
       required: true
-      description: The key of the final image
+      description: The unique key of the final image
       schema:
         $ref: '#/components/schemas/Key'
 
