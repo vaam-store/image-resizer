@@ -28,7 +28,7 @@ jobs:
           sha: ${{ github.sha }}
           files_yaml: |
             chart_yaml:
-              - helm/emgr/Chart.yaml
+              - helm/**
             docs_dir:
               - docs/**
 
