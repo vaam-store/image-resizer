@@ -70,7 +70,7 @@ controllers:
         # -- ConfigMap to be loaded as environment variables
         envFrom:
           - configMapRef:
-              name: '{{ .Release.Name }}-config'
+              identifier: config
 
 service:
   app:
