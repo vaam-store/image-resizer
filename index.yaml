@@ -3,6 +3,20 @@ entries:
   emgr:
   - apiVersion: v2
     appVersion: 0.1.1
+    created: "2025-06-08T00:37:39.531829104Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.0.1
+    description: A Helm chart for Kubernetes
+    digest: 8ccd476d311aac5749d920ed4ec2a54db3bb26543e259546bacb76c6c9056cd7
+    name: emgr
+    type: application
+    urls:
+    - https://github.com/vymalo/image-resizer/releases/download/emgr-0.1.3/emgr-0.1.3.tgz
+    version: 0.1.3
+  - apiVersion: v2
+    appVersion: 0.1.1
     created: "2025-06-08T00:18:53.607226234Z"
     dependencies:
     - name: common
@@ -15,4 +29,4 @@ entries:
     urls:
     - https://github.com/vymalo/image-resizer/releases/download/emgr-0.1.2/emgr-0.1.2.tgz
     version: 0.1.2
-generated: "2025-06-08T00:18:53.607236173Z"
+generated: "2025-06-08T00:37:39.531842589Z"
