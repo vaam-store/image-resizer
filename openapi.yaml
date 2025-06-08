@@ -53,7 +53,7 @@ paths:
         - $ref: '#/components/parameters/blur_sigma'
         - $ref: '#/components/parameters/grayscale'
       responses:
-        '302':
+        '301':
           description: The image was resize and in the location you'll get the link to it
           headers:
             Location:
@@ -61,16 +61,6 @@ paths:
               schema:
                 type: string
                 format: uri
-            Cache-Control:
-              description: Cache control header for the redirect
-              schema:
-                type: string
-                example: "no-cache, no-store, must-revalidate"
-            ETag:
-              description: ETag for the redirect response (typically not used for 302, but can be present)
-              schema:
-                type: string
-                example: "\"33a64df551425fcc55e4d42a148795d9f25f89d4\""
   /api/images/files/{key}:
     get:
       summary: Resize an image
