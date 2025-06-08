@@ -78,11 +78,6 @@ paths:
               schema:
                 type: string
                 example: "public, max-age=31536000, immutable"
-            ETag:
-              description: ETag of the image resource
-              schema:
-                type: string
-                example: "\"33a64df551425fcc55e4d42a148795d9f25f89d4\""
           content:
             image/png:
               schema:

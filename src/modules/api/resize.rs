@@ -22,7 +22,6 @@ impl Images for ApiService {
             Ok(data) => Ok(DownloadResponse::Status200_OperationPerformedSuccessfully {
                 body: ByteArray(data),
                 cache_control: Some("public, max-age=31536000, immutable".to_string()),
-                e_tag: None,
             }),
             Err(e) => {
                 // Log the error but return a generic error to the client
@@ -33,7 +32,6 @@ impl Images for ApiService {
                 Ok(DownloadResponse::Status200_OperationPerformedSuccessfully {
                     body: ByteArray(Vec::new()),
                     cache_control: None,
-                    e_tag: None,
                 })
             }
         }

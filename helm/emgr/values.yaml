@@ -28,7 +28,7 @@ controllers:
     podLabels:
       app: open-web-ui
     initContainers:
-      migrations:
+      permission-fix:
         securityContext:
           runAsUser: 0
           runAsGroup: 0
@@ -122,7 +122,7 @@ persistence:
     storageClass: ~
     advancedMounts:
       main:
-        migrations:
+        permission-fix:
           - path: /tmp/data/images
         app:
           - path: /tmp/data/images
