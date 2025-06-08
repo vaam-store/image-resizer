@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       chart_changed: ${{ steps.changed_files.outputs.chart_yaml_changed }}
-      docs_changed: ${{ steps.changed_files.outputs.docs_dir_changed }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,12 +28,10 @@ jobs:
           files_yaml: |
             chart_yaml:
               - helm/**
-            docs_dir:
-              - docs/**
 
   deploy:
     needs: determine_changes
-    if: ${{ needs.determine_changes.outputs.chart_changed == 'true' && needs.determine_changes.outputs.docs_changed == 'true' }}
+    if: ${{ needs.determine_changes.outputs.chart_changed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
