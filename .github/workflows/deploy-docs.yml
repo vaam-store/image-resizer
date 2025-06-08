@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write # Required for pushing to GHCR
 
 jobs:
   deploy:
@@ -72,3 +73,24 @@ jobs:
           # The chart-releaser-action handles checking out the gh-pages branch,
           # packaging charts, updating the index.yaml, committing, and pushing.
           # It is designed to be additive to the gh-pages branch.
+
+      # OCI Helm Chart Steps
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package Helm chart for OCI
+        # chart-releaser might package it, but we ensure it's done here for clarity and control
+        # and to ensure the .tgz is in the current working directory for the push command.
+        run: |
+          helm package ./helm/emgr --destination .
+          # helm package ./helm/emgr --destination . --version ${{ steps.get_version.outputs.VERSION }} # If dynamic versioning is needed
+
+      - name: Push Helm chart to GHCR
+        # The chart name (emgr) and version (from Chart.yaml) are automatically used by helm push.
+        # The OCI URL format is oci://<registry>/<namespace>/<chartname>
+        # The chart version will be appended as a tag automatically.
+        run: |
+          CHART_NAME=$(helm show chart ./helm/emgr | grep '^name:' | awk '{print $2}')
+          CHART_VERSION=$(helm show chart ./helm/emgr | grep '^version:' | awk '{print $2}')
+          echo "Pushing $CHART_NAME:$CHART_VERSION to oci://ghcr.io/${{ github.repository_owner }}/$CHART_NAME"
+          helm push ${CHART_NAME}-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/$CHART_NAME

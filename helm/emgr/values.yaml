@@ -3,17 +3,35 @@ global:
 
 defaultPodOptions:
   securityContext:
-    runAsUser: 1000
-    runAsGroup: 1000
-
+    runAsUser: 1001
+    runAsGroup: 1001
+      
 controllers:
   main:
     type: deployment
     replicas: 2
+    pod:
+      labels:
+        main: emgr-app
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - emgr-app
+              topologyKey: "kubernetes.io/hostname"
     labels:
       main: main-app
+    podLabels:
+      app: open-web-ui
     initContainers:
       migrations:
+        securityContext:
+          runAsUser: 0
+          runAsGroup: 0
         image:
           repository: busybox
           tag: latest
@@ -25,7 +43,7 @@ controllers:
             set -ex
             
             # Ensure the directory exists
-            chown -R 65532:65532 /tmp/data/images
+            chown -R 1001:1001 /tmp/data/images
             chmod -R 775 /tmp/data/images
         resources:
           requests:
@@ -57,7 +75,7 @@ controllers:
 service:
   app:
     enabled: true
-    annotations: {}
+    annotations: { }
     nameOverride: service
     type: ClusterIP
     controller: main
@@ -70,7 +88,7 @@ service:
 ingress:
   app:
     enabled: true
-    annotations: {}
+    annotations: { }
     nameOverride: ingress
     #className: 'nginx'
     hosts:
