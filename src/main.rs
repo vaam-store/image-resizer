@@ -9,6 +9,12 @@ use tracing::{debug, info};
 
 mod modules;
 mod services;
+mod models;
+
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,8 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize tracing and OpenTelemetry
     #[cfg(feature = "otel")]
-    let (metrics, provider, meter_provider) =
-        crate::modules::tracer::init_tracing(config.clone()).await?;
+    let (metrics, provider, meter_provider) = modules::tracer::init_tracing(config.clone()).await?;
 
     // Get address to listen on
     let addr = format!("{}:{:?}", config.http_host, config.http_port).parse::<SocketAddr>()?;

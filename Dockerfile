@@ -1,10 +1,8 @@
-FROM rust:1 as base
+FROM rust:1 as builder
 
 ENV APP_NAME=emgr
 
 WORKDIR /app
-
-FROM base as builder
 
 ENV CARGO_TERM_COLOR=always
 

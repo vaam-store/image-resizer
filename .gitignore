@@ -2,3 +2,6 @@
 .idea
 gen-server
 data
+
+charts
+*.tgz

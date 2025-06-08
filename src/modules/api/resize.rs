@@ -1,3 +1,4 @@
+use crate::models::params::ResizeQuery;
 use crate::modules::api::handler::ApiService;
 use async_trait::async_trait;
 use axum::http::Method;
@@ -8,25 +9,6 @@ use gen_server::types::ByteArray;
 
 #[async_trait]
 impl Images for ApiService {
-    async fn resize(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-        query_params: &ResizeQueryParams,
-    ) -> Result<ResizeResponse, ()> {
-        let url = self.resize_service.resize(query_params).await;
-
-        match url {
-            Ok(url) => Ok(
-                ResizeResponse::Status302_TheImageWasResizeAndInTheLocationYou {
-                    location: Some(url),
-                },
-            ),
-            Err(_) => Err(()),
-        }
-    }
-
     async fn download(
         &self,
         _method: &Method,
@@ -50,6 +32,26 @@ impl Images for ApiService {
                     ByteArray(Vec::new()),
                 ))
             }
+        }
+    }
+
+    async fn resize(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        query_params: &ResizeQueryParams,
+    ) -> Result<ResizeResponse, ()> {
+        let query = ResizeQuery::from(query_params.clone());
+        let url = self.resize_service.resize(&query).await;
+
+        match url {
+            Ok(url) => Ok(
+                ResizeResponse::Status302_TheImageWasResizeAndInTheLocationYou {
+                    location: Some(url),
+                },
+            ),
+            Err(_) => Err(()),
         }
     }
 }
