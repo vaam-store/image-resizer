@@ -6,6 +6,7 @@ use axum_extra::extract::{CookieJar, Host};
 use gen_server::apis::images::{DownloadResponse, Images, ResizeResponse};
 use gen_server::models::{DownloadPathParams, ResizeQueryParams};
 use gen_server::types::ByteArray;
+use tracing::log::error;
 
 #[async_trait]
 impl Images for ApiService {
@@ -53,7 +54,15 @@ impl Images for ApiService {
                     location: Some(url),
                 },
             ),
-            Err(_) => Err(()),
+            Err(e) => {
+                error!("Failed to resize image: {}", e);
+
+                Ok(
+                    ResizeResponse::Status301_TheImageWasResizeAndInTheLocationYou {
+                        location: Some(query.url),
+                    },
+                )
+            },
         }
     }
 }
