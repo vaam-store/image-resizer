@@ -77,8 +77,7 @@ impl ImageService {
             .http_client
             .get(url)
             .send()
-            .await
-            .context("Failed to initiate image download")?;
+            .await?;
 
         if !response.status().is_success() {
             return Err(anyhow::anyhow!(

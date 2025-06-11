@@ -120,3 +120,109 @@ Monitor your application's performance metrics to determine optimal settings:
 - **Response times** - adjust `HTTP_TIMEOUT_SECS` and `KEEP_ALIVE_TIMEOUT_SECS`
 
 Start with a profile that matches your use case, then fine-tune individual parameters based on your specific requirements and monitoring data.
+
+## Benchmark Configuration
+
+The included benchmark tool is now fully configurable through environment variables, allowing you to customize performance testing for your specific environment and requirements.
+
+### Benchmark Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BENCHMARK_HOST` | `localhost` | Target host for benchmark requests |
+| `BENCHMARK_PORT` | `8080` | Target port for benchmark requests |
+| `BENCHMARK_CONCURRENCY_LEVELS` | `1,5,10,20,50` | Comma-separated list of concurrency levels to test |
+| `BENCHMARK_TEST_URLS` | `https://picsum.photos/...` | Comma-separated list of test image URLs |
+| `BENCHMARK_RESIZE_PARAMS` | `300x300,800x,x600,1200x800` | Comma-separated list of resize parameters (format: `WIDTHxHEIGHT`) |
+| `BENCHMARK_WAIT_BETWEEN_TESTS` | `2` | Seconds to wait between different concurrency level tests |
+| `BENCHMARK_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
+| `BENCHMARK_OUTPUT_FORMAT` | `jpg` | Output image format for resize requests |
+
+### Resize Parameters Format
+
+The `BENCHMARK_RESIZE_PARAMS` variable accepts parameters in the format `WIDTHxHEIGHT`:
+- `300x300` - Resize to 300x300 pixels
+- `800x` - Resize to 800 pixels width, maintain aspect ratio
+- `x600` - Resize to 600 pixels height, maintain aspect ratio
+- `1200x800` - Resize to 1200x800 pixels
+
+### Benchmark Examples
+
+#### Basic Benchmark
+```bash
+# Run benchmark with default settings
+cargo run --bin benchmark
+```
+
+#### Custom Target Server
+```bash
+# Test against a different server
+export BENCHMARK_HOST=production-server.com
+export BENCHMARK_PORT=443
+cargo run --bin benchmark
+```
+
+#### High Concurrency Testing
+```bash
+# Test with higher concurrency levels
+export BENCHMARK_CONCURRENCY_LEVELS=1,10,25,50,100,200
+export BENCHMARK_REQUEST_TIMEOUT=60
+cargo run --bin benchmark
+```
+
+#### Custom Test Images
+```bash
+# Use your own test images
+export BENCHMARK_TEST_URLS="https://example.com/image1.jpg,https://example.com/image2.png,https://example.com/image3.webp"
+export BENCHMARK_RESIZE_PARAMS="100x100,500x500,1000x,x800"
+export BENCHMARK_OUTPUT_FORMAT=webp
+cargo run --bin benchmark
+```
+
+#### Quick Performance Check
+```bash
+# Fast benchmark for CI/CD pipelines
+export BENCHMARK_CONCURRENCY_LEVELS=1,5,10
+export BENCHMARK_WAIT_BETWEEN_TESTS=1
+export BENCHMARK_REQUEST_TIMEOUT=15
+cargo run --bin benchmark
+```
+
+### Benchmark Output
+
+The benchmark provides detailed performance metrics:
+- **Successful requests** - Number of successful vs total requests
+- **Total time** - Time taken for all requests at each concurrency level
+- **Requests/sec** - Throughput measurement
+- **Throughput** - Data transfer rate in MB/s
+- **Response times** - Average, minimum, and maximum response times
+
+### Integration with Performance Profiles
+
+You can combine benchmark configuration with performance profiles to test different server configurations:
+
+```bash
+# Test high throughput profile
+export PERFORMANCE_PROFILE=high_throughput
+./emgr &
+
+# Run benchmark against high throughput configuration
+export BENCHMARK_CONCURRENCY_LEVELS=10,50,100,200
+export BENCHMARK_REQUEST_TIMEOUT=60
+cargo run --bin benchmark
+
+# Stop server and test memory efficient profile
+killall emgr
+export PERFORMANCE_PROFILE=memory_efficient
+./emgr &
+
+# Run benchmark with lower concurrency
+export BENCHMARK_CONCURRENCY_LEVELS=1,5,10
+cargo run --bin benchmark
+```
+
+This configurable approach allows you to:
+1. **Test different environments** - development, staging, production
+2. **Validate performance profiles** - ensure profiles meet your requirements
+3. **Automate performance testing** - integrate into CI/CD pipelines
+4. **Custom load patterns** - simulate your specific usage patterns

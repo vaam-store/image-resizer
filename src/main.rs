@@ -29,6 +29,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{}:{:?}", config.http_host, config.http_port).parse::<SocketAddr>()?;
     let listener = TcpListener::bind(addr).await?;
     debug!(config.http_port, config.http_host, "Will start");
+    debug!(
+        config.max_concurrent_downloads,
+        config.max_concurrent_processing, 
+        config.http_timeout_secs, 
+        config.max_image_size_mb, 
+        config.cpu_thread_pool_size, 
+        config.enable_http2, 
+        config.connection_pool_size, 
+        config.keep_alive_timeout_secs, 
+        config.performance_profile, 
+        "Performance configuration"
+    );
 
     let api_service = Arc::new(ApiService::create(config)?);
 

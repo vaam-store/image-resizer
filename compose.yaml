@@ -42,14 +42,14 @@ services:
     deploy:
       replicas: 1
       resources:
-        limits:
-          memory: 125M
+        limits: &limits
+          memory: 250M
           cpus: "0.125"
     build:
       context: .
       dockerfile: Dockerfile
       target: fs_deploy
-    volumes:
+    volumes: &volumes
       - files:/app/data/images
     environment:
       CDN_BASE_URL: http://localhost:13001/api/images/files
@@ -57,13 +57,33 @@ services:
       OTLP_SPAN_ENDPOINT: http://tracking:4317
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
+      ENABLE_HTTP2: false
     ports:
       - "13001:3000"
-    depends_on:
+    depends_on: &depends_on
       tracking:
         condition: service_started
       volume_init:
         condition: service_completed_successfully
+
+  old-app:
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+      resources:
+        limits: *limits
+
+    image: ghcr.io/vymalo/image-resizer:fs-main-72f3bbb
+    volumes: *volumes
+    environment:
+      CDN_BASE_URL: http://localhost:13002/api/images/files
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OTLP_SPAN_ENDPOINT: http://tracking:4317
+      OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
+      OTLP_SERVICE_NAME: image-resizer
+    ports:
+      - "13002:3000"
+    depends_on: *depends_on
 
   openapi-generator-cli:
     image: openapitools/openapi-generator-cli

@@ -106,25 +106,37 @@ impl PerformanceConfig {
         // Only override if the environment variable was explicitly set (not using defaults)
         // This allows preset profiles to work while still allowing fine-tuning
 
-        // Note: Since envconfig doesn't provide a way to check if a value was explicitly set,
-        // we apply all values from env_config. Users can use PERFORMANCE_PROFILE for presets
-        // or set individual values for full control.
-        config.max_concurrent_downloads = env_config.max_concurrent_downloads;
+        if let Some(max_concurrent_downloads) = env_config.max_concurrent_downloads {
+            config.max_concurrent_downloads = max_concurrent_downloads;
+        }
 
         if let Some(max_processing) = env_config.max_concurrent_processing {
             config.max_concurrent_processing = max_processing;
         }
 
-        config.http_timeout = Duration::from_secs(env_config.http_timeout_secs);
-        config.max_image_size = env_config.max_image_size_mb * 1024 * 1024;
+        if let Some(http_timeout_secs) = env_config.http_timeout_secs {
+            config.http_timeout = Duration::from_secs(http_timeout_secs);
+        }
+
+        if let Some(max_image_size_mb) = env_config.max_image_size_mb {
+            config.max_image_size = max_image_size_mb * 1024 * 1024;
+        }
 
         if let Some(cpu_pool_size) = env_config.cpu_thread_pool_size {
             config.cpu_thread_pool_size = Some(cpu_pool_size);
         }
 
-        config.enable_http2 = env_config.enable_http2;
-        config.connection_pool_size = env_config.connection_pool_size;
-        config.keep_alive_timeout = Duration::from_secs(env_config.keep_alive_timeout_secs);
+        if let Some(enable_http2) = env_config.enable_http2 {
+            config.enable_http2 = enable_http2;
+        }
+
+        if let Some(connection_pool_size) = env_config.connection_pool_size {
+            config.connection_pool_size = connection_pool_size;
+        }
+
+        if let Some(keep_alive_timeout) = env_config.keep_alive_timeout_secs {
+            config.keep_alive_timeout = Duration::from_secs(keep_alive_timeout);
+        }
     }
 
     /// Get optimal CPU thread pool size
@@ -146,16 +158,18 @@ impl From<&EnvConfig> for PerformanceConfig {
         }
 
         Self {
-            max_concurrent_downloads: env_config.max_concurrent_downloads,
+            max_concurrent_downloads: env_config.max_concurrent_downloads.unwrap_or_else(|| 20),
             max_concurrent_processing: env_config
                 .max_concurrent_processing
                 .unwrap_or_else(num_cpus::get),
-            http_timeout: Duration::from_secs(env_config.http_timeout_secs),
-            max_image_size: env_config.max_image_size_mb * 1024 * 1024,
+            http_timeout: Duration::from_secs(env_config.http_timeout_secs.unwrap_or_else(|| 30)),
+            max_image_size: env_config.max_image_size_mb.unwrap_or_else(|| 50) * 1024 * 1024,
             cpu_thread_pool_size: env_config.cpu_thread_pool_size,
-            enable_http2: env_config.enable_http2,
-            connection_pool_size: env_config.connection_pool_size,
-            keep_alive_timeout: Duration::from_secs(env_config.keep_alive_timeout_secs),
+            enable_http2: env_config.enable_http2.unwrap_or(false),
+            connection_pool_size: env_config.connection_pool_size.unwrap_or(50),
+            keep_alive_timeout: Duration::from_secs(
+                env_config.keep_alive_timeout_secs.unwrap_or(60),
+            ),
         }
     }
 }
@@ -241,14 +255,14 @@ mod tests {
             #[cfg(feature = "otel")]
             otlp_service_name: "rust-app-example".to_string(),
             // Performance settings
-            max_concurrent_downloads: 20,
+            max_concurrent_downloads: Some(20),
             max_concurrent_processing: None,
-            http_timeout_secs: 30,
-            max_image_size_mb: 50,
+            http_timeout_secs: Some(30),
+            max_image_size_mb: Some(50),
             cpu_thread_pool_size: None,
-            enable_http2: true,
-            connection_pool_size: 50,
-            keep_alive_timeout_secs: 60,
+            enable_http2: Some(true),
+            connection_pool_size: Some(50),
+            keep_alive_timeout_secs: Some(60),
             performance_profile: None,
         };
 
@@ -292,14 +306,14 @@ mod tests {
             #[cfg(feature = "otel")]
             otlp_service_name: "rust-app-example".to_string(),
             // Custom performance settings
-            max_concurrent_downloads: 100,
+            max_concurrent_downloads: Some(100),
             max_concurrent_processing: Some(8),
-            http_timeout_secs: 15,
-            max_image_size_mb: 100,
+            http_timeout_secs: Some(15),
+            max_image_size_mb: Some(100),
             cpu_thread_pool_size: Some(4),
-            enable_http2: false,
-            connection_pool_size: 25,
-            keep_alive_timeout_secs: 120,
+            enable_http2: Some(false),
+            connection_pool_size: Some(25),
+            keep_alive_timeout_secs: Some(120),
             performance_profile: None,
         };
 

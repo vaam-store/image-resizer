@@ -1,54 +1,190 @@
+use anyhow::Result;
+use envconfig::Envconfig;
 use futures::future::join_all;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+#[derive(Envconfig, Clone, Debug)]
+pub struct BenchmarkConfig {
+    #[envconfig(from = "BENCHMARK_HOST", default = "localhost")]
+    pub host: String,
+
+    #[envconfig(from = "BENCHMARK_PORT", default = "8080")]
+    pub port: u16,
+
+    #[envconfig(from = "BENCHMARK_CONCURRENCY_LEVELS", default = "1,5,10,20,50")]
+    pub concurrency_levels: String,
+
+    #[envconfig(
+        from = "BENCHMARK_TEST_URLS",
+        default = "https://picsum.photos/1920/1080,https://picsum.photos/800/600,https://picsum.photos/400/300"
+    )]
+    pub test_urls: String,
+
+    #[envconfig(
+        from = "BENCHMARK_RESIZE_PARAMS",
+        default = "300x300,800x,x600,1200x800"
+    )]
+    pub resize_params: String,
+
+    #[envconfig(from = "BENCHMARK_WAIT_BETWEEN_TESTS", default = "4")]
+    pub wait_between_tests: u64,
+
+    #[envconfig(from = "BENCHMARK_REQUEST_TIMEOUT", default = "60")]
+    pub request_timeout: u64,
+
+    #[envconfig(from = "BENCHMARK_OUTPUT_FORMAT", default = "jpg")]
+    pub output_format: String,
+}
+
+impl BenchmarkConfig {
+    /// Parse concurrency levels from comma-separated string
+    pub fn get_concurrency_levels(&self) -> Vec<usize> {
+        self.concurrency_levels
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
+
+    /// Parse test URLs from comma-separated string
+    pub fn get_test_urls(&self) -> Vec<String> {
+        self.test_urls
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    }
+
+    /// Parse resize parameters from comma-separated string
+    /// Format: "WIDTHxHEIGHT" where WIDTH or HEIGHT can be empty for aspect ratio preservation
+    pub fn get_resize_params(&self) -> Vec<(Option<u32>, Option<u32>)> {
+        self.resize_params
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if let Some((width_str, height_str)) = s.split_once('x') {
+                    let width = if width_str.is_empty() {
+                        None
+                    } else {
+                        width_str.parse().ok()
+                    };
+                    let height = if height_str.is_empty() {
+                        None
+                    } else {
+                        height_str.parse().ok()
+                    };
+                    Some((width, height))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get the base URL for the benchmark target
+    pub fn get_base_url(&self) -> String {
+        format!("http://{}:{}", self.host, self.port)
+    }
+
+    /// Validate the configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if self.get_concurrency_levels().is_empty() {
+            return Err("No valid concurrency levels configured".to_string());
+        }
+
+        if self.get_test_urls().is_empty() {
+            return Err("No valid test URLs configured".to_string());
+        }
+
+        if self.get_resize_params().is_empty() {
+            return Err("No valid resize parameters configured".to_string());
+        }
+
+        if self.request_timeout == 0 {
+            return Err("Request timeout must be greater than 0".to_string());
+        }
+
+        Ok(())
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
+    let config = BenchmarkConfig::init_from_env()?;
+
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        eprintln!("❌ Configuration error: {}", e);
+        return Ok(());
+    }
+
     println!("🚀 Image Resize Performance Benchmark");
     println!("=====================================");
+    println!("📋 Configuration:");
+    println!("   Host: {}", config.host);
+    println!("   Port: {}", config.port);
+    println!(
+        "   Concurrency levels: {:?}",
+        config.get_concurrency_levels()
+    );
+    println!("   Test URLs count: {}", config.get_test_urls().len());
+    println!(
+        "   Resize params count: {}",
+        config.get_resize_params().len()
+    );
+    println!("   Output format: {}", config.output_format);
+    println!("   Request timeout: {}s", config.request_timeout);
+    println!("   Wait between tests: {}s", config.wait_between_tests);
+    println!();
 
-    // Concurrency levels to test
-    let concurrency_levels = vec![1, 5, 10, 20, 50];
+    let concurrency_levels = config.get_concurrency_levels();
+    let test_urls = config.get_test_urls();
+    let resize_params = config.get_resize_params();
 
-    for concurrency in concurrency_levels {
-        println!("\n📊 Testing with {} concurrent requests", concurrency);
+    for concurrency in &concurrency_levels {
+        println!("\n📊 Testing with {} concurrent requests", *concurrency);
         println!("----------------------------------------");
 
         let start_time = Instant::now();
         let mut tasks = Vec::new();
 
-        for i in 0..concurrency {
+        for i in 0..*concurrency {
+            let config_clone = config.clone();
+            let test_urls_clone = test_urls.clone();
+            let resize_params_clone = resize_params.clone();
+
             let task = tokio::spawn(async move {
-                let client = reqwest::Client::new();
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(config_clone.request_timeout))
+                    .build()
+                    .unwrap();
                 let request_start = Instant::now();
 
-                // Test URLs - create them inside the task to avoid lifetime issues
-                let test_urls = [
-                    "https://picsum.photos/1920/1080", // Large image
-                    "https://picsum.photos/800/600",   // Medium image
-                    "https://picsum.photos/400/300",   // Small image
-                ];
+                let url = &test_urls_clone[i % test_urls_clone.len()];
+                let (width, height) = resize_params_clone[i % resize_params_clone.len()];
 
-                let resize_params = [
-                    (Some(300), Some(300)),  // Thumbnail
-                    (Some(800), None),       // Width only
-                    (None, Some(600)),       // Height only
-                    (Some(1200), Some(800)), // Large resize
-                ];
+                // Build query parameters
+                let mut query_params = Vec::new();
+                if let Some(w) = width {
+                    query_params.push(format!("width={}", w));
+                }
+                if let Some(h) = height {
+                    query_params.push(format!("height={}", h));
+                }
+                query_params.push(format!("format={}", config_clone.output_format));
 
-                let url = test_urls[i % test_urls.len()];
-                let (width, height) = resize_params[i % resize_params.len()];
-
-                // Simulate resize request
-                let params = format!(
-                    "?width={}&height={}&format=jpg",
-                    width.map_or("".to_string(), |w| w.to_string()),
-                    height.map_or("".to_string(), |h| h.to_string())
-                );
+                let params = if query_params.is_empty() {
+                    String::new()
+                } else {
+                    format!("&{}", query_params.join("&"))
+                };
 
                 let encoded_url = urlencoding::encode(url);
-                let url_with_params =
-                    format!("http://localhost:8080/resize?url={}{}", encoded_url, params);
+                let url_with_params = format!(
+                    "{}/api/images/resize?url={}{}",
+                    config_clone.get_base_url(),
+                    encoded_url,
+                    params
+                );
 
                 match client.get(&url_with_params).send().await {
                     Ok(response) => {
@@ -117,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Wait between tests
-        sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(config.wait_between_tests)).await;
     }
 
     println!("\n🎯 Performance Recommendations:");
@@ -127,6 +263,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("3. Verify network bandwidth utilization");
     println!("4. Test with different image sizes and formats");
     println!("5. Profile with tools like `perf` or `flamegraph`");
+    println!("\n💡 Configuration Tips:");
+    println!("- Use BENCHMARK_HOST and BENCHMARK_PORT to target different servers");
+    println!("- Customize BENCHMARK_CONCURRENCY_LEVELS (e.g., '1,10,50,100')");
+    println!("- Add your own test URLs with BENCHMARK_TEST_URLS");
+    println!(
+        "- Configure resize parameters with BENCHMARK_RESIZE_PARAMS (e.g., '100x100,500x,x300')"
+    );
 
     Ok(())
 }
