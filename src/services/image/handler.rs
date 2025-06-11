@@ -32,8 +32,23 @@ impl ImageService {
     }
 
     /// Process an image (decode, resize, encode)
-    pub fn process_image(
+    pub async fn process_image(
         &self,
+        image_bytes: &[u8],
+        params: &ResizeQuery,
+    ) -> Result<(Vec<u8>, String)> {
+        // Clone the data needed for the blocking operation
+        let image_bytes = image_bytes.to_vec();
+        let params = params.clone();
+
+        // Move CPU-intensive image processing to a blocking thread
+        tokio::task::spawn_blocking(move || Self::process_image_blocking(&image_bytes, &params))
+            .await
+            .context("Image processing task panicked")?
+    }
+
+    /// CPU-intensive image processing operations (runs in blocking thread)
+    fn process_image_blocking(
         image_bytes: &[u8],
         params: &ResizeQuery,
     ) -> Result<(Vec<u8>, String)> {

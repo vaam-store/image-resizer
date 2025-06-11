@@ -57,7 +57,7 @@ impl ResizeService {
         // Process image
         let process_timer = Instant::now();
         let (processed_image, content_type) =
-            match self.image_service.process_image(&image_bytes, params) {
+            match self.image_service.process_image(&image_bytes, params).await {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Failed to process image: {}", e);
