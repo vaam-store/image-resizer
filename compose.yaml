@@ -58,6 +58,8 @@ services:
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
       ENABLE_HTTP2: false
+      PERFORMANCE_PROFILE: high_throughput
+      MAX_CONCURRENT_PROCESSING: 40
     ports:
       - "13001:3000"
     depends_on: &depends_on

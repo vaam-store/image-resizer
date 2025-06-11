@@ -112,6 +112,7 @@ configMaps:
     data:
       LOCAL_FS_STORAGE_PATH: /tmp/data/images
       CDN_BASE_URL: https://emgr.com
+      PERFORMANCE_PROFILE: high_throughput
 
 persistence:
   data:
