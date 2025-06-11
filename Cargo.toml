@@ -5,7 +5,11 @@ edition = "2024"
 
 [[bin]]
 name = "healthcheck"
-path = "src/healthcheck.rs"
+path = "src/bin/healthcheck.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
 
 [dependencies]
 gen-server = { path = "./packages/gen-server", features = ["conversion"] }
@@ -19,8 +23,12 @@ tower-http = { version = "0.6", features = ["compression-full", "cors"] }
 
 tokio = { version = "1", features = ["full"] }
 
-reqwest = { version = "0.12", features = ["json", "stream"] } # stream for efficient downloads
-image = "0.25" # Core image processing
+reqwest = { version = "0.12", features = ["json", "stream", "http2", "gzip"] } # Optimized HTTP client
+image = { version = "0.25", features = ["jpeg", "png", "webp"] } # Core image processing with specific formats
+rayon = "1.8" # Parallel processing and custom thread pools
+num_cpus = "1.16" # CPU detection for optimal thread pool sizing
+bytes = "1.5" # Efficient byte handling
+futures = "0.3" # Stream processing utilities
 
 aws-config = { version = "1.6", optional = true } # AWS SDK configuration (for MinIO)
 aws-sdk-s3 = { version = "1.90", optional = true } # AWS S3 client (MinIO compatible)
@@ -29,6 +37,7 @@ envconfig = { version = "0" }
 derive_builder = { version = "0" }
 anyhow = { version = "1" }
 thiserror = { version = "2" }
+urlencoding = "2.1"
 
 o2o = { version = "0.5.4", features = ["default"] }
 
@@ -48,12 +57,31 @@ tracing = { version = "0", features = ["attributes"] }
 prometheus = { version = "0", optional = true }
 
 
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [profile.prod]
 inherits = "release"
-lto = true
+lto = "fat"
 opt-level = "z"
 codegen-units = 1
 strip = true
+
+# Performance-optimized profile for maximum speed
+[profile.perf]
+inherits = "release"
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
+# Enable CPU-specific optimizations
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
 
 [features]
 default = []

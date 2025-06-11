@@ -1,3 +1,4 @@
+use crate::config::performance::PerformanceConfig;
 use crate::models::params::ResizeQuery;
 use crate::services::cache::handler::CacheService;
 use crate::services::image::handler::ImageService;
@@ -8,7 +9,7 @@ use gen_server::models::DownloadPathParams;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 
-/// Main service for image resizing
+/// Main service for image resizing with performance optimizations
 #[derive(Clone, Builder)]
 pub struct ResizeService {
     storage_service: StorageService,
@@ -17,7 +18,31 @@ pub struct ResizeService {
 }
 
 impl ResizeService {
-    /// Main resize method that orchestrates the entire process
+    /// Create a new ResizeService with default performance configuration
+    pub fn new(storage_service: StorageService, cache_service: CacheService) -> Result<Self> {
+        let image_service = ImageService::new()?;
+        Ok(Self {
+            storage_service,
+            cache_service,
+            image_service,
+        })
+    }
+
+    /// Create a new ResizeService with custom performance configuration
+    pub fn with_config(
+        storage_service: StorageService,
+        cache_service: CacheService,
+        config: PerformanceConfig,
+    ) -> Result<Self> {
+        let image_service = ImageService::with_config(config)?;
+        Ok(Self {
+            storage_service,
+            cache_service,
+            image_service,
+        })
+    }
+
+    /// Main resize method with optimized processing
     #[instrument(skip(self), fields(url = %params.url))]
     pub async fn resize(&self, params: &ResizeQuery) -> Result<String> {
         // Generate cache key
@@ -85,6 +110,21 @@ impl ResizeService {
         info!("Returning CDN URL: {}", cdn_url);
 
         Ok(cdn_url)
+    }
+
+    /// Batch processing for multiple images with controlled concurrency
+    pub async fn resize_batch(
+        &self,
+        requests: Vec<ResizeQuery>,
+        max_concurrent: usize,
+    ) -> Vec<Result<String>> {
+        use futures::stream::{self, StreamExt};
+
+        stream::iter(requests)
+            .map(|params| async move { self.resize(&params).await })
+            .buffer_unordered(max_concurrent)
+            .collect()
+            .await
     }
 
     #[instrument(skip(self), fields(url = %params.key))]

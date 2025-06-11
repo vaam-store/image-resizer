@@ -1,7 +1,7 @@
+use crate::config::performance::PerformanceConfig;
 use crate::modules::env::env::EnvConfig;
 use crate::services::cache::handler::CacheServiceBuilder;
-use crate::services::image::handler::ImageServiceBuilder;
-use crate::services::resize::handler::{ResizeService, ResizeServiceBuilder};
+use crate::services::resize::handler::ResizeService;
 use crate::services::storage::handler::StorageService;
 use anyhow::Result;
 use derive_builder::Builder;
@@ -14,11 +14,11 @@ pub struct ApiService {
 
 impl ApiService {
     pub fn create(config: EnvConfig) -> Result<Self> {
+        // Create performance configuration from environment
+        let performance_config = PerformanceConfig::from(&config);
+
         // Initialize cache service
         let cache_service = CacheServiceBuilder::default().build()?;
-
-        // Image service
-        let image_service = ImageServiceBuilder::default().build()?;
 
         // Create storage config
         let mut storage_config =
@@ -52,12 +52,9 @@ impl ApiService {
         // Create storage service
         let storage_service = StorageService::new(storage_config)?;
 
-        // Initialize resize service
-        let resize_service = ResizeServiceBuilder::default()
-            .storage_service(storage_service)
-            .cache_service(cache_service)
-            .image_service(image_service)
-            .build()?;
+        // Initialize resize service with performance configuration
+        let resize_service =
+            ResizeService::with_config(storage_service, cache_service, performance_config)?;
 
         // Create API service
         let api_service = ApiServiceBuilder::default()

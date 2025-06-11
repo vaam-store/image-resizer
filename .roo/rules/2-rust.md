@@ -1,0 +1,4 @@
+- Think about running `cargo check` before doing a commit.
+- Write / Update tests for files you're editing
+- Always propose ways to optimise
+- This code is using rust edition 2024

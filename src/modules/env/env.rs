@@ -56,4 +56,32 @@ pub struct EnvConfig {
     #[cfg(feature = "otel")]
     #[envconfig(from = "OTLP_SERVICE_NAME", default = "rust-app-example")]
     pub otlp_service_name: String,
+
+    // Performance configuration
+    #[envconfig(from = "MAX_CONCURRENT_DOWNLOADS", default = "20")]
+    pub max_concurrent_downloads: usize,
+
+    #[envconfig(from = "MAX_CONCURRENT_PROCESSING")]
+    pub max_concurrent_processing: Option<usize>,
+
+    #[envconfig(from = "HTTP_TIMEOUT_SECS", default = "30")]
+    pub http_timeout_secs: u64,
+
+    #[envconfig(from = "MAX_IMAGE_SIZE_MB", default = "50")]
+    pub max_image_size_mb: u64,
+
+    #[envconfig(from = "CPU_THREAD_POOL_SIZE")]
+    pub cpu_thread_pool_size: Option<usize>,
+
+    #[envconfig(from = "ENABLE_HTTP2", default = "true")]
+    pub enable_http2: bool,
+
+    #[envconfig(from = "CONNECTION_POOL_SIZE", default = "50")]
+    pub connection_pool_size: usize,
+
+    #[envconfig(from = "KEEP_ALIVE_TIMEOUT_SECS", default = "60")]
+    pub keep_alive_timeout_secs: u64,
+
+    #[envconfig(from = "PERFORMANCE_PROFILE")]
+    pub performance_profile: Option<String>,
 }
