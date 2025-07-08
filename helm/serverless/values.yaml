@@ -11,7 +11,7 @@ global:
   security:
     ## @param global.security.allowInsecureImages Allows skipping image verification
     allowInsecureImages: false
-  
+
 annotations: ~
 
 labels: ~
@@ -67,15 +67,15 @@ env:
   ENABLE_HTTP2: false
   PERFORMANCE_PROFILE: high_throughput
   MAX_CONCURRENT_PROCESSING: 4
-  
+
 ports:
   http1: # kservice requirements
     port: 3000
 
 resources:
   limits:
-    cpu: 1000m
-    memory: 4Gi
+    cpu: 1500m
+    memory: 3Gi
   requests:
     cpu: 1000m
     memory: 2Gi
