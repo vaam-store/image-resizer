@@ -1,0 +1,56 @@
+apiVersion: v1
+entries:
+  emgr:
+  - annotations:
+      category: Application
+    apiVersion: v2
+    appVersion: 0.1.2
+    created: "2025-07-08T21:52:40.599648731Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.0.1
+    description: A Helm chart for Kubernetes
+    digest: 2d0e5dddbd3d2e83bb969adcdd51045f806667906e4dd19d9a1518075cbdde0d
+    home: https://github.com/vaam-store/image-resizer
+    maintainers:
+    - email: team@vaam.com
+      name: VAAM Team
+    name: emgr
+    sources:
+    - https://github.com/vaam-store/image-resizer
+    type: application
+    urls:
+    - https://github.com/vaam-store/image-resizer/releases/download/emgr-0.1.8/emgr-0.1.8.tgz
+    version: 0.1.8
+  emgr-serverless:
+  - annotations:
+      category: Application
+    apiVersion: v2
+    appVersion: 0.1.2
+    created: "2025-07-08T21:52:40.803314618Z"
+    dependencies:
+    - name: common
+      repository: oci://registry-1.docker.io/bitnamicharts
+      tags:
+      - bitnami-common
+      version: '*'
+    description: A Helm chart for EmgR application
+    digest: ba63aa209397a8f6a424894c8e701dfb85af59be00b5f0c76741e41d5db78a68
+    home: https://github.com/vaam-store/image-resizer
+    keywords:
+    - vaam
+    - eat
+    - emgr
+    - serverless
+    maintainers:
+    - email: team@vaam.com
+      name: VAAM Team
+    name: emgr-serverless
+    sources:
+    - https://github.com/vaam-store/image-resizer
+    type: application
+    urls:
+    - https://github.com/vaam-store/image-resizer/releases/download/emgr-serverless-0.1.1/emgr-serverless-0.1.1.tgz
+    version: 0.1.1
+generated: "2025-07-08T21:52:40.803322353Z"
