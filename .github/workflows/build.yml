@@ -24,12 +24,20 @@ jobs:
 
     strategy:
       matrix:
-        flavor: [fs, s3,]
+        flavor:
+          - fs 
+          - fs_otel
+          - s3
+          - s3_otel
         include:
           - flavor: fs
             docker_target: fs_deploy
+          - flavor: fs_otel
+            docker_target: fs_otel_deploy
           - flavor: s3
             docker_target: s3_deploy
+          - flavor: s3_otel
+            docker_target: s3_otel_deploy
 
     steps:
       # Checkout the repository code

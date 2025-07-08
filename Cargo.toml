@@ -30,8 +30,8 @@ num_cpus = "1.16" # CPU detection for optimal thread pool sizing
 bytes = "1.5" # Efficient byte handling
 futures = "0.3" # Stream processing utilities
 
-aws-config = { version = "1.6", optional = true } # AWS SDK configuration (for MinIO)
-aws-sdk-s3 = { version = "1.90", optional = true } # AWS S3 client (MinIO compatible)
+aws-config = { version = "1.6", optional = true, features = ["behavior-version-latest"] } # AWS SDK configuration (for MinIO)
+aws-sdk-s3 = { version = "1.90", optional = true, features = ["behavior-version-latest"] } # AWS S3 client (MinIO compatible)
 
 envconfig = { version = "0" }
 derive_builder = { version = "0" }

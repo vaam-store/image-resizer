@@ -11,6 +11,9 @@ pub struct EnvConfig {
     #[envconfig(from = "STORAGE_TYPE")]
     pub storage_type: Option<String>,
 
+    #[envconfig(from = "STORAGE_SUB_PATH", default = "")]
+    pub sub_path: String,
+
     #[cfg(feature = "s3")]
     #[envconfig(from = "MINIO_ENDPOINT_URL", default = "http://localhost:9000")]
     pub minio_endpoint_url: String,

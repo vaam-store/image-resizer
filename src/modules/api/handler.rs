@@ -18,7 +18,9 @@ impl ApiService {
         let performance_config = PerformanceConfig::from(&config);
 
         // Initialize cache service
-        let cache_service = CacheServiceBuilder::default().build()?;
+        let cache_service = CacheServiceBuilder::default()
+            .minio_sub_path(config.sub_path)
+            .build()?;
 
         // Create storage config
         let mut storage_config =

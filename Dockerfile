@@ -17,10 +17,38 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
+  cargo build --profile prod --locked --bin emgr --features="local_fs" \
+  && cp ./target/prod/$APP_NAME $APP_NAME
+
+FROM builder as local_fs_otel_builder
+
+RUN \
+  --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
+  --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
+  --mount=type=bind,source=./packages,target=/app/packages \
+  --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=cache,target=/app/target \
+  --mount=type=cache,target=/usr/local/cargo/registry/cache \
+  --mount=type=cache,target=/usr/local/cargo/registry/index \
+  --mount=type=cache,target=/usr/local/cargo/git/db \
   cargo build --profile prod --locked --bin emgr --features="local_fs otel" \
   && cp ./target/prod/$APP_NAME $APP_NAME
 
 FROM builder as s3_fs_builder
+
+RUN \
+  --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
+  --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
+  --mount=type=bind,source=./packages,target=/app/packages \
+  --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=cache,target=/app/target \
+  --mount=type=cache,target=/usr/local/cargo/registry/cache \
+  --mount=type=cache,target=/usr/local/cargo/registry/index \
+  --mount=type=cache,target=/usr/local/cargo/git/db \
+  cargo build --profile prod --locked --bin emgr --features="s3" \
+  && cp ./target/prod/$APP_NAME $APP_NAME
+
+FROM builder as s3_fs_otel_builder
 
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
@@ -68,11 +96,19 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["/app/healthcheck"]
 
 ENTRYPOINT ["/app/emgr"]
-
 FROM base_deploy as fs_deploy
 
+
 COPY --from=local_fs_builder /app/$APP_NAME /app/emgr
+
+FROM base_deploy as fs_otel_deploy
+
+COPY --from=local_fs_otel_builder /app/$APP_NAME /app/emgr
 
 FROM base_deploy as s3_deploy
 
 COPY --from=s3_fs_builder /app/$APP_NAME /app/emgr
+
+FROM base_deploy as s3_otel_deploy
+
+COPY --from=s3_fs_otel_builder /app/$APP_NAME /app/emgr

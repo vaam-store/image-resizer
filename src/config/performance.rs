@@ -177,8 +177,6 @@ impl From<&EnvConfig> for PerformanceConfig {
 /// Runtime performance metrics
 #[derive(Debug, Default)]
 pub struct PerformanceMetrics {
-    pub active_downloads: std::sync::atomic::AtomicUsize,
-    pub active_processing: std::sync::atomic::AtomicUsize,
     pub total_requests: std::sync::atomic::AtomicU64,
     pub cache_hits: std::sync::atomic::AtomicU64,
     pub cache_misses: std::sync::atomic::AtomicU64,
@@ -233,6 +231,7 @@ mod tests {
             http_host: "0.0.0.0".to_string(),
             http_port: 3000,
             storage_type: None,
+            sub_path: "".to_string(),
             #[cfg(feature = "s3")]
             minio_endpoint_url: "http://localhost:9000".to_string(),
             #[cfg(feature = "s3")]
@@ -284,6 +283,7 @@ mod tests {
             http_host: "0.0.0.0".to_string(),
             http_port: 3000,
             storage_type: None,
+            sub_path: "".to_string(),
             #[cfg(feature = "s3")]
             minio_endpoint_url: "http://localhost:9000".to_string(),
             #[cfg(feature = "s3")]

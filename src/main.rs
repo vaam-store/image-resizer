@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize tracing and OpenTelemetry
     #[cfg(feature = "otel")]
-    let (metrics, provider, meter_provider) = modules::tracer::init_tracing(config.clone()).await?;
+    let (metrics, trace_provider, meter_provider) = modules::tracer::init_tracing(config.clone()).await?;
 
     // Get address to listen on
     let addr = format!("{}:{:?}", config.http_host, config.http_port).parse::<SocketAddr>()?;
@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "otel")]
     {
         // Shutdown the tracer provider
-        provider.shutdown()?;
+        trace_provider.shutdown()?;
         meter_provider.shutdown()?;
     }
     Ok(())

@@ -38,18 +38,17 @@ services:
           cpus: "0.01"
 
   app:
-    restart: unless-stopped
     deploy:
       replicas: 1
       resources:
         limits: &limits
-          memory: 250M
-          cpus: "0.125"
+          memory: 1G
+          cpus: "1"
     build:
       context: .
       dockerfile: Dockerfile
-      target: fs_deploy
-    volumes: &volumes
+      target: fs_otel_deploy
+    volumes:
       - files:/app/data/images
     environment:
       CDN_BASE_URL: http://localhost:13001/api/images/files
@@ -62,30 +61,108 @@ services:
       MAX_CONCURRENT_PROCESSING: 40
     ports:
       - "13001:3000"
-    depends_on: &depends_on
+    depends_on:
       tracking:
         condition: service_started
       volume_init:
         condition: service_completed_successfully
-
-  old-app:
-    restart: unless-stopped
+        
+  app-s3:
     deploy:
       replicas: 1
       resources:
         limits: *limits
-
-    image: ghcr.io/vymalo/image-resizer:fs-main-72f3bbb
-    volumes: *volumes
+        
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: s3_otel_deploy
     environment:
-      CDN_BASE_URL: http://localhost:13002/api/images/files
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY_ID: minio
+      MINIO_SECRET_ACCESS_KEY: minio123
+      MINIO_BUCKET: emgr
+      MINIO_REGION: ~
+      
+      STORAGE_SUB_PATH: "gen/"
+      
+      CDN_BASE_URL: http://localhost:19000/emgr
       LOG_LEVEL: ${LOG_LEVEL:-info}
       OTLP_SPAN_ENDPOINT: http://tracking:4317
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
+      ENABLE_HTTP2: false
+      PERFORMANCE_PROFILE: high_throughput
+      MAX_CONCURRENT_PROCESSING: 40
     ports:
       - "13002:3000"
-    depends_on: *depends_on
+    depends_on:
+      tracking:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+
+  minio-object-browser:
+    image: bitnami/minio-object-browser
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 500M
+    ports:
+      - ${MINIO_PORT:-19090}:9090
+    environment:
+      CONSOLE_PBKDF_PASSPHRASE: some-passphrase
+      CONSOLE_PBKDF_SALT: some-salt
+      CONSOLE_MINIO_SERVER: "http://minio:9000"
+    command:
+      - server
+
+  minio:
+    image: bitnami/minio:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 500M
+    volumes:
+      - minio:/bitnami/minio/data
+    ports:
+      - ${MINIO_PORT:-19000}:9000
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+      MINIO_BROWSER_SESSION_DURATION: 7d
+      MINIO_BROWSER_LOGIN_ANIMATION: off
+
+  minio-init:
+    image: bitnami/minio
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 500M
+    volumes:
+      - .docker/minio/policy.json:/tmp/policy.json
+    command:
+      - /bin/bash
+      - -c
+      - |-
+        set -e;
+
+        sleep 5;
+        
+        mc alias set bucketer http://minio:9000 minio minio123;
+        mc admin service restart bucketer --wait --json;
+
+        sleep 5;
+
+        mc mb bucketer/emgr --ignore-existing
+
+        mc anonymous set-json /tmp/policy.json bucketer/emgr
+    depends_on:
+      minio:
+        condition: service_started
 
   openapi-generator-cli:
     image: openapitools/openapi-generator-cli
@@ -105,3 +182,4 @@ services:
 
 volumes:
   files:
+  minio:

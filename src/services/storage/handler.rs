@@ -285,6 +285,7 @@ impl StorageConfig {
     }
 
     /// Set the local file system configuration
+    #[cfg(feature = "local_fs")]
     pub fn with_local_fs_config(mut self, base_path: impl AsRef<std::path::Path>) -> Self {
         self.local_fs_config = Some(LocalFsConfig {
             base_path: base_path.as_ref().to_path_buf(),
