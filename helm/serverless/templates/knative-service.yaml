@@ -44,6 +44,19 @@ spec:
           {{ with .Values.resources }}
           resources: {{ include "common.tplvalues.render" ( dict "value" . "context" $ ) | nindent 14 }}
           {{ end }}
+
+          readinessProbe:
+            httpGet:
+              port: {{ .Values.ports.http1.port }}
+              path: "/health"
+          livenessProbe:
+            httpGet:
+              port: {{ .Values.ports.http1.port }}
+              path: "/health"
+          startupProbe:
+            httpGet:
+              port: {{ .Values.ports.http1.port }}
+              path: "/health"
               
 
             
