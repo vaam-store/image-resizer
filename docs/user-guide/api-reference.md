@@ -4,7 +4,7 @@ The Image Resize Service provides a RESTful API for resizing and manipulating im
 
 ## OpenAPI Specification
 
-The complete API specification is available in OpenAPI format in the [openapi.yaml](https://github.com/vymalo/image-resizer/blob/main/openapi.yaml) file in the repository root.
+The complete API specification is available in OpenAPI format in the [openapi.yaml](https://github.com/vaam-store/image-resizer/blob/main/openapi.yaml) file in the repository root.
 
 ## Base URL
 

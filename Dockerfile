@@ -78,7 +78,7 @@ RUN \
 
 FROM gcr.io/distroless/cc-debian12:nonroot as base_deploy
 
-LABEL maintainer="vymalo <vymalo@ssegning.com>"
+LABEL maintainer="vaam-store <vaam-store@ssegning.com>"
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Resize images with this image"
 

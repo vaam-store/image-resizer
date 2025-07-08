@@ -2,13 +2,13 @@ openapi: 3.0.3
 info:
   title: EmgR OpenApi
   description: |
-    EmgR app. More at [official doc](https://vymalo.github.io/image-resizer)
+    EmgR app. More at [official doc](https://vaam-store.github.io/image-resizer)
   contact:
     email: selastlambou@gmail.com
     name: Stephane Segning
   license:
     name: MIT
-  version: 0.1.1
+  version: 0.1.2
 externalDocs:
   description: |
     Find out more about Managing your Course from afar. Let's meet on 

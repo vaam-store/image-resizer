@@ -10,7 +10,7 @@ permissions:
   packages: write # Required for pushing to GHCR
 
 jobs:
-  deploy-webite:
+  deploy-website:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -41,6 +41,8 @@ jobs:
           
 
   deploy-helm:
+    needs: 
+      - deploy-website
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -72,3 +74,4 @@ jobs:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         with:
           skip_existing: false
+          charts_dir: 'helm'

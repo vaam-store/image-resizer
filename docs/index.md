@@ -14,7 +14,7 @@ Welcome to the documentation for the Image Resize Service, a high-performance im
 
 ```bash
 # Clone the repository
-git clone https://github.com/vymalo/image-resizer.git
+git clone https://github.com/vaam-store/image-resizer.git
 cd image-resizer
 
 # Build and run with Docker Compose

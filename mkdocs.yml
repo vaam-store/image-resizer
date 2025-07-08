@@ -1,8 +1,8 @@
 site_name: Image Resize Service
 site_description: Documentation for the Image Resize Service
 site_author: Image Resize Team
-repo_url: https://github.com/vymalo/image-resizer
-repo_name: vymalo/image-resizer
+repo_url: https://github.com/vaam-store/image-resizer
+repo_name: vaam-store/image-resizer
 
 theme:
   name: material

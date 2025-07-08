@@ -14,7 +14,7 @@ This guide will help you install and run the Image Resize Service.
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/vymalo/image-resizer.git
+git clone https://github.com/vaam-store/image-resizer.git
 cd image-resizer
 ```
 
