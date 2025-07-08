@@ -1,0 +1,90 @@
+global:
+  imageRegistry: ""
+  ## e.g.
+  ## imagePullSecrets:
+  ##   - myRegistryKeySecretName
+  ##
+  imagePullSecrets: [ ]
+  defaultStorageClass: ""
+  ## Security parameters
+  ##
+  security:
+    ## @param global.security.allowInsecureImages Allows skipping image verification
+    allowInsecureImages: false
+  
+annotations: ~
+
+labels: ~
+
+podLabels: ~
+
+podAnnotations: ~
+
+image:
+  registry: ghcr.io
+  repository: ghcr.io/vaam-store/image-resizer
+  tag: "latest"
+  digest: ""
+  ## Specify a imagePullPolicy
+  ## ref: https://kubernetes.io/docs/concepts/containers/images/#pre-pulled-images
+  ##
+  pullPolicy: IfNotPresent
+  ## Optionally specify an array of imagePullSecrets.
+  ## Secrets must be manually created in the namespace.
+  ## ref: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+  ## e.g:
+  ## pullSecrets:
+  ##   - myRegistryKeySecretName
+  ##
+  pullSecrets: [ ]
+  ## Set to true if you would like to see extra information on logs
+  ##
+  debug: false
+
+env:
+  MINIO_ACCESS_KEY_ID:
+    secretKeyRef:
+      name: minio
+      key: access-key
+  
+  MINIO_SECRET_ACCESS_KEY:
+    secretKeyRef:
+      name: minio
+      key: secret-key
+  
+  MINIO_ENDPOINT_URL: http://minio:9000
+  MINIO_BUCKET: emgr
+  MINIO_REGION: ~
+
+  STORAGE_SUB_PATH: 'files/gen/'
+  
+  CDN_BASE_URL: http://localhost:19000/emgr
+  
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  OTLP_SPAN_ENDPOINT: http://tracking:4317
+  OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
+  OTLP_SERVICE_NAME: image-resizer
+  ENABLE_HTTP2: false
+  PERFORMANCE_PROFILE: high_throughput
+  MAX_CONCURRENT_PROCESSING: 4
+  
+ports:
+  http1: # kservice requirements
+    port: 3000
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 4Gi
+  requests:
+    cpu: 1000m
+    memory: 2Gi
+
+domain:
+  enabled: false
+  name: miaou.waff.waff
+  tls: ~
+#    issuerRef:
+#      kind: ClusterIssuer
+#      name: self-signed-ca
+#      group: cert-manager.io

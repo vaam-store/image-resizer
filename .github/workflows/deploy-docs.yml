@@ -10,7 +10,7 @@ permissions:
   packages: write # Required for pushing to GHCR
 
 jobs:
-  deploy:
+  deploy-webite:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -38,59 +38,37 @@ jobs:
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./site
-          keep_files: true # Keep existing files in gh-pages branch
-          # The chart-releaser action will run after this and add its files
-          # to the gh-pages branch.
+          
 
-      # Helm Chart Steps
+  deploy-helm:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Configure Git
-        # This step is generally good practice before actions that commit,
-        # though chart-releaser-action might handle its own git config.
         run: |
           git config user.name "$GITHUB_ACTOR"
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
       - name: Install Helm
         uses: azure/setup-helm@v4
-        # No explicit GITHUB_TOKEN env var needed here for azure/setup-helm.
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
 
-      - name: Add Helm repositories
-        # This step was in the original 'deploy-helm-chart.yml'.
-        # Include this if your charts in the 'helm/' directory have dependencies
-        # on charts from 'bjw-s' that need to be resolved during packaging.
-        # If your charts are self-contained or manage dependencies differently,
-        # this step might be adjusted or removed.
+      - name: Add repos to Helm
         run: |
           helm repo add bjw-s https://bjw-s-labs.github.io/helm-charts
+          helm repo update
 
       - name: Run chart-releaser
-        uses: helm/chart-releaser-action@v1.7.0
+        uses: helm/chart-releaser-action@v1
+        if: github.ref == 'refs/heads/main'
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         with:
-          charts_dir: helm # Specifies the directory containing your Helm charts.
-          # The chart-releaser-action handles checking out the gh-pages branch,
-          # packaging charts, updating the index.yaml, committing, and pushing.
-          # It is designed to be additive to the gh-pages branch.
-
-      # OCI Helm Chart Steps
-      - name: Log in to GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Package Helm chart for OCI
-        # chart-releaser might package it, but we ensure it's done here for clarity and control
-        # and to ensure the .tgz is in the current working directory for the push command.
-        run: |
-          helm package ./helm/emgr --destination .
-          # helm package ./helm/emgr --destination . --version ${{ steps.get_version.outputs.VERSION }} # If dynamic versioning is needed
-
-      - name: Push Helm chart to GHCR
-        # The chart name (emgr) and version (from Chart.yaml) are automatically used by helm push.
-        # The OCI URL format is oci://<registry>/<namespace>/<chartname>
-        # The chart version will be appended as a tag automatically.
-        run: |
-          CHART_NAME=$(helm show chart ./helm/emgr | grep '^name:' | awk '{print $2}')
-          CHART_VERSION=$(helm show chart ./helm/emgr | grep '^version:' | awk '{print $2}')
-          echo "Pushing $CHART_NAME:$CHART_VERSION to oci://ghcr.io/${{ github.repository_owner }}/$CHART_NAME"
-          helm push ${CHART_NAME}-${CHART_VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/$CHART_NAME
+          skip_existing: false

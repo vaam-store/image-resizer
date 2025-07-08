@@ -1,0 +1,29 @@
+{{ if .Values.domain.enabled }}
+---
+apiVersion: serving.knative.dev/v1beta1
+kind: DomainMapping
+metadata:
+  name: {{ .Values.domain.name }}
+  namespace: {{ include "common.names.namespace" $ }}
+spec:
+  ref:
+    name: {{ include "common.names.fullname" $ }}
+    kind: Service
+    apiVersion: serving.knative.dev/v1
+  tls:
+    secretName: {{ .Values.domain.name }}-tls
+---
+{{ if and .Values.domain.tls .Values.domain.tls.issuerRef }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.domain.name }}-certificate
+spec:
+  secretName: {{ .Values.domain.name }}-tls
+  issuerRef: {{ include "common.tplvalues.render" ( dict "value" .Values.domain.tls.issuerRef "context" $ ) | nindent 4 }}
+  commonName: {{ .Values.domain.name }}
+  dnsNames:
+    - {{ .Values.domain.name }}
+{{ end }}
+{{ end }}

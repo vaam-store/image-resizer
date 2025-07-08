@@ -1,0 +1,49 @@
+---
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: {{ include "common.names.fullname" $ }}
+  namespace: {{ include "common.names.namespace" $ }}
+  {{ with .Values.labels }}
+  labels: {{ include "common.tplvalues.render" ( dict "value" . "context" $ ) | nindent 4 }}
+  {{ end }}
+  {{ with .Values.annotations }}
+  annotations: {{ include "common.tplvalues.render" ( dict "value" . "context" $ ) | nindent 4 }}
+  {{ end }}
+    
+spec:
+  template:
+    metadata:
+      {{ with .Values.podLabels }}
+      labels: {{ include "common.tplvalues.render" ( dict "value" . "context" $ ) | nindent 8 }}
+      {{ end }}
+      {{ with .Values.podAnnotations }}
+      annotations: {{ include "common.tplvalues.render" ( dict "value" . "context" $ ) | nindent 8 }}
+      {{ end }}
+    spec:
+      {{ include "common.images.renderPullSecrets" (dict "images" (list .Values.image ) "context" $) | nindent 6 }}
+      containers:
+        - image: {{ include "common.images.image" (dict "imageRoot" .Values.image "global" .Values.global) }}
+          {{ with .Values.env }}
+          env:
+          {{ range $k, $v := . }}
+            {{ with include "common.env" (dict "key" $k "value" $v "context" $ ) }}
+            - {{ . | nindent 14 }}
+            {{ end }}
+          {{ end }}
+          {{ end }}
+
+          {{ with .Values.ports }}
+          ports:
+            {{ range $k, $v := . }}
+            - name: {{ include "common.tplvalues.render" ( dict "value" $k "context" $ ) }}
+              containerPort: {{ include "common.tplvalues.render" ( dict "value" $v.port "context" $ ) }}
+            {{ end }}
+          {{ end }}
+
+          {{ with .Values.resources }}
+          resources: {{ include "common.tplvalues.render" ( dict "value" . "context" $ ) | nindent 14 }}
+          {{ end }}
+              
+
+            

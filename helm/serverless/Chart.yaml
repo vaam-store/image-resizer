@@ -1,0 +1,31 @@
+apiVersion: v2
+name: emgr-serverless
+description: A Helm chart for EmgR application
+type: application
+version: 0.1.0
+appVersion: '1.0.0'
+
+keywords:
+  - vaam
+  - eat
+  - emgr
+  - serverless
+
+home: https://github.com/vaam-store/image-resizer
+
+sources:
+  - https://github.com/vaam-store/image-resizer
+
+maintainers:
+  - name: VAAM Team
+    email: team@vaam.com
+
+dependencies:
+  - name: common
+    repository: oci://registry-1.docker.io/bitnamicharts
+    tags:
+      - bitnami-common
+    version: "*"
+    
+annotations:
+  category: Application
