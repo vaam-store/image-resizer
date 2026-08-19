@@ -169,11 +169,16 @@ jobs:
           restore-keys: |
             criterion-baseline-main-
 
-      - name: cargo bench --features local_fs -- --baseline main
+      # `--baseline-lenient`, not `--baseline`: plain `--baseline` makes
+      # criterion hard-error when the named baseline is absent, which is
+      # exactly the state of every PR until a push to main has saved one.
+      # Lenient mode runs the benches and simply skips the comparison, which
+      # is what bench_gate.py already expects to handle.
+      - name: cargo bench --features local_fs -- --baseline-lenient main
         run: |
           cargo bench --features local_fs -- \
             --sample-size 20 --measurement-time 2 --warm-up-time 1 \
-            --baseline main
+            --baseline-lenient main
 
       - name: Build regression report
         id: gate

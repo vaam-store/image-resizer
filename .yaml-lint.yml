@@ -35,6 +35,10 @@ rules:
     level: warning
     indent-sequences: consistent
   line-length:
+    # Workflow files carry long `uses:` refs, digest pins and shell one-liners
+    # that cannot be wrapped without harming readability. 80 is a prose limit,
+    # not a YAML one.
+    max: 140
     level: warning
     allow-non-breakable-inline-mappings: true
   truthy: disable
