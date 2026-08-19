@@ -50,6 +50,12 @@ impl StorageBackend for MinIOStorage {
             .key(key)
             .body(ByteStream::from(data))
             .content_type(content_type)
+            // Cache-Control was previously left unset on the object itself;
+            // this now matches the header the download response is served
+            // with (`src/modules/api/resize.rs`), so it's also correct for
+            // anything reading the object directly from S3/MinIO/a CDN
+            // fronting the bucket, not just via this app's own endpoint.
+            .cache_control("public, max-age=31536000, immutable")
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("S3 error: {}", e))

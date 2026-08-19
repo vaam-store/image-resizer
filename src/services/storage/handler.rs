@@ -9,6 +9,13 @@ use std::sync::Arc;
 pub struct StorageService {
     storage: Arc<dyn StorageBackend>,
     cdn_base_url: String,
+    /// The `STORAGE_SUB_PATH` prefix `CacheService::generate_key` prepends
+    /// before `<hash>.<ext>`. Used to validate that a `key` reaching this
+    /// service matches exactly what `generate_key` can produce (#23) before
+    /// it is passed to any backend. Defaults to `""` (`StorageConfig::new`'s
+    /// default), matching this repo's `STORAGE_SUB_PATH` default - see
+    /// `StorageConfig::with_key_prefix` if that default is overridden.
+    key_prefix: String,
 }
 
 /// Storage type options
@@ -49,6 +56,7 @@ impl StorageService {
                     .s3_config
                     .ok_or_else(|| anyhow!("S3 configuration is required"))?,
                 config.cdn_base_url,
+                config.key_prefix,
             ),
 
             #[cfg(feature = "local_fs")]
@@ -57,10 +65,13 @@ impl StorageService {
                     .local_fs_config
                     .ok_or_else(|| anyhow!("Local FS configuration is required"))?,
                 config.cdn_base_url,
+                config.key_prefix,
             ),
 
             #[cfg(feature = "in_memory")]
-            StorageType::InMemory => Self::create_in_memory_storage(config.cdn_base_url),
+            StorageType::InMemory => {
+                Self::create_in_memory_storage(config.cdn_base_url, config.key_prefix)
+            }
 
             #[allow(unreachable_patterns)]
             _ => Err(anyhow!(
@@ -133,7 +144,7 @@ impl StorageService {
 
     /// Create a new MinIO storage backend
     #[cfg(feature = "s3")]
-    fn create_s3_storage(config: S3Config, cdn_base_url: String) -> Result<Self> {
+    fn create_s3_storage(config: S3Config, cdn_base_url: String, key_prefix: String) -> Result<Self> {
         let s3_storage_adapter = crate::services::storage::s3_handler::MinIOStorage::new_minio(
             config.endpoint_url,
             config.access_key,
@@ -145,18 +156,24 @@ impl StorageService {
         Ok(Self {
             storage: Arc::new(s3_storage_adapter),
             cdn_base_url,
+            key_prefix,
         })
     }
 
     /// Create a new local file system storage backend
     #[cfg(feature = "local_fs")]
-    fn create_local_fs_storage(config: LocalFsConfig, cdn_base_url: String) -> Result<Self> {
+    fn create_local_fs_storage(
+        config: LocalFsConfig,
+        cdn_base_url: String,
+        key_prefix: String,
+    ) -> Result<Self> {
         let local_fs_storage_adapter =
             crate::services::storage::local_fs_handler::LocalFSStorage::new(config.base_path)?;
 
         Ok(Self {
             storage: Arc::new(local_fs_storage_adapter),
             cdn_base_url,
+            key_prefix,
         })
     }
 
@@ -166,23 +183,32 @@ impl StorageService {
     /// This storage backend is intended for development and testing purposes only.
     /// Data is stored in memory and will be lost when the application restarts.
     #[cfg(feature = "in_memory")]
-    fn create_in_memory_storage(cdn_base_url: String) -> Result<Self> {
+    fn create_in_memory_storage(cdn_base_url: String, key_prefix: String) -> Result<Self> {
         let in_memory_storage_adapter =
             crate::services::storage::in_memory_handler::InMemoryStorage::new();
 
         Ok(Self {
             storage: Arc::new(in_memory_storage_adapter),
             cdn_base_url,
+            key_prefix,
         })
     }
 
-    /// Upload an image to storage
+    /// Upload an image to storage.
+    ///
+    /// Validates `key` against exactly the shape `CacheService::generate_key`
+    /// produces before it ever reaches a backend (#23) - protects every
+    /// backend (S3, local_fs, in-memory) from a single choke point instead
+    /// of relying on each implementation to defend itself.
     pub async fn upload_image(&self, key: &str, content_type: &str, data: Vec<u8>) -> Result<()> {
+        crate::services::storage::key_validation::validate_cache_key(key, &self.key_prefix)?;
         self.storage.upload_image(key, content_type, data).await
     }
 
-    /// Check if an image exists in the cache
+    /// Check if an image exists in the cache. See [`Self::upload_image`] for
+    /// why `key` is validated here, before touching any backend.
     pub async fn check_cache(&self, key: &str) -> Result<bool> {
+        crate::services::storage::key_validation::validate_cache_key(key, &self.key_prefix)?;
         self.storage.check_cache(key).await
     }
 
@@ -191,8 +217,12 @@ impl StorageService {
         format!("{}/{}", self.cdn_base_url.trim_end_matches('/'), key)
     }
 
-    /// Get an image from storage
+    /// Get an image from storage. See [`Self::upload_image`] for why `key`
+    /// is validated here, before touching any backend - this is the
+    /// arbitrary-file-read path (#23): an unvalidated key here is either a
+    /// local path traversal or an S3 IDOR across the whole bucket.
     pub async fn get_image(&self, key: &str) -> Result<Vec<u8>> {
+        crate::services::storage::key_validation::validate_cache_key(key, &self.key_prefix)?;
         self.storage.get_image(key).await
     }
 }
@@ -222,6 +252,10 @@ pub struct StorageConfig {
     pub cdn_base_url: String,
     pub s3_config: Option<S3Config>,
     pub local_fs_config: Option<LocalFsConfig>,
+    /// The `STORAGE_SUB_PATH` prefix `CacheService::generate_key` prepends
+    /// before `<hash>.<ext>`. Defaults to `""`, matching this repo's
+    /// `STORAGE_SUB_PATH` env default - see `with_key_prefix`.
+    pub key_prefix: String,
 }
 
 #[cfg(not(feature = "s3"))]
@@ -229,6 +263,10 @@ pub struct StorageConfig {
     pub storage_type: Option<String>,
     pub cdn_base_url: String,
     pub local_fs_config: Option<LocalFsConfig>,
+    /// The `STORAGE_SUB_PATH` prefix `CacheService::generate_key` prepends
+    /// before `<hash>.<ext>`. Defaults to `""`, matching this repo's
+    /// `STORAGE_SUB_PATH` env default - see `with_key_prefix`.
+    pub key_prefix: String,
 }
 
 #[cfg(feature = "s3")]
@@ -240,6 +278,7 @@ impl StorageConfig {
             cdn_base_url,
             s3_config: None,
             local_fs_config: None,
+            key_prefix: String::new(),
         }
     }
 }
@@ -252,6 +291,7 @@ impl StorageConfig {
             storage_type: None,
             cdn_base_url,
             local_fs_config: None,
+            key_prefix: String::new(),
         }
     }
 }
@@ -261,6 +301,16 @@ impl StorageConfig {
     /// Set the storage type
     pub fn with_storage_type(mut self, storage_type: impl Into<String>) -> Self {
         self.storage_type = Some(storage_type.into());
+        self
+    }
+
+    /// Set the cache-key prefix used to validate `key` before it reaches any
+    /// storage backend (#23). Must match whatever `STORAGE_SUB_PATH` the
+    /// `CacheService` in front of this `StorageService` is configured with
+    /// (`CacheServiceBuilder::minio_sub_path`), or legitimately-generated
+    /// keys will be rejected as invalid. Defaults to `""`.
+    pub fn with_key_prefix(mut self, key_prefix: impl Into<String>) -> Self {
+        self.key_prefix = key_prefix.into();
         self
     }
 
@@ -291,5 +341,118 @@ impl StorageConfig {
             base_path: base_path.as_ref().to_path_buf(),
         });
         self
+    }
+}
+
+#[cfg(all(test, feature = "local_fs"))]
+mod tests {
+    use super::*;
+    use crate::models::params::ResizeQuery;
+    use crate::services::cache::handler::CacheServiceBuilder;
+    use gen_server::models::ImageFormat;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Owns a per-test local_fs storage directory under the OS temp dir and
+    /// removes it on drop, so repeated test runs don't litter the temp dir.
+    /// Mirrors `TestStorageDir` in `src/modules/api/resize.rs`.
+    struct TestStorageDir(std::path::PathBuf);
+
+    impl std::ops::Deref for TestStorageDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TestStorageDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_storage_dir() -> TestStorageDir {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = TestStorageDir(std::env::temp_dir().join(format!(
+            "emgr-storage-handler-test-{}-{}",
+            std::process::id(),
+            id
+        )));
+        std::fs::create_dir_all(&*dir).expect("create test storage dir");
+        dir
+    }
+
+    /// A non-empty `STORAGE_SUB_PATH` must round-trip: a key generated by
+    /// `CacheService` (with `minio_sub_path` set) has to be accepted by
+    /// `StorageService::{check_cache,upload_image,get_image}` when
+    /// `StorageConfig` is given the *same* prefix via `with_key_prefix`.
+    ///
+    /// This is exactly the wiring `ApiService::create`
+    /// (`src/modules/api/handler.rs`) performs for real. Before that wiring
+    /// landed, `StorageConfig::key_prefix` silently defaulted to `""`
+    /// regardless of `STORAGE_SUB_PATH`, so `CacheService::generate_key`
+    /// would emit `{sub_path}{hash}.{ext}` while the storage validator only
+    /// ever accepted `{hash}.{ext}` - rejecting every legitimately-generated
+    /// key outright as soon as an operator configured a non-default
+    /// sub-path. Deployments that leave `STORAGE_SUB_PATH` at its default
+    /// empty string never observed this, which is why nothing caught it.
+    #[tokio::test]
+    async fn non_empty_sub_path_round_trips_through_check_cache_and_get_image() {
+        let dir = test_storage_dir();
+        let sub_path = "sub/";
+
+        let storage_config = StorageConfig::new("http://cdn.test".to_string())
+            .with_key_prefix(sub_path)
+            .with_local_fs_config(&*dir);
+        let storage = StorageService::new(storage_config).expect("build storage service");
+
+        let cache = CacheServiceBuilder::default()
+            .minio_sub_path(sub_path.to_string())
+            .build()
+            .expect("build cache service");
+
+        let params = ResizeQuery {
+            url: "https://example.com/img.png".to_string(),
+            width: Some(100),
+            height: Some(100),
+            format: ImageFormat::Png,
+            blur_sigma: None,
+            grayscale: None,
+        };
+        let key = cache.generate_key(&params);
+        assert!(
+            key.starts_with(sub_path),
+            "expected generated key '{key}' to start with the configured sub_path '{sub_path}'"
+        );
+
+        // Not uploaded yet - check_cache must accept the key shape (not
+        // reject it as invalid, which would have surfaced as an `Err` here
+        // before the sub_path was wired in) and correctly report it absent.
+        assert!(
+            !storage
+                .check_cache(&key)
+                .await
+                .expect("check_cache should accept a validly-prefixed key"),
+            "key should not be cached yet"
+        );
+
+        storage
+            .upload_image(&key, "image/png", b"fake-png-bytes".to_vec())
+            .await
+            .expect("upload_image should accept a validly-prefixed key");
+
+        assert!(
+            storage
+                .check_cache(&key)
+                .await
+                .expect("check_cache after upload"),
+            "key should be cached after upload"
+        );
+
+        let fetched = storage
+            .get_image(&key)
+            .await
+            .expect("get_image should accept a validly-prefixed key");
+        assert_eq!(fetched, b"fake-png-bytes".to_vec());
     }
 }

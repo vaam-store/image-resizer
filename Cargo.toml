@@ -2,21 +2,59 @@
 name = "emgr"
 version = "0.1.2"
 edition = "2024"
+# benches/fixtures.rs is a shared module (pulled in via `#[path]` by the
+# real bench targets below, the `benchmark` bin, and tests/), not a bench
+# target itself - disable autodiscovery so Cargo doesn't also try to treat
+# it as one.
+autobenches = false
+
+[lib]
+name = "emgr"
+path = "src/lib.rs"
+bench = false          # criterion owns `cargo bench`; lib has no bench harness
+
+[[bin]]
+name = "emgr"
+path = "src/main.rs"
+bench = false
 
 [[bin]]
 name = "healthcheck"
 path = "src/bin/healthcheck.rs"
+bench = false
 
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
+bench = false
+
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "resize"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "cache_key"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
 
 [dependencies]
 gen-server = { path = "./packages/gen-server", features = ["conversion"] }
 mimalloc = "0.1"
 
 axum = { version = "0.8", features = ["tracing", "tokio", "macros"] }
-axum-extra = { version = "0.10", features = ["cookie", "multipart"] }
+axum-extra = { version = "0.12", features = ["cookie", "multipart", "typed-header"] }
+headers = "0.4" # `Host` type required by the generated gen-server Images trait
 axum-otel-metrics = { version = "0.11" }
 axum-tracing-opentelemetry = { version = "0.29" }
 tower-http = { version = "0.6", features = ["compression-full", "cors"] }
@@ -38,6 +76,8 @@ derive_builder = { version = "0" }
 anyhow = { version = "1" }
 thiserror = { version = "2" }
 urlencoding = "2.1"
+url = "2.5"      # source-URL parsing and scheme validation (#21)
+ipnet = "2.9"    # private/link-local range checks for SSRF filtering (#21)
 
 o2o = { version = "0.5.4", features = ["default"] }
 
@@ -46,6 +86,14 @@ sha2 = "0"
 
 # For async traits
 async-trait = "0.1" # Required for async methods in traits
+
+# Deterministic RNG for the generated fixture corpus (benches/fixtures.rs),
+# also linked into the `benchmark` bin, which serves that same corpus locally.
+rand = "0.8"
+
+# Machine-readable output for the `benchmark` load-test bin (BENCHMARK_JSON_OUTPUT)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 opentelemetry = { version = "0.29", optional = true }
 opentelemetry-otlp = { version = "0.29", optional = true, features = ["tokio", "metrics", "trace", "grpc-tonic", "gzip-tonic"] }
@@ -56,6 +104,8 @@ tracing-opentelemetry = { version = "0.30", optional = true }
 tracing = { version = "0", features = ["attributes"] }
 prometheus = { version = "0", optional = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.prod]
 inherits = "release"
@@ -70,11 +120,12 @@ inherits = "release"
 lto = "fat"
 opt-level = 3
 codegen-units = 1
-panic = "abort"
+# NOT panic = "abort": this service decodes attacker-supplied image bytes, and a
+# panic in a codec would take the whole process down with it - a trivial DoS.
+# Unwinding keeps a future catch boundary around the decode stage possible.
+# See issue #29.
+panic = "unwind"
 strip = true
-# Enable CPU-specific optimizations
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
 
 [features]
 default = []

@@ -61,6 +61,49 @@ paths:
               schema:
                 type: string
                 format: uri
+        '400':
+          description: |
+            The request was invalid - e.g. the source URL points at something
+            that isn't a decodable image, or exceeds the configured size
+            limit. Never a redirect to the caller-supplied URL (see #25).
+          headers:
+            Cache-Control:
+              description: Always `no-store`; error responses are never cached.
+              schema:
+                type: string
+                example: "no-store"
+          content:
+            text/plain:
+              schema:
+                type: string
+        '502':
+          description: |
+            The origin server for the requested image failed (unreachable,
+            non-2xx, or the connection dropped mid-transfer).
+          headers:
+            Cache-Control:
+              description: Always `no-store`; error responses are never cached.
+              schema:
+                type: string
+                example: "no-store"
+          content:
+            text/plain:
+              schema:
+                type: string
+        '503':
+          description: |
+            The service is shedding load (download/processing concurrency
+            limits reached) and cannot handle the request right now.
+          headers:
+            Cache-Control:
+              description: Always `no-store`; error responses are never cached.
+              schema:
+                type: string
+                example: "no-store"
+          content:
+            text/plain:
+              schema:
+                type: string
   /api/images/files/{key}:
     get:
       summary: Resize an image
@@ -95,6 +138,30 @@ paths:
               schema:
                 type: string
                 format: binary
+        '404':
+          description: No image exists for the given key.
+          headers:
+            Cache-Control:
+              description: Always `no-store`; error responses are never cached.
+              schema:
+                type: string
+                example: "no-store"
+          content:
+            text/plain:
+              schema:
+                type: string
+        '502':
+          description: The storage backend failed to serve the image.
+          headers:
+            Cache-Control:
+              description: Always `no-store`; error responses are never cached.
+              schema:
+                type: string
+                example: "no-store"
+          content:
+            text/plain:
+              schema:
+                type: string
 
 components:
 
@@ -160,6 +227,12 @@ components:
   schemas:
     Key:
       type: string
+      # Exactly what CacheService::generate_key produces: an optional
+      # STORAGE_SUB_PATH prefix followed by a 64-char lowercase hex SHA-256
+      # digest and one of the image extensions the resizer emits. Anything
+      # else (absolute paths, traversal, arbitrary strings) is rejected
+      # before it reaches any storage backend (#23).
+      pattern: '^.*[0-9a-f]{64}\.(jpg|png|webp)$'
     Url:
       type: string
       format: uri

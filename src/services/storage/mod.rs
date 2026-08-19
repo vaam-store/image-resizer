@@ -10,3 +10,5 @@ pub mod local_fs_handler;
 pub mod in_memory_handler;
 
 pub mod core;
+
+pub mod key_validation;

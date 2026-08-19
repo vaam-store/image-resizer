@@ -23,7 +23,7 @@ pub async fn router(
 
     // Add health and metrics endpoints
     let app = app
-        .route("/", get(|| async { Redirect::permanent("/health") }))
+        .route("/", get(|| async { Redirect::temporary("/health") }))
         .route("/health", get(health))
         .route(
             "/metrics",
@@ -43,7 +43,7 @@ pub async fn router(api_service: Arc<ApiService>) -> Result<Router> {
 
     // Add health and metrics endpoints
     let app = app
-        .route("/", get(|| async { Redirect::permanent("/health") }))
+        .route("/", get(|| async { Redirect::temporary("/health") }))
         .route("/health", get(health));
 
     let router = apply_common_middlewares(app);

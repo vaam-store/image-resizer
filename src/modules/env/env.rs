@@ -87,4 +87,46 @@ pub struct EnvConfig {
 
     #[envconfig(from = "PERFORMANCE_PROFILE")]
     pub performance_profile: Option<String>,
+
+    // SSRF / source-fetch guard (#21)
+    /// Maximum number of redirects the source fetch will follow, each hop
+    /// re-validated (scheme, allowlist, resolved-address range). imgproxy
+    /// equivalent: `IMGPROXY_MAX_REDIRECTS` / `MAX_REDIRECTS`.
+    #[envconfig(from = "MAX_REDIRECTS")]
+    pub max_redirects: Option<u8>,
+
+    /// Comma-separated allowlist of source URL prefixes. When set, only
+    /// source URLs matching at least one prefix are fetched. Unset (the
+    /// default) allows any http(s) URL, subject to the private-range guard.
+    /// imgproxy equivalent: `IMGPROXY_ALLOWED_SOURCES`.
+    #[envconfig(from = "ALLOWED_SOURCES")]
+    pub allowed_sources: Option<String>,
+
+    /// Opt-in override to allow fetching from loopback addresses (default:
+    /// blocked). imgproxy equivalent: `ALLOW_LOOPBACK_SOURCE_ADDRESSES`.
+    #[envconfig(from = "ALLOW_LOOPBACK_SOURCE_ADDRESSES")]
+    pub allow_loopback_source_addresses: Option<bool>,
+
+    /// Opt-in override to allow fetching from link-local addresses
+    /// (default: blocked). imgproxy equivalent:
+    /// `ALLOW_LINK_LOCAL_SOURCE_ADDRESSES`.
+    #[envconfig(from = "ALLOW_LINK_LOCAL_SOURCE_ADDRESSES")]
+    pub allow_link_local_source_addresses: Option<bool>,
+
+    // Resolution limits (#26)
+    /// Maximum decoded *source* resolution in megapixels, checked against
+    /// header dimensions before full decode. imgproxy equivalent:
+    /// `IMGPROXY_MAX_SRC_RESOLUTION` (default 50).
+    #[envconfig(from = "MAX_SRC_RESOLUTION_MP")]
+    pub max_src_resolution_mp: Option<u64>,
+
+    /// Maximum requested *output* width, enforced independently of
+    /// whatever the generated OpenAPI layer does or does not validate.
+    #[envconfig(from = "MAX_OUTPUT_WIDTH")]
+    pub max_output_width: Option<u32>,
+
+    /// Maximum requested *output* height, enforced independently of
+    /// whatever the generated OpenAPI layer does or does not validate.
+    #[envconfig(from = "MAX_OUTPUT_HEIGHT")]
+    pub max_output_height: Option<u32>,
 }

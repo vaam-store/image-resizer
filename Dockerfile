@@ -17,8 +17,8 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
-  cargo build --profile prod --locked --bin emgr --features="local_fs" \
-  && cp ./target/prod/$APP_NAME $APP_NAME
+  cargo build --profile perf --locked --bin emgr --features="local_fs" \
+  && cp ./target/perf/$APP_NAME $APP_NAME
 
 FROM builder as local_fs_otel_builder
 
@@ -31,8 +31,8 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
-  cargo build --profile prod --locked --bin emgr --features="local_fs otel" \
-  && cp ./target/prod/$APP_NAME $APP_NAME
+  cargo build --profile perf --locked --bin emgr --features="local_fs otel" \
+  && cp ./target/perf/$APP_NAME $APP_NAME
 
 FROM builder as s3_fs_builder
 
@@ -45,8 +45,8 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
-  cargo build --profile prod --locked --bin emgr --features="s3" \
-  && cp ./target/prod/$APP_NAME $APP_NAME
+  cargo build --profile perf --locked --bin emgr --features="s3" \
+  && cp ./target/perf/$APP_NAME $APP_NAME
 
 FROM builder as s3_fs_otel_builder
 
@@ -59,8 +59,8 @@ RUN \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
   --mount=type=cache,target=/usr/local/cargo/git/db \
-  cargo build --profile prod --locked --bin emgr --features="s3 otel" \
-  && cp ./target/prod/$APP_NAME $APP_NAME
+  cargo build --profile perf --locked --bin emgr --features="s3 otel" \
+  && cp ./target/perf/$APP_NAME $APP_NAME
 
 FROM builder AS healthcheck_builder
 
