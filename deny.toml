@@ -12,10 +12,18 @@
 #   sources    - only allow crates.io as a registry source.
 
 [advisories]
+
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` is unmaintained. NOT a vulnerability — an abandoned-crate notice,
+    # no exploitability claim. Reaches us only transitively
+    # (rav1e -> pulp -> paste), so there is no direct action available until
+    # those upstreams migrate. Revisit when rav1e drops it.
+    # Every other advisory present on 2026-08-19 was cleared by `cargo update`.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
