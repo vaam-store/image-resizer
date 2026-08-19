@@ -1,0 +1,9 @@
+# Clippy configuration. Previously 0 bytes; see .hadolint.yaml for why empty
+# config files only began to matter once super-linter was pointed at the repo
+# root (GH #46).
+
+# This service decodes attacker-supplied image bytes, so an accidental panic
+# in a request path is a denial-of-service primitive. Keep the bar low enough
+# that new unwraps stand out in review.
+too-many-arguments-threshold = 8
+cognitive-complexity-threshold = 30
