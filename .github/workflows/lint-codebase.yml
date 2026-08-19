@@ -39,6 +39,14 @@ jobs:
         uses: super-linter/super-linter@v7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # super-linter looks for linter configs under LINTER_RULES_PATH,
+          # which defaults to `.github/linters`. This repo keeps them at the
+          # root (.yaml-lint.yml, .hadolint.yaml, .clippy.toml), so they were
+          # never actually read and every YAML run used yamllint's defaults -
+          # which is why `document-start: disable` in .yaml-lint.yml had no
+          # effect and Lint failed on style warnings. Point it at the root.
+          LINTER_RULES_PATH: "."
+          YAML_CONFIG_FILE: ".yaml-lint.yml"
           VALIDATE_DOCKERFILE_HADOLINT: "true"
           VALIDATE_GITHUB_ACTIONS: "true"
           VALIDATE_GITLEAKS: "true"
