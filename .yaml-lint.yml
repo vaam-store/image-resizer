@@ -33,7 +33,11 @@ rules:
     level: warning
   indentation:
     level: warning
-    indent-sequences: consistent
+    # `whatever`, not `consistent`: mkdocs.yml's nav uses the conventional
+    # mkdocs style (sequence items indented 4 under their mapping key) which
+    # is valid YAML and what the tool's own docs show. Re-indenting a working
+    # config to satisfy a linter preference is the wrong trade.
+    indent-sequences: whatever
   line-length:
     # Workflow files carry long `uses:` refs, digest pins and shell one-liners
     # that cannot be wrapped without harming readability. 80 is a prose limit,
