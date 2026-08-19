@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow};
 use derive_builder::Builder;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Factory for creating storage backends based on configuration
 #[derive(Clone, Builder)]
@@ -68,7 +69,13 @@ impl StorageService {
                 config.key_prefix,
             ),
 
-            #[cfg(feature = "in_memory")]
+            // Not reachable outside this crate's own test builds (#39) - see
+            // `InMemoryStorage`'s doc comment. In a release build (even one
+            // compiled with the `in_memory` Cargo feature on) this arm does
+            // not exist, so selecting `STORAGE_TYPE=IN_MEMORY` there falls
+            // through to the catch-all `Err` below instead of running an
+            // unbounded, lock-poisoning cache in production.
+            #[cfg(all(test, feature = "in_memory"))]
             StorageType::InMemory => {
                 Self::create_in_memory_storage(config.cdn_base_url, config.key_prefix)
             }
@@ -144,7 +151,11 @@ impl StorageService {
 
     /// Create a new MinIO storage backend
     #[cfg(feature = "s3")]
-    fn create_s3_storage(config: S3Config, cdn_base_url: String, key_prefix: String) -> Result<Self> {
+    fn create_s3_storage(
+        config: S3Config,
+        cdn_base_url: String,
+        key_prefix: String,
+    ) -> Result<Self> {
         let s3_storage_adapter = crate::services::storage::s3_handler::MinIOStorage::new_minio(
             config.endpoint_url,
             config.access_key,
@@ -180,9 +191,10 @@ impl StorageService {
     /// Create a new in-memory storage backend
     ///
     /// # Note
-    /// This storage backend is intended for development and testing purposes only.
-    /// Data is stored in memory and will be lost when the application restarts.
-    #[cfg(feature = "in_memory")]
+    /// This storage backend exists only for this crate's own test builds
+    /// (#39) - see `InMemoryStorage`'s doc comment for why it is not
+    /// reachable from a release build regardless of Cargo feature flags.
+    #[cfg(all(test, feature = "in_memory"))]
     fn create_in_memory_storage(cdn_base_url: String, key_prefix: String) -> Result<Self> {
         let in_memory_storage_adapter =
             crate::services::storage::in_memory_handler::InMemoryStorage::new();
@@ -203,6 +215,38 @@ impl StorageService {
     pub async fn upload_image(&self, key: &str, content_type: &str, data: Vec<u8>) -> Result<()> {
         crate::services::storage::key_validation::validate_cache_key(key, &self.key_prefix)?;
         self.storage.upload_image(key, content_type, data).await
+    }
+
+    /// Upload an image to storage with an expiry (#40). See
+    /// [`Self::upload_image`] for the key-validation rationale; see
+    /// [`StorageBackend::upload_image_with_ttl`] for what `ttl` means.
+    pub async fn upload_image_with_ttl(
+        &self,
+        key: &str,
+        content_type: &str,
+        data: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> Result<()> {
+        crate::services::storage::key_validation::validate_cache_key(key, &self.key_prefix)?;
+        self.storage
+            .upload_image_with_ttl(key, content_type, data, ttl)
+            .await
+    }
+
+    /// Deletes a cached object, purging it from storage (#40). Same key
+    /// validation as every other entry point (#23) - a delete call is just
+    /// as dangerous an arbitrary-file/IDOR primitive as a read would be if
+    /// an unvalidated key reached a backend. Idempotent: deleting an
+    /// already-absent key still succeeds.
+    ///
+    /// # Note
+    /// Not yet exposed over HTTP - a purge endpoint needs authentication
+    /// (#27, not built yet). This exists at the service layer so it is
+    /// ready to wire up as soon as #27 lands, instead of leaving
+    /// `StorageBackend` itself without the operation in the meantime.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        crate::services::storage::key_validation::validate_cache_key(key, &self.key_prefix)?;
+        self.storage.delete(key).await
     }
 
     /// Check if an image exists in the cache. See [`Self::upload_image`] for
@@ -418,6 +462,7 @@ mod tests {
             format: ImageFormat::Png,
             blur_sigma: None,
             grayscale: None,
+            enlarge: false,
         };
         let key = cache.generate_key(&params);
         assert!(
@@ -454,5 +499,88 @@ mod tests {
             .await
             .expect("get_image should accept a validly-prefixed key");
         assert_eq!(fetched, b"fake-png-bytes".to_vec());
+    }
+
+    /// `delete` (#40) must actually remove an uploaded entry, and must be
+    /// idempotent - deleting an already-absent key is still `Ok(())`, not an
+    /// error - so a purge call never needs to check existence first.
+    #[tokio::test]
+    async fn delete_removes_entry_and_is_idempotent() {
+        let dir = test_storage_dir();
+        let storage_config =
+            StorageConfig::new("http://cdn.test".to_string()).with_local_fs_config(&*dir);
+        let storage = StorageService::new(storage_config).expect("build storage service");
+
+        let key = format!(
+            "{}.png",
+            "a".repeat(64) // valid-shaped 64 lowercase hex-looking key
+        );
+
+        storage
+            .upload_image(&key, "image/png", b"bytes".to_vec())
+            .await
+            .expect("upload_image");
+        assert!(storage.check_cache(&key).await.unwrap());
+
+        storage.delete(&key).await.expect("delete should succeed");
+        assert!(!storage.check_cache(&key).await.unwrap());
+        assert!(storage.get_image(&key).await.is_err());
+
+        // Idempotent: deleting again (still absent) must not error.
+        storage
+            .delete(&key)
+            .await
+            .expect("deleting an already-absent key should still succeed");
+    }
+
+    /// A TTL'd entry (#40) must be reported absent by both `check_cache` and
+    /// `get_image` once expired, and an entry with a future TTL must keep
+    /// being served normally in the meantime.
+    #[tokio::test]
+    async fn ttl_expiry_is_honored_through_storage_service() {
+        let dir = test_storage_dir();
+        let storage_config =
+            StorageConfig::new("http://cdn.test".to_string()).with_local_fs_config(&*dir);
+        let storage = StorageService::new(storage_config).expect("build storage service");
+
+        let expired_key = format!("{}.png", "b".repeat(64));
+        let live_key = format!("{}.png", "c".repeat(64));
+
+        storage
+            .upload_image_with_ttl(
+                &expired_key,
+                "image/png",
+                b"expired".to_vec(),
+                Some(std::time::Duration::from_millis(1)),
+            )
+            .await
+            .expect("upload_image_with_ttl (expired)");
+
+        storage
+            .upload_image_with_ttl(
+                &live_key,
+                "image/png",
+                b"still alive".to_vec(),
+                Some(std::time::Duration::from_secs(3600)),
+            )
+            .await
+            .expect("upload_image_with_ttl (live)");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            !storage.check_cache(&expired_key).await.unwrap(),
+            "expired entry should be reported as a cache miss"
+        );
+        assert!(storage.get_image(&expired_key).await.is_err());
+
+        assert!(
+            storage.check_cache(&live_key).await.unwrap(),
+            "not-yet-expired entry should still be a cache hit"
+        );
+        assert_eq!(
+            storage.get_image(&live_key).await.unwrap(),
+            b"still alive".to_vec()
+        );
     }
 }

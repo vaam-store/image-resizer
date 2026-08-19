@@ -75,9 +75,9 @@ mod tests {
     use crate::services::cache::handler::CacheServiceBuilder;
     use crate::services::resize::handler::ResizeService;
     use crate::services::storage::handler::{StorageConfig, StorageService};
+    use axum::http::uri::Authority;
     use gen_server::apis::images::{DownloadResponse, Images, ResizeResponse};
     use gen_server::models::{DownloadPathParams, ResizeQueryParams};
-    use axum::http::uri::Authority;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

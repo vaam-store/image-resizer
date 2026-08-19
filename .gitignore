@@ -5,3 +5,9 @@ data
 
 charts
 *.tgz
+
+# Local environment overrides (GH #48). Never commit real credentials here
+# even though the tracked history only ever held MinIO's public demo
+# creds - copy .env.example instead.
+.env
+.env.local

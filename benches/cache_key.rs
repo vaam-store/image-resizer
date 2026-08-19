@@ -19,6 +19,7 @@ fn bench_cache_key(c: &mut Criterion) {
         format: ApiImageFormat::Webp,
         blur_sigma: Some(1.5),
         grayscale: Some(false),
+        enlarge: false,
     };
 
     c.bench_function("cache_key/generate_key", |b| {

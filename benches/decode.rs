@@ -30,8 +30,7 @@ fn bench_decode(c: &mut Criterion) {
                 &bytes,
                 |b, bytes| {
                     b.iter(|| {
-                        image::load_from_memory_with_format(bytes, format)
-                            .expect("decode fixture")
+                        image::load_from_memory_with_format(bytes, format).expect("decode fixture")
                     });
                 },
             );

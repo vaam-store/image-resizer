@@ -1,11 +1,17 @@
 global:
+  # `.github/workflows/build.yml` only ever publishes `fs-latest` (moves
+  # on every push to the default branch) and per-commit sha tags
+  # (`fs-<full-sha>`) - it has no release-tag trigger today, so there is
+  # no immutable semver tag to default this to (GH #48's "floating tags"
+  # finding; see the PR description for the full writeup). Production
+  # deployments should override this to a specific `fs-<sha>` build.
   version: fs-latest
 
 defaultPodOptions:
   securityContext:
     runAsUser: 1001
     runAsGroup: 1001
-      
+
 controllers:
   main:
     type: deployment
@@ -34,14 +40,15 @@ controllers:
           runAsGroup: 0
         image:
           repository: busybox
-          tag: latest
+          # Pinned by digest (GH #48) - "latest" is a floating tag.
+          tag: latest@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616
           pullPolicy: IfNotPresent
         command:
           - /bin/sh
           - -c
           - |
             set -ex
-            
+
             # Ensure the directory exists
             chown -R 1001:1001 /tmp/data/images
             chmod -R 775 /tmp/data/images
@@ -57,8 +64,57 @@ controllers:
         image:
           repository: ghcr.io/vaam-store/image-resizer
           tag: '{{ .Values.global.version }}'
-          pullPolicy: IfNotPresent
-        
+          # `global.version` defaults to the floating "fs-latest" tag (see
+          # above), so `IfNotPresent` let different nodes keep whatever
+          # they happened to already have cached under that tag name,
+          # silently running different builds side by side (GH #48).
+          # `Always` re-resolves the tag to its current digest on every
+          # pod (re)start. If you override `global.version` to an
+          # immutable `fs-<sha>` tag, `IfNotPresent` is safe to switch
+          # back to for faster restarts.
+          pullPolicy: Always
+
+        # -- Probes: the bjw-s common library does NOT synthesize defaults,
+        # so without this block traffic is routed to pods before storage and
+        # the resize service finish initializing, and a wedged container is
+        # never restarted (GH #48). Mirrors helm/serverless's Knative probes
+        # (helm/serverless/templates/knative-service.yaml:48-59), which hit
+        # the same /health endpoint.
+        probes:
+          liveness:
+            enabled: true
+            custom: false
+            type: HTTP
+            path: /health
+            port: 3000
+            spec:
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              timeoutSeconds: 2
+              failureThreshold: 3
+          readiness:
+            enabled: true
+            custom: false
+            type: HTTP
+            path: /health
+            port: 3000
+            spec:
+              initialDelaySeconds: 5
+              periodSeconds: 10
+              timeoutSeconds: 2
+              failureThreshold: 3
+          startup:
+            enabled: true
+            custom: false
+            type: HTTP
+            path: /health
+            port: 3000
+            spec:
+              initialDelaySeconds: 0
+              periodSeconds: 5
+              # 30 * 5s = 150s to finish starting up before it's killed.
+              failureThreshold: 30
+
         resources:
           requests:
             cpu: 125m
@@ -66,7 +122,7 @@ controllers:
           limits:
             cpu: 400m
             memory: 512Mi
-        
+
         # -- ConfigMap to be loaded as environment variables
         envFrom:
           - configMapRef:

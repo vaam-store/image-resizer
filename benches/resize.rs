@@ -40,9 +40,13 @@ fn bench_resize(c: &mut Criterion) {
     group.sample_size(20);
 
     for (name, filter) in FILTERS {
-        group.bench_with_input(BenchmarkId::new("downscale", name), &filter, |b, &filter| {
-            b.iter(|| img.resize(DOWNSCALE_TARGET.0, DOWNSCALE_TARGET.1, filter));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("downscale", name),
+            &filter,
+            |b, &filter| {
+                b.iter(|| img.resize(DOWNSCALE_TARGET.0, DOWNSCALE_TARGET.1, filter));
+            },
+        );
 
         group.bench_with_input(BenchmarkId::new("upscale", name), &filter, |b, &filter| {
             b.iter(|| img.resize(UPSCALE_TARGET.0, UPSCALE_TARGET.1, filter));

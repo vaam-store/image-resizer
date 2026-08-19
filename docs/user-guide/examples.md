@@ -1,89 +1,92 @@
 # Usage Examples
 
-This page provides practical examples of how to use the Image Resize Service API.
+Practical examples against the real API (see the
+[API reference](api-reference.md) for the full parameter list - `quality`
+and `fit` do not exist; the equivalents that do are noted below).
 
-## Basic Resizing
+!!! note "The resize endpoint redirects, it doesn't stream bytes back"
+    `GET /api/images/resize` responds `301 Moved Permanently` with a
+    `Location` header pointing at the resized image, rather than
+    returning the image bytes directly. Browsers, `fetch()`, and
+    `curl -L` all follow that redirect transparently, so most of the
+    examples below work unmodified - just be aware a plain `curl` (no
+    `-L`) will save the (empty) redirect response, not an image.
 
-### Resize to Specific Dimensions
+## Basic resizing
 
-```
-GET /api/v1/resize?url=https://example.com/image.jpg&width=800&height=600
-```
-
-This will resize the image to 800x600 pixels, maintaining the aspect ratio.
-
-### Resize to Specific Width (Maintaining Aspect Ratio)
-
-```
-GET /api/v1/resize?url=https://example.com/image.jpg&width=800
-```
-
-This will resize the image to 800 pixels wide, maintaining the aspect ratio.
-
-### Resize to Specific Height (Maintaining Aspect Ratio)
+### Resize to specific dimensions
 
 ```
-GET /api/v1/resize?url=https://example.com/image.jpg&height=600
+GET /api/images/resize?url=https://example.com/image.jpg&width=800&height=600&format=jpg
 ```
 
-This will resize the image to 600 pixels tall, maintaining the aspect ratio.
+Resizes the image to fit within 800x600 pixels, maintaining the aspect
+ratio (pass `enlarge`-related behavior aside, output never exceeds the
+source's own aspect-preserving fit into the requested box).
 
-## Format Conversion
+### Resize to a specific width only
+
+```
+GET /api/images/resize?url=https://example.com/image.jpg&width=800&format=jpg
+```
+
+### Resize to a specific height only
+
+```
+GET /api/images/resize?url=https://example.com/image.jpg&height=600&format=jpg
+```
+
+## Format conversion
 
 ### Convert to WebP
 
 ```
-GET /api/v1/resize?url=https://example.com/image.jpg&format=webp
+GET /api/images/resize?url=https://example.com/image.jpg&format=webp
 ```
 
-This will convert the image to WebP format without resizing.
-
-### Convert to JPEG with Quality Setting
+### Convert to JPEG
 
 ```
-GET /api/v1/resize?url=https://example.com/image.png&format=jpeg&quality=85
+GET /api/images/resize?url=https://example.com/image.png&format=jpg
 ```
 
-This will convert the image to JPEG format with 85% quality.
+There is no `quality` parameter.
 
-## Fit Methods
+## Blur and grayscale
 
-### Cover (Crop to Fill)
+There is no `fit` parameter (no `cover`/`contain`/`fill` modes) - the two
+transform parameters beyond width/height/format are `blur_sigma` and
+`grayscale`.
 
-```
-GET /api/v1/resize?url=https://example.com/image.jpg&width=800&height=600&fit=cover
-```
-
-This will resize the image to 800x600 pixels, cropping if necessary to maintain the aspect ratio.
-
-### Contain (Letterbox)
+### Grayscale
 
 ```
-GET /api/v1/resize?url=https://example.com/image.jpg&width=800&height=600&fit=contain
+GET /api/images/resize?url=https://example.com/image.jpg&width=800&height=600&grayscale=true
 ```
 
-This will resize the image to fit within 800x600 pixels, adding letterboxing if necessary.
-
-### Fill (Stretch)
+### Gaussian blur
 
 ```
-GET /api/v1/resize?url=https://example.com/image.jpg&width=800&height=600&fit=fill
+GET /api/images/resize?url=https://example.com/image.jpg&width=800&height=600&blur_sigma=8
 ```
 
-This will stretch the image to 800x600 pixels, potentially distorting the aspect ratio.
+`blur_sigma` accepts 0-100 (default 5).
 
-## Client Integration Examples
+## Client integration examples
 
 ### HTML
 
 ```html
-<img src="https://your-service.com/api/v1/resize?url=https://example.com/image.jpg&width=800" alt="Resized Image">
+<img src="https://your-service.com/api/images/resize?url=https://example.com/image.jpg&width=800&format=jpg" alt="Resized Image">
 ```
 
 ### JavaScript Fetch
 
+`fetch()` follows redirects by default, so this resolves to the
+resized image's bytes:
+
 ```javascript
-fetch('https://your-service.com/api/v1/resize?url=https://example.com/image.jpg&width=800')
+fetch('https://your-service.com/api/images/resize?url=https://example.com/image.jpg&width=800&format=jpg')
   .then(response => response.blob())
   .then(blob => {
     const img = document.createElement('img');
@@ -94,11 +97,15 @@ fetch('https://your-service.com/api/v1/resize?url=https://example.com/image.jpg&
 
 ### cURL
 
+`-L` is required to follow the `301` redirect:
+
 ```bash
-curl -o resized.jpg "https://your-service.com/api/v1/resize?url=https://example.com/image.jpg&width=800"
+curl -L -o resized.jpg "https://your-service.com/api/images/resize?url=https://example.com/image.jpg&width=800&format=jpg"
 ```
 
 ### Python Requests
+
+`requests` follows redirects by default:
 
 ```python
 import requests
@@ -106,13 +113,14 @@ from PIL import Image
 from io import BytesIO
 
 response = requests.get(
-    "https://your-service.com/api/v1/resize",
+    "https://your-service.com/api/images/resize",
     params={
         "url": "https://example.com/image.jpg",
         "width": 800,
-        "format": "webp"
-    }
+        "format": "webp",
+    },
 )
 
 img = Image.open(BytesIO(response.content))
 img.save("resized.webp")
+```

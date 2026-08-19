@@ -8,8 +8,14 @@ use sha2::{Digest, Sha256};
 /// keys produced by the new scheme.
 ///
 /// v1 was the original, un-prefixed, delimiter-free concatenation (see
-/// GH-24). v2 introduces length-prefixed fields.
-const CACHE_KEY_VERSION: u8 = 2;
+/// GH-24). v2 introduces length-prefixed fields. v3 adds `enlarge` (#36) to
+/// the hashed byte stream - without the bump, every key computed under v2
+/// (which never hashed `enlarge` at all) would keep colliding across
+/// `enlarge=true`/`enlarge=false` requests for the same other parameters
+/// even after the field started being read from `ResizeQuery`, since bytes
+/// already written to storage under those v2 keys wouldn't be reinterpreted
+/// just because the code changed.
+const CACHE_KEY_VERSION: u8 = 3;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -66,6 +72,15 @@ impl CacheService {
             None => Self::update_field(&mut hasher, b"None"),
         }
 
+        // `enlarge` (#36) changes the resize pipeline's output (whether
+        // upscaling past the source resolution is permitted), so it must be
+        // part of the key like every other field that affects output bytes
+        // - otherwise a request with `enlarge=true` could be served a
+        // cached response produced with `enlarge=false` (or vice versa).
+        // Always-present (not `Option<bool>`, so no "None" bucket needed
+        // here unlike `grayscale`/`blur_sigma`).
+        Self::update_field(&mut hasher, params.enlarge.to_string().as_bytes());
+
         let result = hasher.finalize();
         format!("{:}{:x}.{}", self.minio_sub_path, result, params.format)
     }
@@ -117,6 +132,19 @@ mod tests {
         blur_sigma: Option<f32>,
         grayscale: Option<bool>,
     ) -> ResizeQuery {
+        params_with_enlarge(url, width, height, format, blur_sigma, grayscale, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn params_with_enlarge(
+        url: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        format: ImageFormat,
+        blur_sigma: Option<f32>,
+        grayscale: Option<bool>,
+        enlarge: bool,
+    ) -> ResizeQuery {
         ResizeQuery {
             url: url.to_string(),
             width,
@@ -124,6 +152,7 @@ mod tests {
             format,
             blur_sigma,
             grayscale,
+            enlarge,
         }
     }
 
@@ -247,6 +276,31 @@ mod tests {
         assert_ne!(key_1_5, key_2_0);
     }
 
+    /// `enlarge` (#36) changes the resize pipeline's output, so two
+    /// requests differing only in `enlarge` must not collide onto the same
+    /// cache key.
+    #[test]
+    fn enlarge_true_and_false_produce_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |enlarge: bool| {
+            params_with_enlarge(
+                "https://ex.com/a.jpg",
+                Some(100),
+                Some(100),
+                ImageFormat::Png,
+                None,
+                Some(false),
+                enlarge,
+            )
+        };
+
+        assert_ne!(
+            cache.generate_key(&base(true)),
+            cache.generate_key(&base(false))
+        );
+    }
+
     /// Property-style check: a set of distinct parameter tuples must all
     /// produce distinct keys. Written as a plain loop over a `HashSet`
     /// rather than pulling in a proptest-style dependency.
@@ -265,6 +319,7 @@ mod tests {
         let formats = [ImageFormat::Jpg, ImageFormat::Png, ImageFormat::Webp];
         let blur_sigmas: [Option<f32>; 4] = [None, Some(0.0), Some(1.5), Some(2.0)];
         let grayscales: [Option<bool>; 3] = [None, Some(true), Some(false)];
+        let enlarges = [false, true];
 
         let mut tuples = Vec::new();
         for url in urls {
@@ -273,9 +328,11 @@ mod tests {
                     for format in formats {
                         for blur_sigma in blur_sigmas {
                             for grayscale in grayscales {
-                                tuples.push(params(
-                                    url, width, height, format, blur_sigma, grayscale,
-                                ));
+                                for enlarge in enlarges {
+                                    tuples.push(params_with_enlarge(
+                                        url, width, height, format, blur_sigma, grayscale, enlarge,
+                                    ));
+                                }
                             }
                         }
                     }
@@ -304,6 +361,7 @@ mod tests {
                     None
                 },
                 t.grayscale,
+                t.enlarge,
             );
             if !seen_classes.insert(class) {
                 continue;
@@ -342,7 +400,8 @@ mod tests {
         let (hex, ext) = rest.split_once('.').expect("expected a '.' separator");
         assert_eq!(hex.len(), 64, "hex digest should be 64 chars: {hex}");
         assert!(
-            hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "hex digest should be lowercase hex: {hex}"
         );
         assert_eq!(ext, "webp");

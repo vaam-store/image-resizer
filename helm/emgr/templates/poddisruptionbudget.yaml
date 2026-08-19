@@ -1,0 +1,37 @@
+{{/*
+GH #48: no PodDisruptionBudget existed, so a voluntary disruption (node
+drain, cluster upgrade) was free to evict every `main` replica at once.
+The pinned `bjw-s/common` dependency (Chart.lock: 4.0.1) predates that
+chart's own `podDisruptionBudget` values key, so this is a plain template
+rather than a `bjw-s.common.loader.all`-driven one. Its selector is a
+literal copy of the `main` controller's Deployment selector, rendered
+here with `helm template` against the pinned dependency version:
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/controller: main
+      app.kubernetes.io/name: emgr
+      app.kubernetes.io/instance: {{ "{{" }} .Release.Name {{ "}}" }}
+
+If the `main` controller is ever renamed or a second controller is added,
+this selector needs updating to match (`helm template . | grep -A3
+'^  selector:'` on the Deployment to confirm).
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-emgr
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: emgr
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/controller: main
+      app.kubernetes.io/name: emgr
+      app.kubernetes.io/instance: {{ .Release.Name }}

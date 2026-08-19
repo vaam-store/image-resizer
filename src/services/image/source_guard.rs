@@ -144,7 +144,9 @@ pub fn validate_scheme(url: &Url) -> Result<()> {
 /// URL prefixes, matched via plain `starts_with`.
 pub fn is_allowed_source(url: &Url, allowed: &[String]) -> bool {
     let candidate = url.as_str();
-    allowed.iter().any(|prefix| candidate.starts_with(prefix.as_str()))
+    allowed
+        .iter()
+        .any(|prefix| candidate.starts_with(prefix.as_str()))
 }
 
 fn is_blocked_ipv4(ip: Ipv4Addr, allow_loopback: bool, allow_link_local: bool) -> bool {
@@ -429,10 +431,7 @@ mod tests {
         assert!(is_blocked_ip(parse_ip_literal("2130706433").unwrap()));
 
         // 2852039166 == 169.254.169.254 (cloud metadata endpoint)
-        assert_eq!(
-            parse_ip_literal("2852039166"),
-            Some(ip("169.254.169.254"))
-        );
+        assert_eq!(parse_ip_literal("2852039166"), Some(ip("169.254.169.254")));
     }
 
     #[test]
@@ -558,9 +557,6 @@ mod tests {
     #[tokio::test]
     async fn resolve_validated_addr_honors_loopback_override() {
         let result = resolve_validated_addr("127.0.0.1", 8080, true, false).await;
-        assert_eq!(
-            result.unwrap(),
-            SocketAddr::new(ip("127.0.0.1"), 8080)
-        );
+        assert_eq!(result.unwrap(), SocketAddr::new(ip("127.0.0.1"), 8080));
     }
 }

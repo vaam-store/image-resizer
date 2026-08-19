@@ -22,4 +22,12 @@ pub mod services;
 /// under `modules::api` is reachable through this path.
 pub mod modules {
     pub mod env;
+
+    /// Only the leaf helpers `config::performance` needs. `cgroup` has no
+    /// dependencies of its own, so exposing it here does not drag the
+    /// axum-dependent parts of `modules::utils` (`err`, `etag`) into the
+    /// lib target.
+    pub mod utils {
+        pub mod cgroup;
+    }
 }

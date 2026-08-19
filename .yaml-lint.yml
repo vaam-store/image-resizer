@@ -1,6 +1,18 @@
 ---
 extends: default
 
+# Helm templates embed Go template directives (`{{ }}`) inline, which is
+# not valid standalone YAML - yamllint reported real syntax errors here
+# (e.g. "could not find expected ':'" on knative-service.yaml:8,
+# "expected <block end>, but found '<scalar>'" on
+# kserving-domain-mapping.yaml:14) on every single recorded Lint run
+# (GH #46/#47), unrelated to any actual chart problem (both charts render
+# correctly - `helm template` passes on both). Exclude rendered-template
+# directories from YAML validation rather than have this linter validate
+# Go template source as if it were YAML.
+ignore: |
+  helm/*/templates/**
+
 rules:
   braces:
     level: warning

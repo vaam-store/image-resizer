@@ -23,9 +23,9 @@ services:
       - -c
       - |
         set -ex
-        
+
         # Ensure the directory exists
-        chown -R 65532:65532 /app/data/images 
+        chown -R 65532:65532 /app/data/images
         chmod -R 775 /app/data/images
     # Optional: If you want to make it executable by others too, use 777 (less secure)
     # command: sh -c "chown -R 65532:65532 /app/data/images && chmod -R 777 /app/data/images"
@@ -57,8 +57,15 @@ services:
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
       ENABLE_HTTP2: false
+      # PERFORMANCE_PROFILE sizes concurrency off the *container's* core
+      # count (num_cpus, see src/config/performance.rs's
+      # high_throughput()), not a fixed number - it used to be paired with
+      # an explicit MAX_CONCURRENT_PROCESSING: 40 override here, four
+      # times the deploy.resources.limits.cpus: "1" cap above (GH #48).
+      # Once the resize service's core-count detection is cgroup-aware,
+      # letting the profile compute this itself is the correct default;
+      # override explicitly only if you also raise `cpus` above.
       PERFORMANCE_PROFILE: high_throughput
-      MAX_CONCURRENT_PROCESSING: 40
     ports:
       - "13001:3000"
     depends_on:
@@ -66,13 +73,13 @@ services:
         condition: service_started
       volume_init:
         condition: service_completed_successfully
-        
+
   app-s3:
     deploy:
       replicas: 1
       resources:
         limits: *limits
-        
+
     build:
       context: .
       dockerfile: Dockerfile
@@ -83,17 +90,24 @@ services:
       MINIO_SECRET_ACCESS_KEY: minio123
       MINIO_BUCKET: emgr
       MINIO_REGION: ~
-      
+
       STORAGE_SUB_PATH: "gen/"
-      
+
       CDN_BASE_URL: http://localhost:19000/emgr
       LOG_LEVEL: ${LOG_LEVEL:-info}
       OTLP_SPAN_ENDPOINT: http://tracking:4317
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
       ENABLE_HTTP2: false
+      # PERFORMANCE_PROFILE sizes concurrency off the *container's* core
+      # count (num_cpus, see src/config/performance.rs's
+      # high_throughput()), not a fixed number - it used to be paired with
+      # an explicit MAX_CONCURRENT_PROCESSING: 40 override here, four
+      # times the deploy.resources.limits.cpus: "1" cap above (GH #48).
+      # Once the resize service's core-count detection is cgroup-aware,
+      # letting the profile compute this itself is the correct default;
+      # override explicitly only if you also raise `cpus` above.
       PERFORMANCE_PROFILE: high_throughput
-      MAX_CONCURRENT_PROCESSING: 40
     ports:
       - "13002:3000"
     depends_on:
@@ -151,7 +165,7 @@ services:
         set -e;
 
         sleep 5;
-        
+
         mc alias set bucketer http://minio:9000 minio minio123;
         mc admin service restart bucketer --wait --json;
 
@@ -165,7 +179,18 @@ services:
         condition: service_started
 
   openapi-generator-cli:
-    image: openapitools/openapi-generator-cli
+    # Pinned (GH #45) - the "latest" tag tracks openapi-generator's
+    # unreleased master-branch snapshot builds (the previously-generated
+    # packages/gen-server on disk carries a "7.25.0-SNAPSHOT" marker in
+    # its .openapi-generator/VERSION), not the newest stable release. That
+    # snapshot is a moving target: nothing pins which commit "latest"
+    # resolves to on any given day, so `make init` can silently regenerate
+    # gen-server with different (possibly source-incompatible) codegen
+    # output between two otherwise-identical CI runs. v7.24.0 is the
+    # newest actual stable release and was verified here to regenerate
+    # gen-server with the same `headers::Host` extractor shape the current
+    # source expects. Bump deliberately, not by moving back to `latest`.
+    image: openapitools/openapi-generator-cli:v7.24.0@sha256:5bf3dc75f764c584da8e3344c51b2f3f1e74703461d46a035b5ac1d31515cc88
     volumes:
       - ./openapi.yaml:/packages/openapi.yaml
       - ./packages/gen-server:/packages/gen-server

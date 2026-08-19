@@ -1,4 +1,9 @@
-FROM rust:1 as builder
+# Pinned by digest (GH #48) - "rust:1" is a floating tag that gets
+# repointed on every new 1.x release, which lets replicas built on
+# different days/nodes end up compiled with a different rustc. This is
+# rustc 1.97.1 as of the pin below; bump deliberately with
+# `docker pull rust:1 && docker inspect rust:1 --format='{{index .RepoDigests 0}}'`.
+FROM rust@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f as builder
 
 ENV APP_NAME=emgr
 
@@ -76,7 +81,11 @@ RUN \
   cargo build --profile prod --locked --bin healthcheck \
   && cp ./target/prod/healthcheck healthcheck
 
-FROM gcr.io/distroless/cc-debian12:nonroot as base_deploy
+# Pinned by digest (GH #48), same rationale as the builder image above -
+# "nonroot" is also a floating tag. Bump deliberately with
+# `docker pull gcr.io/distroless/cc-debian12:nonroot && docker inspect \
+#   gcr.io/distroless/cc-debian12:nonroot --format='{{index .RepoDigests 0}}'`.
+FROM gcr.io/distroless/cc-debian12@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77 as base_deploy
 
 LABEL maintainer="vaam-store <vaam-store@ssegning.com>"
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"

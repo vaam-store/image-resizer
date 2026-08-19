@@ -1,4 +1,8 @@
 use crate::modules::env::env::EnvConfig;
+// Cgroup-aware CPU count (#44): `num_cpus::get()` reads sched_getaffinity and
+// is blind to a CFS quota, so a 400m-limited pod would size pools for the
+// whole node and thrash on throttling.
+use crate::modules::utils::cgroup::effective_cpu_count;
 use std::time::Duration;
 
 /// Performance configuration for the image resize service
@@ -47,7 +51,7 @@ impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             max_concurrent_downloads: 20,
-            max_concurrent_processing: num_cpus::get(),
+            max_concurrent_processing: effective_cpu_count(),
             http_timeout: Duration::from_secs(30),
             max_image_size: 50 * 1024 * 1024, // 50MB
             cpu_thread_pool_size: None,       // Use CPU count
@@ -70,10 +74,10 @@ impl PerformanceConfig {
     pub fn high_throughput() -> Self {
         Self {
             max_concurrent_downloads: 50,
-            max_concurrent_processing: num_cpus::get() * 2,
+            max_concurrent_processing: effective_cpu_count() * 2,
             http_timeout: Duration::from_secs(15),
             max_image_size: 100 * 1024 * 1024, // 100MB
-            cpu_thread_pool_size: Some(num_cpus::get()),
+            cpu_thread_pool_size: Some(effective_cpu_count()),
             enable_http2: true,
             connection_pool_size: 100,
             keep_alive_timeout: Duration::from_secs(120),
@@ -91,10 +95,10 @@ impl PerformanceConfig {
     pub fn low_latency() -> Self {
         Self {
             max_concurrent_downloads: 10,
-            max_concurrent_processing: num_cpus::get(),
+            max_concurrent_processing: effective_cpu_count(),
             http_timeout: Duration::from_secs(10),
             max_image_size: 20 * 1024 * 1024, // 20MB
-            cpu_thread_pool_size: Some(num_cpus::get()),
+            cpu_thread_pool_size: Some(effective_cpu_count()),
             enable_http2: true,
             connection_pool_size: 25,
             keep_alive_timeout: Duration::from_secs(30),
@@ -112,10 +116,10 @@ impl PerformanceConfig {
     pub fn memory_efficient() -> Self {
         Self {
             max_concurrent_downloads: 5,
-            max_concurrent_processing: num_cpus::get() / 2,
+            max_concurrent_processing: effective_cpu_count() / 2,
             http_timeout: Duration::from_secs(45),
             max_image_size: 10 * 1024 * 1024, // 10MB
-            cpu_thread_pool_size: Some(num_cpus::get() / 2),
+            cpu_thread_pool_size: Some(effective_cpu_count() / 2),
             enable_http2: false, // HTTP/1.1 uses less memory
             connection_pool_size: 10,
             keep_alive_timeout: Duration::from_secs(30),
@@ -233,7 +237,7 @@ impl PerformanceConfig {
 
     /// Get optimal CPU thread pool size
     pub fn get_cpu_thread_pool_size(&self) -> usize {
-        self.cpu_thread_pool_size.unwrap_or_else(num_cpus::get)
+        self.cpu_thread_pool_size.unwrap_or_else(effective_cpu_count)
     }
 }
 
@@ -253,7 +257,7 @@ impl From<&EnvConfig> for PerformanceConfig {
             max_concurrent_downloads: env_config.max_concurrent_downloads.unwrap_or_else(|| 20),
             max_concurrent_processing: env_config
                 .max_concurrent_processing
-                .unwrap_or_else(num_cpus::get),
+                .unwrap_or_else(effective_cpu_count),
             http_timeout: Duration::from_secs(env_config.http_timeout_secs.unwrap_or_else(|| 30)),
             max_image_size: env_config.max_image_size_mb.unwrap_or_else(|| 50) * 1024 * 1024,
             cpu_thread_pool_size: env_config.cpu_thread_pool_size,
@@ -381,7 +385,7 @@ mod tests {
         let perf_config = PerformanceConfig::from(&env_config);
 
         assert_eq!(perf_config.max_concurrent_downloads, 20);
-        assert_eq!(perf_config.max_concurrent_processing, num_cpus::get());
+        assert_eq!(perf_config.max_concurrent_processing, effective_cpu_count());
         assert_eq!(perf_config.http_timeout, Duration::from_secs(30));
         assert_eq!(perf_config.max_image_size, 50 * 1024 * 1024);
         assert_eq!(perf_config.cpu_thread_pool_size, None);
@@ -436,7 +440,9 @@ mod tests {
             keep_alive_timeout_secs: Some(120),
             performance_profile: None,
             max_redirects: Some(3),
-            allowed_sources: Some("https://trusted.example.com/, https://cdn.example.net/".to_string()),
+            allowed_sources: Some(
+                "https://trusted.example.com/, https://cdn.example.net/".to_string(),
+            ),
             allow_loopback_source_addresses: Some(true),
             allow_link_local_source_addresses: Some(true),
             max_src_resolution_mp: Some(80),

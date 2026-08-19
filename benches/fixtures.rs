@@ -66,12 +66,17 @@ fn encode(img: &DynamicImage, format: ImageFormat) -> Vec<u8> {
 /// 10000x10000), which is the whole point of that fixture.
 fn encode_png_best_compression(img: &RgbImage) -> Vec<u8> {
     use image::ExtendedColorType;
-    use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
     use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 
     let mut buf = Cursor::new(Vec::new());
     PngEncoder::new_with_quality(&mut buf, CompressionType::Best, PngFilterType::Up)
-        .write_image(img.as_raw(), img.width(), img.height(), ExtendedColorType::Rgb8)
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            ExtendedColorType::Rgb8,
+        )
         .expect("fixture PNG encoding should never fail");
     buf.into_inner()
 }

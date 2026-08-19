@@ -2,7 +2,7 @@ use crate::config::performance::PerformanceConfig;
 use crate::models::params::ResizeQuery;
 use crate::services::image::source_guard;
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use derive_builder::Builder;
 use futures::StreamExt;
 use image::imageops::FilterType;
@@ -19,8 +19,12 @@ use url::Url;
 pub struct ImageService {
     // Limit concurrent downloads to prevent memory exhaustion
     download_semaphore: Arc<Semaphore>,
-    // Custom thread pool for CPU-intensive work
-    cpu_pool: Arc<rayon::ThreadPool>,
+    // Bounds concurrent calls to the CPU-bound decode/resize/encode stage
+    // (#30). Acquired with `try_acquire_owned` right before that stage so
+    // load is shed with a distinguishable error the moment
+    // `max_concurrent_processing` concurrent jobs are already running,
+    // instead of letting an unbounded number queue up behind it.
+    processing_semaphore: Arc<Semaphore>,
     config: PerformanceConfig,
 }
 
@@ -33,19 +37,16 @@ impl ImageService {
         // Limit concurrent downloads based on configuration
         let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
 
-        // Create custom thread pool for CPU work
-        let cpu_pool_size = config.get_cpu_thread_pool_size();
-        let cpu_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(cpu_pool_size)
-                .thread_name(|i| format!("image-cpu-{}", i))
-                .build()
-                .context("Failed to create CPU thread pool")?,
-        );
+        // Limit concurrent CPU-bound processing based on configuration
+        // (#30). The CPU stage itself now runs on tokio's own managed
+        // blocking-thread pool via `spawn_blocking` rather than a
+        // hand-rolled rayon pool - see `process_image`'s doc comment for
+        // why rayon bought nothing here.
+        let processing_semaphore = Arc::new(Semaphore::new(config.max_concurrent_processing));
 
         Ok(Self {
             download_semaphore,
-            cpu_pool,
+            processing_semaphore,
             config,
         })
     }
@@ -149,7 +150,17 @@ impl ImageService {
     }
 
     /// Download an image from a URL with optimizations
-    pub async fn download_image(&self, url: &str) -> Result<Vec<u8>> {
+    ///
+    /// Returns `Bytes` rather than `Vec<u8>` (#31): the body is still read
+    /// incrementally with the size cap enforced per chunk (unchanged from
+    /// #22), but the final buffer is handed to callers as a refcounted
+    /// `Bytes` - `.freeze()` on the accumulation `BytesMut` is a type
+    /// conversion, not a copy - instead of a `Vec<u8>` that `process_image`
+    /// used to re-copy wholesale into a fresh `Bytes` via
+    /// `Bytes::copy_from_slice` before it could be moved into the blocking
+    /// task. `process_image` now just clones the `Bytes` handle (an atomic
+    /// refcount bump) to move it into that task.
+    pub async fn download_image(&self, url: &str) -> Result<Bytes> {
         // Acquire semaphore to limit concurrent downloads
         let _permit = self
             .download_semaphore
@@ -189,7 +200,7 @@ impl ImageService {
             .content_length()
             .unwrap_or(0)
             .min(self.config.max_image_size) as usize;
-        let mut buffer: Vec<u8> = Vec::with_capacity(capacity_hint);
+        let mut buffer = BytesMut::with_capacity(capacity_hint);
         let mut total_len: u64 = 0;
         let mut stream = response.bytes_stream();
 
@@ -208,24 +219,94 @@ impl ImageService {
             buffer.extend_from_slice(&chunk);
         }
 
-        Ok(buffer)
+        // `.freeze()` turns the mutable accumulation buffer into a
+        // refcounted `Bytes` in place - no further copy of the image data.
+        Ok(buffer.freeze())
     }
 
-    /// Process image using custom thread pool with CPU affinity
+    /// Process image on tokio's managed blocking thread pool, bounded by
+    /// `processing_semaphore` (#30).
+    ///
+    /// ## Why `spawn_blocking`, not the rayon pool this used to run on
+    ///
+    /// Rayon's entire value proposition is work-stealing parallelism
+    /// *within* a single job (`par_iter`, `rayon::join`, `rayon::scope`,
+    /// `par_chunks`). Grepping this crate for all four returns zero hits -
+    /// `process_image_blocking_with_limits` is a strictly sequential
+    /// decode -> resize -> encode for one image, so nothing here ever
+    /// fans a job out across rayon's pool. The old `cpu_pool.spawn(..)`
+    /// call used rayon purely as a hand-rolled blocking-task pool, which
+    /// bought two real problems for zero benefit: the queue in front of it
+    /// was unbounded (no backpressure - see the semaphore below), and
+    /// rayon's own worker count was fixed at startup rather than scaling
+    /// with the runtime the way tokio's blocking pool does. `spawn_blocking`
+    /// gets the same "off the async runtime" property with dynamic sizing
+    /// and no separate pool to manage, at zero intra-image parallelism
+    /// cost since there was never any intra-image parallelism to lose.
+    ///
+    /// ## Load shedding
+    ///
+    /// `processing_semaphore.try_acquire_owned()` is non-blocking: when
+    /// `max_concurrent_processing` jobs are already running, this returns
+    /// immediately with an error containing "permit" rather than queueing
+    /// the caller behind an unbounded backlog -
+    /// `AppError::classify_resize_error` (`src/modules/utils/err.rs`, owned
+    /// separately) already maps any message containing "permit" or
+    /// "cancelled" to `503 Service Unavailable`, so this lands there
+    /// without needing a new error variant.
+    ///
+    /// ## Cancellation on caller disconnect
+    ///
+    /// The permit is moved into the blocking closure so the semaphore
+    /// reflects real in-flight work for its whole duration, not just the
+    /// hand-off. Before doing any decode/resize/encode work, the closure
+    /// checks `tx.is_closed()` - true if `rx` (and therefore the
+    /// `process_image` future `rx.await` is driving) has already been
+    /// dropped, which is exactly what happens when the caller's request
+    /// future is cancelled (e.g. the client disconnected upstream and axum
+    /// drops the whole response future). A blocking-pool task that was
+    /// merely queued, not yet running, when that happened skips the CPU
+    /// work entirely instead of paying full decode/resize/encode cost for a
+    /// response nobody will read. A task already mid-decode when the
+    /// disconnect happens still runs to completion - Rust has no
+    /// preemption point inside synchronous decode/resize/encode calls - so
+    /// this bounds the *queued*, not in-flight, waste.
     pub async fn process_image(
         &self,
-        image_bytes: &[u8],
+        image_bytes: &Bytes,
         params: &ResizeQuery,
     ) -> Result<(Vec<u8>, String)> {
-        let image_bytes = Bytes::copy_from_slice(image_bytes);
+        let permit = match Arc::clone(&self.processing_semaphore).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                anyhow::bail!(
+                    "No processing permit available: {} concurrent image processing jobs already running",
+                    self.config.max_concurrent_processing
+                );
+            }
+        };
+
+        // Cheap: an `Arc`-backed refcount bump, not a copy of the image
+        // bytes (#31).
+        let image_bytes = image_bytes.clone();
         let params = params.clone();
-        let cpu_pool = Arc::clone(&self.cpu_pool);
         let config = self.config.clone();
 
-        // Use custom thread pool instead of tokio's spawn_blocking
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        cpu_pool.spawn(move || {
+        tokio::task::spawn_blocking(move || {
+            // Held for the lifetime of this closure so the semaphore keeps
+            // reflecting real concurrency until the work is actually done,
+            // not just until it was handed to the blocking pool.
+            let _permit = permit;
+
+            if tx.is_closed() {
+                // The caller already disconnected while this task was
+                // queued - drop the work rather than pay full CPU cost for
+                // a result nobody will receive.
+                return;
+            }
+
             let result = Self::process_image_blocking_with_limits(&image_bytes, &params, &config);
             let _ = tx.send(result);
         });
@@ -251,11 +332,7 @@ impl ImageService {
         image_bytes: &[u8],
         params: &ResizeQuery,
     ) -> Result<(Vec<u8>, String)> {
-        Self::process_image_blocking_with_limits(
-            image_bytes,
-            params,
-            &PerformanceConfig::default(),
-        )
+        Self::process_image_blocking_with_limits(image_bytes, params, &PerformanceConfig::default())
     }
 
     /// Decode/resize/encode a single image, enforcing the resolution
@@ -288,8 +365,28 @@ impl ImageService {
 
         let img = Self::decode_with_limits(image_bytes, format, config.max_src_resolution_mp)?;
 
+        let (src_width, src_height) = img.dimensions();
+
+        // Upscale guard (#36): refuses to enlarge past the source
+        // resolution unless `params.enlarge` opts in, mirroring imgproxy's
+        // `enlarge` option (default off). Capping each requested dimension
+        // to the source's, rather than rejecting the request outright,
+        // keeps every resize branch below unchanged - it just never sees a
+        // target dimension larger than the source, so none of them can
+        // upscale. This also closes a cheap CPU amplification vector: the
+        // committed benchmark baseline (.bench-baseline/BASELINE.md) puts
+        // resize/upscale/lanczos3 at 143ms vs 17.4ms for the equivalent
+        // downscale (~8x), for what would otherwise be a single request
+        // naming an arbitrary output size against a tiny source.
+        let effective_width = params
+            .width
+            .map(|w| if params.enlarge { w } else { w.min(src_width) });
+        let effective_height = params
+            .height
+            .map(|h| if params.enlarge { h } else { h.min(src_height) });
+
         // Use faster resize algorithms for different scenarios
-        let filter = match (params.width, params.height) {
+        let filter = match (effective_width, effective_height) {
             // For thumbnails, use faster Triangle filter
             (Some(w), Some(h)) if w <= 300 && h <= 300 => FilterType::Triangle,
             // For high quality, use Lanczos3
@@ -297,22 +394,18 @@ impl ImageService {
         };
 
         // Resize image with optimized logic
-        let img = match (params.width, params.height) {
+        let img = match (effective_width, effective_height) {
             (Some(w), None) => img.resize(w, u32::MAX, filter),
             (None, Some(h)) => img.resize(u32::MAX, h, filter),
-            (Some(w), Some(h)) => {
-                // Optimize resize-to-fill + crop operation
-                let img = img.resize_to_fill(w, h, filter);
-                let (current_width, current_height) = img.dimensions();
-
-                if current_width == w && current_height == h {
-                    img // No cropping needed
-                } else {
-                    let crop_x = (current_width.saturating_sub(w)) / 2;
-                    let crop_y = (current_height.saturating_sub(h)) / 2;
-                    img.crop_imm(crop_x, crop_y, w.min(current_width), h.min(current_height))
-                }
-            }
+            // `resize_to_fill` already crops to exactly `w x h` internally
+            // (verified against image-0.25.10's
+            // `DynamicImage::resize_to_fill`, `image-0.25.10/src/images/dynimage.rs:943-962`,
+            // which calls `.crop(...)` on the scaled image before
+            // returning), so the dimensions-equality check and manual
+            // `crop_imm` fallback that used to live here were dead code
+            // (#36): the `else` branch could never run, since the `if`
+            // condition was always true.
+            (Some(w), Some(h)) => img.resize_to_fill(w, h, filter),
             (None, None) => img,
         };
 
@@ -519,29 +612,32 @@ mod tests {
             format: ApiImageFormat::Jpg,
             blur_sigma: None,
             grayscale: None,
+            enlarge: false,
         }
     }
 
     #[test]
     fn output_dimensions_within_limits_pass() {
         let config = PerformanceConfig::default();
-        assert!(ImageService::check_output_dimensions(&query(Some(800), Some(600)), &config).is_ok());
+        assert!(
+            ImageService::check_output_dimensions(&query(Some(800), Some(600)), &config).is_ok()
+        );
         assert!(ImageService::check_output_dimensions(&query(None, None), &config).is_ok());
     }
 
     #[test]
     fn output_width_over_limit_is_rejected() {
         let config = PerformanceConfig::default();
-        let err = ImageService::check_output_dimensions(&query(Some(5000), None), &config)
-            .unwrap_err();
+        let err =
+            ImageService::check_output_dimensions(&query(Some(5000), None), &config).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("too large"));
     }
 
     #[test]
     fn output_height_over_limit_is_rejected() {
         let config = PerformanceConfig::default();
-        let err = ImageService::check_output_dimensions(&query(None, Some(5000)), &config)
-            .unwrap_err();
+        let err =
+            ImageService::check_output_dimensions(&query(None, Some(5000)), &config).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("too large"));
     }
 
@@ -589,6 +685,160 @@ mod tests {
         let img = image::DynamicImage::new_rgb8(1, 1);
         let size = ImageService::estimate_output_size(&img, &ImageFormat::Png);
         assert_eq!(size, 4);
+    }
+
+    /// #36: requesting a much larger output than a tiny source, with
+    /// `enlarge` left at its default (`false`), must not upscale - the
+    /// per-axis guard in `process_image_blocking_with_limits` caps the
+    /// effective target dimensions at the source's, so the decoded output
+    /// dimensions must never exceed `fixtures::TINY_SIZE`.
+    #[test]
+    fn upscale_refused_by_default() {
+        let bytes = fixtures::tiny(); // 64x64
+        let config = PerformanceConfig::default();
+        let params = query(Some(1000), Some(1000));
+        assert!(!params.enlarge, "test assumes enlarge defaults to false");
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing a valid small source should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        let (width, height) = decoded.dimensions();
+        assert!(
+            width <= fixtures::TINY_SIZE && height <= fixtures::TINY_SIZE,
+            "expected output capped at the {0}x{0} source, got {width}x{height}",
+            fixtures::TINY_SIZE
+        );
+    }
+
+    /// #36: the same oversized request against the same tiny source, but
+    /// with `enlarge: true`, must be allowed to upscale to the requested
+    /// size - proving the guard is an opt-in gate, not an unconditional cap.
+    #[test]
+    fn upscale_allowed_with_enlarge() {
+        let bytes = fixtures::tiny(); // 64x64
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            enlarge: true,
+            ..query(Some(200), Some(200))
+        };
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing with enlarge=true should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        assert_eq!(
+            decoded.dimensions(),
+            (200, 200),
+            "enlarge=true should honor the requested (larger than source) output size"
+        );
+    }
+
+    /// #30: with the processing semaphore fully saturated (zero permits),
+    /// every call must be shed immediately with an error naming "permit" -
+    /// the exact substring `AppError::classify_resize_error`
+    /// (`src/modules/utils/err.rs`, owned separately) maps to `503 Service
+    /// Unavailable` - rather than queueing behind the empty pool
+    /// indefinitely. Deterministic (no timing dependency): zero permits
+    /// means `try_acquire_owned` fails on every call, unconditionally.
+    #[tokio::test]
+    async fn processing_saturated_at_zero_permits_sheds_every_call() {
+        let config = PerformanceConfig {
+            max_concurrent_processing: 0,
+            ..PerformanceConfig::default()
+        };
+        let service = ImageService::with_config(config).unwrap();
+        let bytes = Bytes::from(fixtures::tiny());
+        let params = query(Some(32), Some(32));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.process_image(&bytes, &params),
+        )
+        .await
+        .expect("a shed call must return immediately, not hang");
+
+        let err = result.expect_err("zero permits must reject every processing call");
+        assert!(
+            err.to_string().to_lowercase().contains("permit"),
+            "expected a 'permit' error (maps to 503), got: {err}"
+        );
+    }
+
+    /// #30: under genuine concurrent load with a single permit, some calls
+    /// must succeed and at least one must be shed rather than every call
+    /// queueing up and eventually succeeding - proving the semaphore
+    /// actually bounds concurrency instead of merely being threaded through
+    /// unused (the state before this change).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrency_limit_sheds_excess_requests_under_real_load() {
+        let config = PerformanceConfig {
+            max_concurrent_processing: 1,
+            ..PerformanceConfig::default()
+        };
+        let service = Arc::new(ImageService::with_config(config).unwrap());
+        // A real-sized image so processing takes long enough for concurrent
+        // callers to actually contend on the single permit, rather than
+        // each finishing before the next one is even scheduled.
+        let bytes = Bytes::from(fixtures::photo_like());
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let service = Arc::clone(&service);
+            let bytes = bytes.clone();
+            handles.push(tokio::spawn(async move {
+                let params = query(Some(640), Some(480));
+                service.process_image(&bytes, &params).await
+            }));
+        }
+
+        let mut successes = 0;
+        let mut shed = 0;
+        for handle in handles {
+            match handle.await.expect("spawned task should not panic") {
+                Ok(_) => successes += 1,
+                Err(err) if err.to_string().to_lowercase().contains("permit") => shed += 1,
+                Err(err) => panic!("unexpected error: {err}"),
+            }
+        }
+
+        assert!(successes >= 1, "expected at least one request to succeed");
+        assert!(
+            shed >= 1,
+            "expected at least one of 8 concurrent requests to be shed with only 1 permit \
+             available (got {successes} successes, {shed} shed) - the semaphore does not \
+             appear to be bounding concurrency"
+        );
+    }
+
+    /// #31: the `Bytes`-threaded path (`ImageService::process_image`, used
+    /// in production) must produce byte-identical output to the plain
+    /// `&[u8]` path (`ImageService::process_image_blocking`, used by
+    /// benches) for the same input - proving the `Vec<u8>` -> `Bytes`
+    /// return-type change and the `Bytes::copy_from_slice` removal didn't
+    /// alter what gets encoded.
+    #[tokio::test]
+    async fn bytes_path_produces_identical_output_to_slice_path() {
+        let raw = fixtures::photo_like();
+        let params = query(Some(300), Some(200));
+
+        let (expected_bytes, expected_content_type) =
+            ImageService::process_image_blocking(&raw, &params).expect("slice path");
+
+        let service = ImageService::with_config(PerformanceConfig::default()).unwrap();
+        let bytes = Bytes::from(raw);
+        let (actual_bytes, actual_content_type) = service
+            .process_image(&bytes, &params)
+            .await
+            .expect("bytes path");
+
+        assert_eq!(actual_content_type, expected_content_type);
+        assert_eq!(
+            actual_bytes, expected_bytes,
+            "Bytes-threaded path must produce identical output to the slice path"
+        );
     }
 
     /// #22: a chunked-transfer-encoded response (no `Content-Length` at
@@ -652,7 +902,7 @@ mod tests {
         });
 
         let config = PerformanceConfig {
-            max_image_size: 64 * 1024, // 64KB - far under the ~8MB on offer
+            max_image_size: 64 * 1024,             // 64KB - far under the ~8MB on offer
             allow_loopback_source_addresses: true, // this test's origin is 127.0.0.1
             ..PerformanceConfig::default()
         };
@@ -795,7 +1045,9 @@ mod tests {
 
         let err = result.expect_err("an infinite redirect loop must be cut off");
         assert!(
-            err.to_string().to_lowercase().contains("too many redirects"),
+            err.to_string()
+                .to_lowercase()
+                .contains("too many redirects"),
             "unexpected error: {err}"
         );
 

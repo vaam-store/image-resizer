@@ -138,7 +138,10 @@ mod tests {
     fn rejects_all_allowed_extensions_only() {
         for ext in ["jpg", "png", "webp"] {
             let key = format!("{VALID_HASH}.{ext}");
-            assert!(validate_cache_key(&key, "").is_ok(), "{ext} should be accepted");
+            assert!(
+                validate_cache_key(&key, "").is_ok(),
+                "{ext} should be accepted"
+            );
         }
         for ext in ["gif", "bmp", "jpeg", "svg", "JPG"] {
             let key = format!("{VALID_HASH}.{ext}");

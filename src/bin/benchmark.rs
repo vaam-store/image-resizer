@@ -450,10 +450,7 @@ async fn main() -> Result<()> {
     println!("Image Resize Load-Test Harness");
     println!("===============================");
     println!("Target:              {}", config.get_base_url());
-    println!(
-        "Concurrency levels:  {:?}",
-        config.get_concurrency_levels()
-    );
+    println!("Concurrency levels:  {:?}", config.get_concurrency_levels());
     println!("Requests per level:  {}", config.requests_per_level);
     println!("Warm-up requests:    {}", config.warmup_requests);
     println!("Fixtures:            {:?}", config.get_fixture_names());
@@ -503,7 +500,10 @@ async fn main() -> Result<()> {
         println!("=== Concurrency {concurrency} ===");
 
         if config.warmup_requests > 0 {
-            println!("  warming up ({} requests, discarded)...", config.warmup_requests);
+            println!(
+                "  warming up ({} requests, discarded)...",
+                config.warmup_requests
+            );
             run_requests(&client, &urls, concurrency, config.warmup_requests).await;
         }
 
@@ -568,14 +568,20 @@ async fn main() -> Result<()> {
     println!("Configuration (env vars):");
     println!("  BENCHMARK_HOST / BENCHMARK_PORT      - target service address");
     println!("  BENCHMARK_CONCURRENCY_LEVELS         - e.g. '1,10,50,100'");
-    println!("  BENCHMARK_REQUESTS_PER_LEVEL         - timed requests per level (sample size for percentiles)");
+    println!(
+        "  BENCHMARK_REQUESTS_PER_LEVEL         - timed requests per level (sample size for percentiles)"
+    );
     println!("  BENCHMARK_WARMUP_REQUESTS            - discarded requests run before each level");
-    println!("  BENCHMARK_FIXTURE_NAMES              - photo_like,flat,alpha,tiny (see benches/fixtures.rs)");
+    println!(
+        "  BENCHMARK_FIXTURE_NAMES              - photo_like,flat,alpha,tiny (see benches/fixtures.rs)"
+    );
     println!("  BENCHMARK_RESIZE_PARAMS              - e.g. '100x100,500x,x300'");
     println!("  BENCHMARK_OUTPUT_FORMAT              - jpg|png|webp");
     println!("  BENCHMARK_REQUEST_TIMEOUT            - per-request timeout, seconds");
     println!("  BENCHMARK_WAIT_BETWEEN_TESTS         - pause between levels, seconds");
-    println!("  BENCHMARK_FIXTURE_HOST/_PORT         - local origin bind address (0 = random port)");
+    println!(
+        "  BENCHMARK_FIXTURE_HOST/_PORT         - local origin bind address (0 = random port)"
+    );
     println!("  BENCHMARK_JSON_OUTPUT                - path for the machine-readable report");
 
     Ok(())

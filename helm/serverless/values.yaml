@@ -46,20 +46,20 @@ env:
     secretKeyRef:
       name: minio
       key: access-key
-  
+
   MINIO_SECRET_ACCESS_KEY:
     secretKeyRef:
       name: minio
       key: secret-key
-  
+
   MINIO_ENDPOINT_URL: http://minio:9000
   MINIO_BUCKET: emgr
   MINIO_REGION: ~
 
   STORAGE_SUB_PATH: 'files/gen/'
-  
+
   CDN_BASE_URL: http://localhost:19000/emgr
-  
+
   LOG_LEVEL: ${LOG_LEVEL:-info}
   OTLP_SPAN_ENDPOINT: http://tracking:4317
   OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics

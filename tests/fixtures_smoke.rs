@@ -94,7 +94,10 @@ fn bomb_is_small_on_disk_but_decodes_huge() {
 
 #[test]
 fn by_name_matches_direct_accessors() {
-    assert_eq!(fixtures::by_name("photo_like"), Some(fixtures::photo_like()));
+    assert_eq!(
+        fixtures::by_name("photo_like"),
+        Some(fixtures::photo_like())
+    );
     assert_eq!(fixtures::by_name("flat"), Some(fixtures::flat()));
     assert_eq!(fixtures::by_name("alpha"), Some(fixtures::alpha()));
     assert_eq!(fixtures::by_name("tiny"), Some(fixtures::tiny()));
