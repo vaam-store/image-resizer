@@ -102,7 +102,6 @@ tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter
 tracing-opentelemetry = { version = "0.30", optional = true }
 tracing = { version = "0.1", features = ["attributes"] }
 prometheus = { version = "0.14", optional = true }
-lru = "0.12"
 dashmap = "6"
 tower_governor = "0.8"
 

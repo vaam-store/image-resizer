@@ -18,6 +18,7 @@ RUN \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
   --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
@@ -32,6 +33,7 @@ RUN \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
   --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
@@ -46,6 +48,7 @@ RUN \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
   --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
@@ -60,6 +63,7 @@ RUN \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
   --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
@@ -74,6 +78,7 @@ RUN \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
   --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
+  --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
   --mount=type=cache,target=/usr/local/cargo/registry/cache \
   --mount=type=cache,target=/usr/local/cargo/registry/index \
