@@ -497,6 +497,7 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            background: None,
         });
 
         let mut handles = Vec::with_capacity(100);
@@ -573,6 +574,7 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            background: None,
         });
 
         let mut handles = Vec::with_capacity(20);

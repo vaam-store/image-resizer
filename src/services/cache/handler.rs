@@ -24,8 +24,14 @@ use sha2::{Digest, Sha256};
 /// output cached under the same width/height/etc, or vice versa - exactly
 /// the kind of stale, wrong-shape response #59 exists to eliminate. Every
 /// key computed under v3 must therefore be invalidated by this bump, same
-/// as the v2 -> v3 transition for `enlarge`.
-const CACHE_KEY_VERSION: u8 = 4;
+/// as the v2 -> v3 transition for `enlarge`. v5 adds `background` (#34/#60):
+/// before this, the resize pipeline never flattened alpha or normalised
+/// transparent pixels at all, so `background` had no effect on output
+/// bytes. Now that it changes what gets encoded - both the flatten colour
+/// for alpha->no-alpha conversions and the fill colour for fully-transparent
+/// pixels when alpha is kept - two requests differing only in `background`
+/// must not collide onto a v4 key that never hashed it.
+const CACHE_KEY_VERSION: u8 = 5;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -98,6 +104,16 @@ impl CacheService {
         // Always-present (not `Option<bool>`, so no "None" bucket needed
         // here unlike `grayscale`/`blur_sigma`).
         Self::update_field(&mut hasher, params.enlarge.to_string().as_bytes());
+
+        // `background` (#34/#60, v5) changes the resize pipeline's output
+        // bytes wherever alpha is flattened or transparent pixels are
+        // normalised, so it must be part of the key like every other
+        // output-affecting field - see the v5 `CACHE_KEY_VERSION` note
+        // above.
+        match params.background {
+            Some([r, g, b]) => Self::update_field(&mut hasher, &[r, g, b]),
+            None => Self::update_field(&mut hasher, b"None"),
+        }
 
         let result = hasher.finalize();
         format!("{:}{:x}.{}", self.minio_sub_path, result, params.format)
@@ -176,6 +192,7 @@ mod tests {
             grayscale,
             enlarge,
             quality: None,
+            background: None,
         }
     }
 
@@ -324,6 +341,39 @@ mod tests {
         );
     }
 
+    /// #34/#60 (v5 bump): `background` changes the resize pipeline's output
+    /// bytes (flatten/normalise colour), so distinct backgrounds - and the
+    /// unset ("use the default") case - must not collide onto the same
+    /// cache key.
+    #[test]
+    fn background_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |background: Option<[u8; 3]>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
+            background,
+        };
+
+        let keys: HashSet<String> = [None, Some([255, 255, 255]), Some([0, 0, 0]), Some([1, 2, 3])]
+            .into_iter()
+            .map(|bg| cache.generate_key(&base(bg)))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            4,
+            "each distinct background (including unset) must produce a distinct cache key"
+        );
+    }
+
     /// #59 (v4 bump): before #59, `fit`/`fill`/`force`/`auto` were parsed
     /// but ignored, so every width+height request resized identically and
     /// `resize_type` didn't need to be part of the key. Now that each type
@@ -346,6 +396,7 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            background: None,
         };
 
         let keys: HashSet<String> = [
