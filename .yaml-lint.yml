@@ -1,6 +1,18 @@
 ---
 extends: default
 
+# Helm templates embed Go template directives (`{{ }}`) inline, which is
+# not valid standalone YAML - yamllint reported real syntax errors here
+# (e.g. "could not find expected ':'" on knative-service.yaml:8,
+# "expected <block end>, but found '<scalar>'" on
+# kserving-domain-mapping.yaml:14) on every single recorded Lint run
+# (GH #46/#47), unrelated to any actual chart problem (both charts render
+# correctly - `helm template` passes on both). Exclude rendered-template
+# directories from YAML validation rather than have this linter validate
+# Go template source as if it were YAML.
+ignore: |
+  helm/*/templates/**
+
 rules:
   braces:
     level: warning
@@ -21,8 +33,16 @@ rules:
     level: warning
   indentation:
     level: warning
-    indent-sequences: consistent
+    # `whatever`, not `consistent`: mkdocs.yml's nav uses the conventional
+    # mkdocs style (sequence items indented 4 under their mapping key) which
+    # is valid YAML and what the tool's own docs show. Re-indenting a working
+    # config to satisfy a linter preference is the wrong trade.
+    indent-sequences: whatever
   line-length:
+    # Workflow files carry long `uses:` refs, digest pins and shell one-liners
+    # that cannot be wrapped without harming readability. 80 is a prose limit,
+    # not a YAML one.
+    max: 140
     level: warning
     allow-non-breakable-inline-mappings: true
   truthy: disable

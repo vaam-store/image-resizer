@@ -1,0 +1,16 @@
+# `rustflags` is a Cargo *config* key, never a manifest key. It previously sat in
+# Cargo.toml under [target.'cfg(target_arch = "x86_64")'], where Cargo ignored it
+# with `warning: unused manifest key` — so the AVX2/FMA optimisation this project
+# documented was never applied to any build. See issue #28.
+#
+# `target-cpu=native` (the original value) is also wrong for a distributed image:
+# it tunes for whichever machine ran the build, and can SIGILL on an older CPU.
+# x86-64-v3 == Haswell (2013)+: AVX2, FMA, BMI1/2. Override on a known host with
+#   RUSTFLAGS="-C target-cpu=native" cargo build --profile perf
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+# NOTE: on a non-x86_64 host (e.g. Apple Silicon) cargo prints
+#   warning: unused manifest key: target.cfg(target_arch = "x86_64").rustflags
+# That is expected and correct — the section genuinely does not apply to this
+# host's target. It takes effect when building for x86_64.

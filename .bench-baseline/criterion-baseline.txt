@@ -1,0 +1,357 @@
+warning: unused manifest key: target.cfg(target_arch = "x86_64").rustflags
+warning: unused manifest key: target.cfg(target_arch = "x86_64").rustflags
+   Compiling emgr v0.1.2 (/Users/selast/dev/vaam-store/image-resizer/.claude/worktrees/imgproxy-concurrent-review-2b6d38)
+warning: unused import: `tracing::error`
+ --> src/modules/utils/err.rs:5:5
+  |
+5 | use tracing::error;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `PerformanceMetrics` is never constructed
+   --> src/config/performance.rs:179:12
+    |
+179 | pub struct PerformanceMetrics {
+    |            ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `new`, `increment_requests`, `increment_cache_hits`, `increment_cache_misses`, and `get_cache_hit_ratio` are never used
+   --> src/config/performance.rs:189:12
+    |
+188 | impl PerformanceMetrics {
+    | ----------------------- associated items in this implementation
+189 |     pub fn new() -> Self {
+    |            ^^^
+...
+193 |     pub fn increment_requests(&self) {
+    |            ^^^^^^^^^^^^^^^^^^
+...
+198 |     pub fn increment_cache_hits(&self) {
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+203 |     pub fn increment_cache_misses(&self) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+208 |     pub fn get_cache_hit_ratio(&self) -> f64 {
+    |            ^^^^^^^^^^^^^^^^^^^
+
+warning: enum `AppError` is never used
+ --> src/modules/utils/err.rs:8:10
+  |
+8 | pub enum AppError {
+  |          ^^^^^^^^
+
+warning: associated items `new` and `resize_batch` are never used
+   --> src/services/resize/handler.rs:22:12
+    |
+ 20 | impl ResizeService {
+    | ------------------ associated items in this implementation
+ 21 |     /// Create a new ResizeService with default performance configuration
+ 22 |     pub fn new(storage_service: StorageService, cache_service: CacheService) -> Result<Self> {
+    |            ^^^
+...
+116 |     pub async fn resize_batch(
+    |                  ^^^^^^^^^^^^
+
+warning: `emgr` (bin "emgr") generated 5 warnings (run `cargo fix --bin "emgr" -p emgr` to apply 1 suggestion)
+    Finished `bench` profile [optimized] target(s) in 16.04s
+     Running benches/cache_key.rs (target/release/deps/cache_key-d658ced9b4cfab58)
+Gnuplot not found, using plotters backend
+Benchmarking cache_key/generate_key
+Benchmarking cache_key/generate_key: Warming up for 1.0000 s
+Benchmarking cache_key/generate_key: Collecting 20 samples in estimated 2.0000 s (2.9M iterations)
+Benchmarking cache_key/generate_key: Analyzing
+cache_key/generate_key  time:   [686.37 ns 687.46 ns 689.15 ns]
+                        change: [-1.9360% -1.3247% -0.7116%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+
+     Running benches/decode.rs (target/release/deps/decode-978fbc21102a329b)
+Gnuplot not found, using plotters backend
+Benchmarking decode/jpeg/640x360
+Benchmarking decode/jpeg/640x360: Warming up for 1.0000 s
+Benchmarking decode/jpeg/640x360: Collecting 20 samples in estimated 2.0233 s (2520 iterations)
+Benchmarking decode/jpeg/640x360: Analyzing
+decode/jpeg/640x360     time:   [818.27 µs 824.52 µs 833.69 µs]
+                        thrpt:  [71.238 MiB/s 72.031 MiB/s 72.581 MiB/s]
+                 change:
+                        time:   [+0.8190% +2.0257% +3.3862%] (p = 0.12 > 0.05)
+                        thrpt:  [-3.2753% -1.9854% -0.8123%]
+                        No change in performance detected.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) low mild
+  1 (5.00%) high severe
+Benchmarking decode/jpeg/1280x720
+Benchmarking decode/jpeg/1280x720: Warming up for 1.0000 s
+Benchmarking decode/jpeg/1280x720: Collecting 20 samples in estimated 2.4894 s (840 iterations)
+Benchmarking decode/jpeg/1280x720: Analyzing
+decode/jpeg/1280x720    time:   [3.0317 ms 3.0557 ms 3.0881 ms]
+                        thrpt:  [73.993 MiB/s 74.778 MiB/s 75.369 MiB/s]
+                 change:
+                        time:   [+2.1308% +2.7815% +3.4971%] (p = 0.00 < 0.05)
+                        thrpt:  [-3.3789% -2.7063% -2.0864%]
+                        Performance has regressed.
+Benchmarking decode/jpeg/1920x1080
+Benchmarking decode/jpeg/1920x1080: Warming up for 1.0000 s
+Benchmarking decode/jpeg/1920x1080: Collecting 20 samples in estimated 2.7845 s (420 iterations)
+Benchmarking decode/jpeg/1920x1080: Analyzing
+decode/jpeg/1920x1080   time:   [6.7654 ms 6.7774 ms 6.7938 ms]
+                        thrpt:  [75.312 MiB/s 75.494 MiB/s 75.628 MiB/s]
+                 change:
+                        time:   [+0.8690% +1.4538% +2.0403%] (p = 0.02 < 0.05)
+                        thrpt:  [-1.9995% -1.4330% -0.8615%]
+                        Change within noise threshold.
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high severe
+Benchmarking decode/png/640x360
+Benchmarking decode/png/640x360: Warming up for 1.0000 s
+Benchmarking decode/png/640x360: Collecting 20 samples in estimated 2.1288 s (1260 iterations)
+Benchmarking decode/png/640x360: Analyzing
+decode/png/640x360      time:   [1.7114 ms 1.7217 ms 1.7299 ms]
+                        thrpt:  [365.36 MiB/s 367.10 MiB/s 369.30 MiB/s]
+                 change:
+                        time:   [-1.2093% +1.1421% +3.5879%] (p = 0.45 > 0.05)
+                        thrpt:  [-3.4636% -1.1292% +1.2241%]
+                        No change in performance detected.
+Benchmarking decode/png/1280x720
+Benchmarking decode/png/1280x720: Warming up for 1.0000 s
+Benchmarking decode/png/1280x720: Collecting 20 samples in estimated 2.8404 s (420 iterations)
+Benchmarking decode/png/1280x720: Analyzing
+decode/png/1280x720     time:   [6.7332 ms 6.7465 ms 6.7655 ms]
+                        thrpt:  [374.01 MiB/s 375.06 MiB/s 375.80 MiB/s]
+                 change:
+                        time:   [-1.2523% -0.6720% -0.0613%] (p = 0.12 > 0.05)
+                        thrpt:  [+0.0613% +0.6765% +1.2682%]
+                        No change in performance detected.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) high mild
+  1 (5.00%) high severe
+Benchmarking decode/png/1920x1080
+Benchmarking decode/png/1920x1080: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 3.2s, enable flat sampling, or reduce sample count to 10.
+Benchmarking decode/png/1920x1080: Collecting 20 samples in estimated 3.1758 s (210 iterations)
+Benchmarking decode/png/1920x1080: Analyzing
+decode/png/1920x1080    time:   [15.118 ms 15.153 ms 15.199 ms]
+                        thrpt:  [374.41 MiB/s 375.56 MiB/s 376.42 MiB/s]
+                 change:
+                        time:   [-1.7686% -1.2832% -0.7561%] (p = 0.06 > 0.05)
+                        thrpt:  [+0.7618% +1.2999% +1.8004%]
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking decode/webp/640x360
+Benchmarking decode/webp/640x360: Warming up for 1.0000 s
+Benchmarking decode/webp/640x360: Collecting 20 samples in estimated 2.2818 s (840 iterations)
+Benchmarking decode/webp/640x360: Analyzing
+decode/webp/640x360     time:   [2.7187 ms 2.7313 ms 2.7492 ms]
+                        thrpt:  [101.86 MiB/s 102.52 MiB/s 103.00 MiB/s]
+                 change:
+                        time:   [-1.5868% -0.3888% +0.8198%] (p = 0.46 > 0.05)
+                        thrpt:  [-0.8131% +0.3903% +1.6124%]
+                        No change in performance detected.
+Found 5 outliers among 20 measurements (25.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+  3 (15.00%) high severe
+Benchmarking decode/webp/1280x720
+Benchmarking decode/webp/1280x720: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 2.3s, enable flat sampling, or reduce sample count to 10.
+Benchmarking decode/webp/1280x720: Collecting 20 samples in estimated 2.3197 s (210 iterations)
+Benchmarking decode/webp/1280x720: Analyzing
+decode/webp/1280x720    time:   [11.026 ms 11.098 ms 11.169 ms]
+                        thrpt:  [99.220 MiB/s 99.850 MiB/s 100.51 MiB/s]
+                 change:
+                        time:   [+0.5844% +2.5950% +7.1880%] (p = 0.41 > 0.05)
+                        thrpt:  [-6.7060% -2.5294% -0.5810%]
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking decode/webp/1920x1080
+Benchmarking decode/webp/1920x1080: Warming up for 1.0000 s
+Benchmarking decode/webp/1920x1080: Collecting 20 samples in estimated 2.0329 s (80 iterations)
+Benchmarking decode/webp/1920x1080: Analyzing
+decode/webp/1920x1080   time:   [24.506 ms 24.665 ms 24.828 ms]
+                        thrpt:  [98.799 MiB/s 99.450 MiB/s 100.09 MiB/s]
+                 change:
+                        time:   [-1.4342% -0.7750% -0.1841%] (p = 0.21 > 0.05)
+                        thrpt:  [+0.1845% +0.7811% +1.4551%]
+                        No change in performance detected.
+
+     Running benches/encode.rs (target/release/deps/encode-cc81875fa2a8c466)
+Gnuplot not found, using plotters backend
+Benchmarking encode/jpeg
+Benchmarking encode/jpeg: Warming up for 1.0000 s
+Benchmarking encode/jpeg: Collecting 20 samples in estimated 2.0203 s (630 iterations)
+Benchmarking encode/jpeg: Analyzing
+encode/jpeg             time:   [3.1796 ms 3.1867 ms 3.1976 ms]
+                        change: [-1.7958% -1.6365% -1.4616%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking encode/png
+Benchmarking encode/png: Warming up for 1.0000 s
+Benchmarking encode/png: Collecting 20 samples in estimated 2.2175 s (1050 iterations)
+Benchmarking encode/png: Analyzing
+encode/png              time:   [2.0646 ms 2.0856 ms 2.1206 ms]
+                        change: [+0.4949% +2.7330% +5.4747%] (p = 0.30 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking encode/webp
+Benchmarking encode/webp: Warming up for 1.0000 s
+Benchmarking encode/webp: Collecting 20 samples in estimated 2.4115 s (1050 iterations)
+Benchmarking encode/webp: Analyzing
+encode/webp             time:   [2.2472 ms 2.2507 ms 2.2548 ms]
+                        change: [-2.1807% -1.9828% -1.7695%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+     Running benches/pipeline.rs (target/release/deps/pipeline-f9bf123d4882a548)
+Gnuplot not found, using plotters backend
+Benchmarking pipeline/process_image_blocking/photo_like/thumbnail_jpg
+Benchmarking pipeline/process_image_blocking/photo_like/thumbnail_jpg: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 3.1s, enable flat sampling, or reduce sample count to 10.
+Benchmarking pipeline/process_image_blocking/photo_like/thumbnail_jpg: Collecting 20 samples in estimated 3.1300 s (210 iterations)
+Benchmarking pipeline/process_image_blocking/photo_like/thumbnail_jpg: Analyzing
+pipeline/process_image_blocking/photo_like/thumbnail_jpg
+                        time:   [14.606 ms 14.883 ms 15.094 ms]
+                        change: [-2.3387% -1.4073% -0.5570%] (p = 0.09 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 20 measurements (15.00%)
+  2 (10.00%) high mild
+  1 (5.00%) high severe
+Benchmarking pipeline/process_image_blocking/flat/resize_png
+Benchmarking pipeline/process_image_blocking/flat/resize_png: Warming up for 1.0000 s
+Benchmarking pipeline/process_image_blocking/flat/resize_png: Collecting 20 samples in estimated 2.6149 s (80 iterations)
+Benchmarking pipeline/process_image_blocking/flat/resize_png: Analyzing
+pipeline/process_image_blocking/flat/resize_png
+                        time:   [32.591 ms 32.805 ms 33.010 ms]
+                        change: [-0.5842% +0.5214% +1.6220%] (p = 0.49 > 0.05)
+                        No change in performance detected.
+Benchmarking pipeline/process_image_blocking/alpha/resize_webp
+Benchmarking pipeline/process_image_blocking/alpha/resize_webp: Warming up for 1.0000 s
+Benchmarking pipeline/process_image_blocking/alpha/resize_webp: Collecting 20 samples in estimated 2.4743 s (840 iterations)
+Benchmarking pipeline/process_image_blocking/alpha/resize_webp: Analyzing
+pipeline/process_image_blocking/alpha/resize_webp
+                        time:   [2.9079 ms 2.9376 ms 2.9725 ms]
+                        change: [-0.4421% +0.7984% +2.1887%] (p = 0.46 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high severe
+
+     Running benches/resize.rs (target/release/deps/resize-6d388533ee94ced2)
+Gnuplot not found, using plotters backend
+Benchmarking resize/downscale/nearest
+Benchmarking resize/downscale/nearest: Warming up for 1.0000 s
+Benchmarking resize/downscale/nearest: Collecting 20 samples in estimated 2.0157 s (1890 iterations)
+Benchmarking resize/downscale/nearest: Analyzing
+resize/downscale/nearest
+                        time:   [1.0893 ms 1.1030 ms 1.1160 ms]
+                        change: [+0.7673% +1.9307% +3.0390%] (p = 0.13 > 0.05)
+                        No change in performance detected.
+Benchmarking resize/upscale/nearest
+Benchmarking resize/upscale/nearest: Warming up for 1.0000 s
+Benchmarking resize/upscale/nearest: Collecting 20 samples in estimated 3.8491 s (40 iterations)
+Benchmarking resize/upscale/nearest: Analyzing
+resize/upscale/nearest  time:   [92.539 ms 93.276 ms 94.340 ms]
+                        change: [-1.2645% -0.5125% +0.6637%] (p = 0.32 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking resize/downscale/triangle
+Benchmarking resize/downscale/triangle: Warming up for 1.0000 s
+Benchmarking resize/downscale/triangle: Collecting 20 samples in estimated 2.3942 s (420 iterations)
+Benchmarking resize/downscale/triangle: Analyzing
+resize/downscale/triangle
+                        time:   [5.6374 ms 5.6516 ms 5.6752 ms]
+                        change: [-2.6425% -2.0066% -1.3832%] (p = 0.08 > 0.05)
+                        No change in performance detected.
+Benchmarking resize/upscale/triangle
+Benchmarking resize/upscale/triangle: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 2.2s, or reduce sample count to 10.
+Benchmarking resize/upscale/triangle: Collecting 20 samples in estimated 2.2256 s (20 iterations)
+Benchmarking resize/upscale/triangle: Analyzing
+resize/upscale/triangle time:   [110.26 ms 110.69 ms 111.14 ms]
+                        change: [+0.8060% +1.2591% +1.7087%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Benchmarking resize/downscale/catmull_rom
+Benchmarking resize/downscale/catmull_rom: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 2.3s, enable flat sampling, or reduce sample count to 10.
+Benchmarking resize/downscale/catmull_rom: Collecting 20 samples in estimated 2.2673 s (210 iterations)
+Benchmarking resize/downscale/catmull_rom: Analyzing
+resize/downscale/catmull_rom
+                        time:   [10.684 ms 10.706 ms 10.737 ms]
+                        change: [-3.6562% -3.2728% -2.8289%] (p = 0.01 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+Benchmarking resize/upscale/catmull_rom
+Benchmarking resize/upscale/catmull_rom: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 2.7s, or reduce sample count to 10.
+Benchmarking resize/upscale/catmull_rom: Collecting 20 samples in estimated 2.6723 s (20 iterations)
+Benchmarking resize/upscale/catmull_rom: Analyzing
+resize/upscale/catmull_rom
+                        time:   [132.46 ms 133.96 ms 135.56 ms]
+                        change: [+5.4920% +7.4731% +9.5384%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking resize/downscale/gaussian
+Benchmarking resize/downscale/gaussian: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 3.4s, enable flat sampling, or reduce sample count to 10.
+Benchmarking resize/downscale/gaussian: Collecting 20 samples in estimated 3.3599 s (210 iterations)
+Benchmarking resize/downscale/gaussian: Analyzing
+resize/downscale/gaussian
+                        time:   [15.866 ms 16.010 ms 16.134 ms]
+                        change: [-6.0974% -4.7906% -3.4792%] (p = 0.03 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+Benchmarking resize/upscale/gaussian
+Benchmarking resize/upscale/gaussian: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 2.9s, or reduce sample count to 10.
+Benchmarking resize/upscale/gaussian: Collecting 20 samples in estimated 2.9127 s (20 iterations)
+Benchmarking resize/upscale/gaussian: Analyzing
+resize/upscale/gaussian time:   [143.29 ms 144.71 ms 146.19 ms]
+                        change: [+4.5433% +5.7331% +7.0632%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Benchmarking resize/downscale/lanczos3
+Benchmarking resize/downscale/lanczos3: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 3.4s, enable flat sampling, or reduce sample count to 10.
+Benchmarking resize/downscale/lanczos3: Collecting 20 samples in estimated 3.4184 s (210 iterations)
+Benchmarking resize/downscale/lanczos3: Analyzing
+resize/downscale/lanczos3
+                        time:   [16.950 ms 17.390 ms 17.908 ms]
+                        change: [+1.6282% +4.8316% +8.5856%] (p = 0.25 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 20 measurements (10.00%)
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+Benchmarking resize/upscale/lanczos3
+Benchmarking resize/upscale/lanczos3: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 2.0s. You may wish to increase target time to 3.0s, or reduce sample count to 10.
+Benchmarking resize/upscale/lanczos3: Collecting 20 samples in estimated 2.9650 s (20 iterations)
+Benchmarking resize/upscale/lanczos3: Analyzing
+resize/upscale/lanczos3 time:   [141.88 ms 143.02 ms 144.26 ms]
+                        change: [+2.6174% +3.5432% +4.5711%] (p = 0.01 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+

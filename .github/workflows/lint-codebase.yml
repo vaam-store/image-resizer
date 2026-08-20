@@ -23,13 +23,40 @@ jobs:
         with:
           fetch-depth: "0"
 
+      # RUST_CLIPPY used to run here (VALIDATE_RUST_CLIPPY) but every
+      # single recorded run of this workflow has failed (GH #46) - not on
+      # real lint findings, but because super-linter v7.4.0 bundles Cargo
+      # 1.83.0, and this crate declares `edition = "2024"` (Cargo.toml:4),
+      # which that Cargo version cannot parse at all:
+      #   error: failed to parse manifest ... feature `edition2024` is
+      #   required ... not stabilized in this version of Cargo (1.83.0)
+      # This fails before clippy ever resolves the crate graph, so fixing
+      # `packages/gen-server` generation (GH #45) would not have helped -
+      # confirmed via `gh run view --log-failed` on run 32248458528. Rust
+      # linting now runs for real in ci.yml's `clippy` job instead, with a
+      # current toolchain.
       - name: Run ESLint and post results
         uses: super-linter/super-linter@v7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # super-linter looks for linter configs under LINTER_RULES_PATH,
+          # which defaults to `.github/linters`. This repo keeps them at the
+          # root (.yaml-lint.yml, .hadolint.yaml, .clippy.toml), so they were
+          # never actually read and every YAML run used yamllint's defaults -
+          # which is why `document-start: disable` in .yaml-lint.yml had no
+          # effect and Lint failed on style warnings. Point it at the root.
+          # yamllint's own `ignore:` in .yaml-lint.yml does not help here:
+          # super-linter hands it one file at a time, so the config's path
+          # patterns never match. Helm templates are Go template source, not
+          # YAML - `{{ }}` directives make them unparseable - so exclude them
+          # at the super-linter level instead. Both charts render correctly
+          # (`helm template` passes); this linter simply is not the right tool
+          # for them.
+          FILTER_REGEX_EXCLUDE: ".*helm/.*/templates/.*"
+          LINTER_RULES_PATH: "."
+          YAML_CONFIG_FILE: ".yaml-lint.yml"
           VALIDATE_DOCKERFILE_HADOLINT: "true"
           VALIDATE_GITHUB_ACTIONS: "true"
           VALIDATE_GITLEAKS: "true"
           VALIDATE_GIT_MERGE_CONFLICT_MARKERS: "true"
-          VALIDATE_RUST_CLIPPY: "true"
           VALIDATE_YAML: "true"

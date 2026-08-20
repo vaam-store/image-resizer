@@ -130,7 +130,7 @@ The included benchmark tool is now fully configurable through environment variab
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BENCHMARK_HOST` | `localhost` | Target host for benchmark requests |
-| `BENCHMARK_PORT` | `8080` | Target port for benchmark requests |
+| `BENCHMARK_PORT` | `3000` | Target port for benchmark requests |
 | `BENCHMARK_CONCURRENCY_LEVELS` | `1,5,10,20,50` | Comma-separated list of concurrency levels to test |
 | `BENCHMARK_TEST_URLS` | `https://picsum.photos/...` | Comma-separated list of test image URLs |
 | `BENCHMARK_RESIZE_PARAMS` | `300x300,800x,x600,1200x800` | Comma-separated list of resize parameters (format: `WIDTHxHEIGHT`) |

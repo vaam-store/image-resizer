@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::modules::api::handler::ApiService;
-use crate::modules::router::middlewares::apply_common_middlewares;
+use crate::modules::router::middlewares::{MiddlewareConfig, apply_common_middlewares};
 use crate::services::health::handler::health;
 use anyhow::Result;
 use axum::Router;
@@ -23,14 +23,14 @@ pub async fn router(
 
     // Add health and metrics endpoints
     let app = app
-        .route("/", get(|| async { Redirect::permanent("/health") }))
+        .route("/", get(|| async { Redirect::temporary("/health") }))
         .route("/health", get(health))
         .route(
             "/metrics",
             get(crate::services::metrics::handler::metrics_handler),
         );
 
-    let router = apply_common_middlewares(app);
+    let router = apply_common_middlewares(app, MiddlewareConfig::from_env());
     Ok(router)
 }
 
@@ -43,9 +43,9 @@ pub async fn router(api_service: Arc<ApiService>) -> Result<Router> {
 
     // Add health and metrics endpoints
     let app = app
-        .route("/", get(|| async { Redirect::permanent("/health") }))
+        .route("/", get(|| async { Redirect::temporary("/health") }))
         .route("/health", get(health));
 
-    let router = apply_common_middlewares(app);
+    let router = apply_common_middlewares(app, MiddlewareConfig::from_env());
     Ok(router)
 }

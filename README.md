@@ -88,10 +88,10 @@ You can test the image resizing functionality using `curl`. The service listens 
 curl -LI 'http://localhost:13001/api/images/resize?url=https%3A%2F%2Fimages.pexels.com%2Fphotos%2F32138887%2Fpexels-photo-32138887.jpeg%3Fcs%3Dsrgb%26dl%3Dpexels-branka-krnjaja-1475677195-32138887.jpg%26fm%3Djpg%26w%3D1280%26h%3D1910&width=1000&height=1000&format=jpg'
 ```
 
-You should see a `302 Found` response, with a `Location` header pointing to the resized image:
+You should see a `301 Moved Permanently` response, with a `Location` header pointing to the resized image:
 
 ```plaintext
-HTTP/1.1 302 Found
+HTTP/1.1 301 Moved Permanently
 location: http://localhost:13001/api/images/files/your-image-hash.jpg
 vary: origin, access-control-request-method, access-control-request-headers
 access-control-allow-origin: *
@@ -142,11 +142,14 @@ The API is defined in [`openapi.yaml`](openapi.yaml:1). Key endpoints include:
     *   **Summary**: Resizes an image based on the provided parameters.
     *   **Query Parameters**:
         *   `url` (string, required): The URL of the image to resize.
-        *   `width` (integer, required): The desired width of the resized image (min: 100, max: 2048).
-        *   `height` (integer, required): The desired height of the resized image (min: 100, max: 2048).
+        *   `width` (integer, optional): The desired width of the resized image (min: 10, max: 4096, default: 200).
+        *   `height` (integer, optional): The desired height of the resized image (min: 10, max: 4096, default: 200).
         *   `format` (string, required): The desired output format (`png`, `webp`, `jpg`).
     *   **Responses**:
-        *   `302 Found`: Redirects to the path of the resized image. The `Location` header contains the URL to the processed image.
+        *   `301 Moved Permanently`: Redirects to the path of the resized image. The `Location` header contains the URL to the processed image. (Never a redirect to the caller-supplied `url` - see [GH #25](https://github.com/vaam-store/image-resizer/issues/25).)
+        *   `400 Bad Request`: The source URL doesn't decode as an image, or exceeds a configured limit.
+        *   `502 Bad Gateway`: The origin server for the requested image failed.
+        *   `503 Service Unavailable`: The service is shedding load (concurrency limits reached).
 
 *   `GET /api/images/files/{key}`
     *   **Summary**: Downloads a previously resized image.
@@ -157,8 +160,17 @@ The API is defined in [`openapi.yaml`](openapi.yaml:1). Key endpoints include:
 
 ## Configuration
 
-The application can be configured via environment variables, as seen in [`compose.yaml`](compose.yaml:1):
+The application is configured entirely via environment variables, read by
+[`src/modules/env/env.rs`](src/modules/env/env.rs). The full, CI-checked
+reference lives at
+[`docs/getting-started/configuration.md`](docs/getting-started/configuration.md)
+(covers storage backend selection, the SSRF source-fetch guard,
+resolution/output limits, performance tuning, and observability). A
+starting-point `.env` file is at [`.env.example`](.env.example) - copy it
+to `.env` (gitignored). The most commonly-touched variables, as seen in
+[`compose.yaml`](compose.yaml):
 
+*   `STORAGE_TYPE`: Storage backend - `LOCAL_FS` or `S3` (alias `MINIO`).
 *   `CDN_BASE_URL`: The base URL for constructing links to served image files (e.g., `http://localhost:13001/api/images/files`).
 *   `LOG_LEVEL`: Sets the logging verbosity (e.g., `info`, `debug`).
 *   `OTLP_SPAN_ENDPOINT`: Endpoint for OpenTelemetry trace collector (Jaeger).

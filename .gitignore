@@ -1,7 +1,18 @@
 /target
 .idea
-gen-server
+# packages/gen-server is now COMMITTED (GH #45). It is generated from
+# openapi.yaml by `make init`, but leaving it ignored meant a fresh clone -
+# and every CI job - could not resolve the path dependency and failed to
+# build at all. Committing it also makes the generated API surface reviewable
+# in diffs, which matters while the generator is pinned. Removed entirely
+# when #53 drops codegen.
 data
 
 charts
 *.tgz
+
+# Local environment overrides (GH #48). Never commit real credentials here
+# even though the tracked history only ever held MinIO's public demo
+# creds - copy .env.example instead.
+.env
+.env.local

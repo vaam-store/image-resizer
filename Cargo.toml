@@ -2,21 +2,59 @@
 name = "emgr"
 version = "0.1.2"
 edition = "2024"
+# benches/fixtures.rs is a shared module (pulled in via `#[path]` by the
+# real bench targets below, the `benchmark` bin, and tests/), not a bench
+# target itself - disable autodiscovery so Cargo doesn't also try to treat
+# it as one.
+autobenches = false
+
+[lib]
+name = "emgr"
+path = "src/lib.rs"
+bench = false          # criterion owns `cargo bench`; lib has no bench harness
+
+[[bin]]
+name = "emgr"
+path = "src/main.rs"
+bench = false
 
 [[bin]]
 name = "healthcheck"
 path = "src/bin/healthcheck.rs"
+bench = false
 
 [[bin]]
 name = "benchmark"
 path = "src/bin/benchmark.rs"
+bench = false
+
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "resize"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "cache_key"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
 
 [dependencies]
 gen-server = { path = "./packages/gen-server", features = ["conversion"] }
 mimalloc = "0.1"
 
 axum = { version = "0.8", features = ["tracing", "tokio", "macros"] }
-axum-extra = { version = "0.10", features = ["cookie", "multipart"] }
+axum-extra = { version = "0.12", features = ["cookie", "multipart", "typed-header"] }
+headers = "0.4" # `Host` type required by the generated gen-server Images trait
 axum-otel-metrics = { version = "0.11" }
 axum-tracing-opentelemetry = { version = "0.29" }
 tower-http = { version = "0.6", features = ["compression-full", "cors"] }
@@ -25,7 +63,6 @@ tokio = { version = "1", features = ["full"] }
 
 reqwest = { version = "0.12", features = ["json", "stream", "http2", "gzip"] } # Optimized HTTP client
 image = { version = "0.25", features = ["jpeg", "png", "webp"] } # Core image processing with specific formats
-rayon = "1.8" # Parallel processing and custom thread pools
 num_cpus = "1.16" # CPU detection for optimal thread pool sizing
 bytes = "1.5" # Efficient byte handling
 futures = "0.3" # Stream processing utilities
@@ -33,29 +70,43 @@ futures = "0.3" # Stream processing utilities
 aws-config = { version = "1.6", optional = true, features = ["behavior-version-latest"] } # AWS SDK configuration (for MinIO)
 aws-sdk-s3 = { version = "1.90", optional = true, features = ["behavior-version-latest"] } # AWS S3 client (MinIO compatible)
 
-envconfig = { version = "0" }
-derive_builder = { version = "0" }
+envconfig = { version = "0.11" }
+derive_builder = { version = "0.20" }
 anyhow = { version = "1" }
 thiserror = { version = "2" }
 urlencoding = "2.1"
+url = "2.5"      # source-URL parsing and scheme validation (#21)
+ipnet = "2.9"    # private/link-local range checks for SSRF filtering (#21)
 
 o2o = { version = "0.5.4", features = ["default"] }
 
 # For hashing the cache key
-sha2 = "0"
+sha2 = "0.10"   # NOT "0": 0.11 changed finalize()'s return type and breaks the cache key
 
 # For async traits
 async-trait = "0.1" # Required for async methods in traits
 
+# Deterministic RNG for the generated fixture corpus (benches/fixtures.rs),
+# also linked into the `benchmark` bin, which serves that same corpus locally.
+rand = "0.8"
+
+# Machine-readable output for the `benchmark` load-test bin (BENCHMARK_JSON_OUTPUT)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 opentelemetry = { version = "0.29", optional = true }
 opentelemetry-otlp = { version = "0.29", optional = true, features = ["tokio", "metrics", "trace", "grpc-tonic", "gzip-tonic"] }
 opentelemetry_sdk = { version = "0.29", optional = true, features = ["tokio", "metrics", "rt-tokio", "trace"] }
-opentelemetry-prometheus = { version = "0", optional = true }
-tracing-subscriber = { version = "0", optional = true, features = ["env-filter", "fmt"] }
+opentelemetry-prometheus = { version = "0.29", optional = true }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
 tracing-opentelemetry = { version = "0.30", optional = true }
-tracing = { version = "0", features = ["attributes"] }
-prometheus = { version = "0", optional = true }
+tracing = { version = "0.1", features = ["attributes"] }
+prometheus = { version = "0.14", optional = true }
+dashmap = "6"
+tower_governor = "0.8"
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.prod]
 inherits = "release"
@@ -70,11 +121,12 @@ inherits = "release"
 lto = "fat"
 opt-level = 3
 codegen-units = 1
-panic = "abort"
+# NOT panic = "abort": this service decodes attacker-supplied image bytes, and a
+# panic in a codec would take the whole process down with it - a trivial DoS.
+# Unwinding keeps a future catch boundary around the decode stage possible.
+# See issue #29.
+panic = "unwind"
 strip = true
-# Enable CPU-specific optimizations
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
 
 [features]
 default = []

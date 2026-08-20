@@ -43,7 +43,7 @@ jobs:
           keep_files: true       # Keep existing files in gh-pages branch
 
   deploy-helm:
-    needs: 
+    needs:
       - deploy-website
     permissions:
       contents: write

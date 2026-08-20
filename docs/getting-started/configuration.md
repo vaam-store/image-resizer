@@ -1,69 +1,141 @@
 # Configuration
 
-The Image Resize Service can be configured using environment variables or a `.env` file in the project root.
+`emgr` is configured entirely through environment variables, read by
+[`src/modules/env/env.rs`](https://github.com/vaam-store/image-resizer/blob/main/src/modules/env/env.rs)
+via [`envconfig`](https://docs.rs/envconfig). That file is the source of
+truth this page is generated against - a CI check
+(`.github/workflows/ci.yml`'s `docs-env-drift` job, `.github/scripts/check_env_docs.py`)
+fails the build if this table drifts from it in either direction.
 
-## Environment Variables
+!!! note "This page previously documented variables that don't exist"
+    *CACHE_ENABLED*, *CACHE_TTL_SECONDS*, *S3_BUCKET*, *S3_REGION* and
+    *LOCAL_STORAGE_PATH* were listed here before but were never read by
+    the code (GH #47). There is no response-cache TTL setting today (see
+    [GH #40](https://github.com/vaam-store/image-resizer/issues/40)); the
+    real storage variables are `MINIO_BUCKET`, `MINIO_REGION` and
+    `LOCAL_FS_STORAGE_PATH`, documented below.
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `PORT` | HTTP server port | `8080` | No |
-| `LOG_LEVEL` | Log level (debug, info, warn, error) | `info` | No |
-| `STORAGE_TYPE` | Storage backend type (s3, local, memory) | `memory` | No |
-| `CACHE_ENABLED` | Enable caching | `true` | No |
-| `CACHE_TTL_SECONDS` | Cache time-to-live in seconds | `3600` | No |
+## Server
 
-## Storage Configuration
+| Variable | Description | Default |
+|---|---|---|
+| `HOST` | Interface the HTTP server binds to. | `0.0.0.0` |
+| `PORT` | HTTP server port. | `3000` |
+| `CDN_BASE_URL` | Base URL used to build the `Location` header on a successful resize - see [Redirect status code](../user-guide/api-reference.md) (a `301`, not `302`). | `http://localhost:9000/image-cache` |
 
-### S3 Storage
+## Storage backend selection
 
-When using `STORAGE_TYPE=s3`, the following additional variables are required:
+| Variable | Description | Default |
+|---|---|---|
+| `STORAGE_TYPE` | Which backend to use. Accepted values: `LOCAL_FS` (aliases `LOCALFS`, `LOCAL`), `S3` (alias `MINIO`), `IN_MEMORY` (aliases `INMEMORY`, `MEMORY` - test/dev only; refuses to start in a release build). Only takes effect for whichever storage feature(s) the binary was compiled with. | _unset_ |
+| `STORAGE_SUB_PATH` | Prefix prepended to every generated cache key, for either backend. | `""` (empty) |
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `S3_BUCKET` | S3 bucket name | - | Yes |
-| `S3_REGION` | AWS region | - | Yes |
-| `AWS_ACCESS_KEY_ID` | AWS access key ID | - | Yes |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | - | Yes |
-| `S3_ENDPOINT` | Custom S3 endpoint (for MinIO, etc.) | - | No |
+### Local filesystem storage
 
-### Local Filesystem Storage
+Requires the binary to be built with `--features local_fs`.
 
-When using `STORAGE_TYPE=local`, the following additional variables are required:
+| Variable | Description | Default |
+|---|---|---|
+| `LOCAL_FS_STORAGE_PATH` | Local path resized images are written to. | `./data/images` |
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `LOCAL_STORAGE_PATH` | Path to local storage directory | `./storage` | No |
+### MinIO / S3 storage
 
-## Example .env File
+Requires the binary to be built with `--features s3`. MinIO and AWS S3
+share the same client (MinIO is S3-compatible), so there is a single set
+of variables for both.
+
+| Variable | Description | Default |
+|---|---|---|
+| `MINIO_ENDPOINT_URL` | S3-compatible endpoint URL. | `http://localhost:9000` |
+| `MINIO_ACCESS_KEY_ID` | Access key. | `minioadmin` |
+| `MINIO_SECRET_ACCESS_KEY` | Secret key. | `minioadmin` |
+| `MINIO_BUCKET` | Bucket resized images are written to. | `image-cache` |
+| `MINIO_REGION` | Bucket region. | `us-east-1` |
+
+## SSRF / source-fetch guard
+
+Added under [GH #21](https://github.com/vaam-store/image-resizer/issues/21)
+to stop the `url` query parameter from being used to reach internal
+services. Mirrors imgproxy's equivalent settings, named in each row below.
+
+| Variable | Description | Default |
+|---|---|---|
+| `MAX_REDIRECTS` | Maximum redirects the source fetch follows; every hop is re-validated (scheme, allowlist, resolved address). imgproxy: *IMGPROXY_MAX_REDIRECTS*. | `5` |
+| `ALLOWED_SOURCES` | Comma-separated allowlist of source URL prefixes. Unset allows any `http(s)` URL, still subject to the private-range guard below. imgproxy: *IMGPROXY_ALLOWED_SOURCES*. | _unset_ |
+| `ALLOW_LOOPBACK_SOURCE_ADDRESSES` | Opt-in to allow fetching from loopback addresses (blocked by default). | `false` |
+| `ALLOW_LINK_LOCAL_SOURCE_ADDRESSES` | Opt-in to allow fetching from link-local addresses (blocked by default). | `false` |
+
+## Resolution and output limits
+
+Added under [GH #26](https://github.com/vaam-store/image-resizer/issues/26).
+See the [API reference](../user-guide/api-reference.md) for how these
+interact with the `width`/`height` query parameters.
+
+| Variable | Description | Default |
+|---|---|---|
+| `MAX_SRC_RESOLUTION_MP` | Maximum decoded *source* resolution in megapixels, checked against header dimensions before a full decode. imgproxy default: *IMGPROXY_MAX_SRC_RESOLUTION* = 50. | `50` |
+| `MAX_OUTPUT_WIDTH` | Maximum requested output width in pixels. | `4096` |
+| `MAX_OUTPUT_HEIGHT` | Maximum requested output height in pixels. | `4096` |
+
+## Performance tuning
+
+`PERFORMANCE_PROFILE` selects a preset (see
+[`src/config/performance.rs`](https://github.com/vaam-store/image-resizer/blob/main/src/config/performance.rs));
+every other variable in this section, if set, overrides that preset's
+value for just that one field.
+
+| Variable | Description | Default |
+|---|---|---|
+| `PERFORMANCE_PROFILE` | One of `high_throughput`, `low_latency`, `memory_efficient`. Unset falls back to per-field defaults below rather than a named preset. | _unset_ |
+| `MAX_CONCURRENT_DOWNLOADS` | Maximum concurrent source-image downloads. | `20` |
+| `MAX_CONCURRENT_PROCESSING` | Maximum concurrent image-processing tasks. | Host core count |
+| `HTTP_TIMEOUT_SECS` | Timeout for the source-image HTTP client. | `30` |
+| `MAX_IMAGE_SIZE_MB` | Maximum accepted source image size. | `50` |
+| `CPU_THREAD_POOL_SIZE` | CPU-bound thread pool size for decode/resize/encode. | Host core count |
+| `ENABLE_HTTP2` | Enable HTTP/2 for the source-image HTTP client. | `false` |
+| `CONNECTION_POOL_SIZE` | Source-image HTTP client's per-host connection pool size. | `50` |
+| `KEEP_ALIVE_TIMEOUT_SECS` | Source-image HTTP client's keep-alive timeout. | `60` |
+
+## Observability
+
+Requires the binary to be built with `--features otel`. See
+[Docker deployment](../deployment/docker.md) for how `compose.yaml` wires
+these to the bundled Jaeger instance.
+
+| Variable | Description | Default |
+|---|---|---|
+| `LOG_LEVEL` | Log verbosity (`trace`, `debug`, `info`, `warn`, `error`). | `debug` |
+| `OTLP_SPAN_ENDPOINT` | OTLP gRPC endpoint for traces. | `http://localhost:4317` |
+| `OTLP_METRIC_ENDPOINT` | OTLP HTTP endpoint for metrics. | `http://localhost:4318/v1/metrics` |
+| `OTLP_SERVICE_NAME` | Service name reported in traces/metrics. | `rust-app-example` |
+
+## Example `.env` file
+
+See [`.env.example`](https://github.com/vaam-store/image-resizer/blob/main/.env.example)
+in the repository root for a copy-pasteable starting point covering every
+variable above. Copy it to `.env` (which is gitignored - never commit
+real credentials there).
 
 ```dotenv
-PORT=8080
-LOG_LEVEL=info
-STORAGE_TYPE=s3
-CACHE_ENABLED=true
-CACHE_TTL_SECONDS=3600
-
-# S3 Configuration
-S3_BUCKET=my-images
-S3_REGION=us-west-2
-AWS_ACCESS_KEY_ID=your-access-key
-AWS_SECRET_ACCESS_KEY=your-secret-key
+STORAGE_TYPE=LOCAL_FS
+LOCAL_FS_STORAGE_PATH=./data/images
+CDN_BASE_URL=http://localhost:3000/api/images/files
 ```
 
-## Docker Environment Variables
+## Docker environment variables
 
-When running with Docker, you can pass environment variables using the `-e` flag:
+When running with Docker, pass environment variables with `-e`:
 
 ```bash
-docker run -p 8080:8080 \
-  -e STORAGE_TYPE=s3 \
-  -e S3_BUCKET=my-images \
-  -e S3_REGION=us-west-2 \
-  -e AWS_ACCESS_KEY_ID=your-access-key \
-  -e AWS_SECRET_ACCESS_KEY=your-secret-key \
-  image-resizer:latest
+docker run -p 3000:3000 \
+  -e STORAGE_TYPE=LOCAL_FS \
+  -e LOCAL_FS_STORAGE_PATH=/app/data/images \
+  -e CDN_BASE_URL=http://localhost:3000/api/images/files \
+  ghcr.io/vaam-store/image-resizer:fs-latest
 ```
 
-## Helm Chart Configuration
+## Helm chart configuration
 
-When deploying with Helm, you can configure the service by modifying the `values.yaml` file. See the [Helm Chart](../deployment/helm-chart.md) documentation for details.
+When deploying with Helm, configure the service via `values.yaml`'s
+`configMaps.config.data` block. See the [Helm Chart](../deployment/helm-chart.md)
+documentation for details.

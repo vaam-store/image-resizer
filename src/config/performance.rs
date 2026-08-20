@@ -1,4 +1,8 @@
 use crate::modules::env::env::EnvConfig;
+// Cgroup-aware CPU count (#44): `num_cpus::get()` reads sched_getaffinity and
+// is blind to a CFS quota, so a 400m-limited pod would size pools for the
+// whole node and thrash on throttling.
+use crate::modules::utils::cgroup::effective_cpu_count;
 use std::time::Duration;
 
 /// Performance configuration for the image resize service
@@ -20,19 +24,47 @@ pub struct PerformanceConfig {
     pub connection_pool_size: usize,
     /// Keep-alive timeout for connections
     pub keep_alive_timeout: Duration,
+    /// Maximum number of redirects the source fetch will follow. Each hop
+    /// is fully re-validated (scheme, allowlist, resolved address) - see
+    /// `services::image::source_guard` (#21).
+    pub max_redirects: u8,
+    /// Optional allowlist of source URL prefixes (imgproxy's
+    /// `ALLOWED_SOURCES` shape). `None`/empty means "no allowlist
+    /// restriction" (still subject to the private-range guard).
+    pub allowed_sources: Option<Vec<String>>,
+    /// Opt-in override to allow fetching from loopback source addresses.
+    /// Default `false` (blocked). See `ALLOW_LOOPBACK_SOURCE_ADDRESSES`.
+    pub allow_loopback_source_addresses: bool,
+    /// Opt-in override to allow fetching from link-local source addresses.
+    /// Default `false` (blocked). See `ALLOW_LINK_LOCAL_SOURCE_ADDRESSES`.
+    pub allow_link_local_source_addresses: bool,
+    /// Maximum decoded *source* resolution in megapixels, checked against
+    /// header dimensions before full decode (#26). imgproxy default: 50.
+    pub max_src_resolution_mp: u64,
+    /// Maximum requested *output* width in pixels (#26).
+    pub max_output_width: u32,
+    /// Maximum requested *output* height in pixels (#26).
+    pub max_output_height: u32,
 }
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             max_concurrent_downloads: 20,
-            max_concurrent_processing: num_cpus::get(),
+            max_concurrent_processing: effective_cpu_count(),
             http_timeout: Duration::from_secs(30),
             max_image_size: 50 * 1024 * 1024, // 50MB
             cpu_thread_pool_size: None,       // Use CPU count
             enable_http2: true,
             connection_pool_size: 50,
             keep_alive_timeout: Duration::from_secs(60),
+            max_redirects: 5,
+            allowed_sources: None,
+            allow_loopback_source_addresses: false,
+            allow_link_local_source_addresses: false,
+            max_src_resolution_mp: 50,
+            max_output_width: 4096,
+            max_output_height: 4096,
         }
     }
 }
@@ -42,13 +74,20 @@ impl PerformanceConfig {
     pub fn high_throughput() -> Self {
         Self {
             max_concurrent_downloads: 50,
-            max_concurrent_processing: num_cpus::get() * 2,
+            max_concurrent_processing: effective_cpu_count() * 2,
             http_timeout: Duration::from_secs(15),
             max_image_size: 100 * 1024 * 1024, // 100MB
-            cpu_thread_pool_size: Some(num_cpus::get()),
+            cpu_thread_pool_size: Some(effective_cpu_count()),
             enable_http2: true,
             connection_pool_size: 100,
             keep_alive_timeout: Duration::from_secs(120),
+            max_redirects: 5,
+            allowed_sources: None,
+            allow_loopback_source_addresses: false,
+            allow_link_local_source_addresses: false,
+            max_src_resolution_mp: 50,
+            max_output_width: 4096,
+            max_output_height: 4096,
         }
     }
 
@@ -56,13 +95,20 @@ impl PerformanceConfig {
     pub fn low_latency() -> Self {
         Self {
             max_concurrent_downloads: 10,
-            max_concurrent_processing: num_cpus::get(),
+            max_concurrent_processing: effective_cpu_count(),
             http_timeout: Duration::from_secs(10),
             max_image_size: 20 * 1024 * 1024, // 20MB
-            cpu_thread_pool_size: Some(num_cpus::get()),
+            cpu_thread_pool_size: Some(effective_cpu_count()),
             enable_http2: true,
             connection_pool_size: 25,
             keep_alive_timeout: Duration::from_secs(30),
+            max_redirects: 5,
+            allowed_sources: None,
+            allow_loopback_source_addresses: false,
+            allow_link_local_source_addresses: false,
+            max_src_resolution_mp: 50,
+            max_output_width: 4096,
+            max_output_height: 4096,
         }
     }
 
@@ -70,13 +116,20 @@ impl PerformanceConfig {
     pub fn memory_efficient() -> Self {
         Self {
             max_concurrent_downloads: 5,
-            max_concurrent_processing: num_cpus::get() / 2,
+            max_concurrent_processing: effective_cpu_count() / 2,
             http_timeout: Duration::from_secs(45),
             max_image_size: 10 * 1024 * 1024, // 10MB
-            cpu_thread_pool_size: Some(num_cpus::get() / 2),
+            cpu_thread_pool_size: Some(effective_cpu_count() / 2),
             enable_http2: false, // HTTP/1.1 uses less memory
             connection_pool_size: 10,
             keep_alive_timeout: Duration::from_secs(30),
+            max_redirects: 5,
+            allowed_sources: None,
+            allow_loopback_source_addresses: false,
+            allow_link_local_source_addresses: false,
+            max_src_resolution_mp: 25, // tighter than the 50MP default, in keeping with the smaller max_image_size
+            max_output_width: 2048,
+            max_output_height: 2048,
         }
     }
 
@@ -137,11 +190,54 @@ impl PerformanceConfig {
         if let Some(keep_alive_timeout) = env_config.keep_alive_timeout_secs {
             config.keep_alive_timeout = Duration::from_secs(keep_alive_timeout);
         }
+
+        if let Some(max_redirects) = env_config.max_redirects {
+            config.max_redirects = max_redirects;
+        }
+
+        if let Some(ref allowed_sources) = env_config.allowed_sources {
+            config.allowed_sources = Self::parse_allowed_sources(allowed_sources);
+        }
+
+        if let Some(allow_loopback) = env_config.allow_loopback_source_addresses {
+            config.allow_loopback_source_addresses = allow_loopback;
+        }
+
+        if let Some(allow_link_local) = env_config.allow_link_local_source_addresses {
+            config.allow_link_local_source_addresses = allow_link_local;
+        }
+
+        if let Some(max_src_resolution_mp) = env_config.max_src_resolution_mp {
+            config.max_src_resolution_mp = max_src_resolution_mp;
+        }
+
+        if let Some(max_output_width) = env_config.max_output_width {
+            config.max_output_width = max_output_width;
+        }
+
+        if let Some(max_output_height) = env_config.max_output_height {
+            config.max_output_height = max_output_height;
+        }
+    }
+
+    /// Parses `ALLOWED_SOURCES`'s comma-separated-prefixes shape (imgproxy's
+    /// `IMGPROXY_ALLOWED_SOURCES`) into a list of prefixes. Returns `None`
+    /// for an empty/blank value, so "set but empty" behaves the same as
+    /// "unset" (no allowlist restriction) rather than blocking everything.
+    fn parse_allowed_sources(raw: &str) -> Option<Vec<String>> {
+        let list: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        if list.is_empty() { None } else { Some(list) }
     }
 
     /// Get optimal CPU thread pool size
     pub fn get_cpu_thread_pool_size(&self) -> usize {
-        self.cpu_thread_pool_size.unwrap_or_else(num_cpus::get)
+        self.cpu_thread_pool_size.unwrap_or_else(effective_cpu_count)
     }
 }
 
@@ -161,7 +257,7 @@ impl From<&EnvConfig> for PerformanceConfig {
             max_concurrent_downloads: env_config.max_concurrent_downloads.unwrap_or_else(|| 20),
             max_concurrent_processing: env_config
                 .max_concurrent_processing
-                .unwrap_or_else(num_cpus::get),
+                .unwrap_or_else(effective_cpu_count),
             http_timeout: Duration::from_secs(env_config.http_timeout_secs.unwrap_or_else(|| 30)),
             max_image_size: env_config.max_image_size_mb.unwrap_or_else(|| 50) * 1024 * 1024,
             cpu_thread_pool_size: env_config.cpu_thread_pool_size,
@@ -170,6 +266,20 @@ impl From<&EnvConfig> for PerformanceConfig {
             keep_alive_timeout: Duration::from_secs(
                 env_config.keep_alive_timeout_secs.unwrap_or(60),
             ),
+            max_redirects: env_config.max_redirects.unwrap_or(5),
+            allowed_sources: env_config
+                .allowed_sources
+                .as_deref()
+                .and_then(Self::parse_allowed_sources),
+            allow_loopback_source_addresses: env_config
+                .allow_loopback_source_addresses
+                .unwrap_or(false),
+            allow_link_local_source_addresses: env_config
+                .allow_link_local_source_addresses
+                .unwrap_or(false),
+            max_src_resolution_mp: env_config.max_src_resolution_mp.unwrap_or(50),
+            max_output_width: env_config.max_output_width.unwrap_or(4096),
+            max_output_height: env_config.max_output_height.unwrap_or(4096),
         }
     }
 }
@@ -263,18 +373,32 @@ mod tests {
             connection_pool_size: Some(50),
             keep_alive_timeout_secs: Some(60),
             performance_profile: None,
+            max_redirects: None,
+            allowed_sources: None,
+            allow_loopback_source_addresses: None,
+            allow_link_local_source_addresses: None,
+            max_src_resolution_mp: None,
+            max_output_width: None,
+            max_output_height: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
 
         assert_eq!(perf_config.max_concurrent_downloads, 20);
-        assert_eq!(perf_config.max_concurrent_processing, num_cpus::get());
+        assert_eq!(perf_config.max_concurrent_processing, effective_cpu_count());
         assert_eq!(perf_config.http_timeout, Duration::from_secs(30));
         assert_eq!(perf_config.max_image_size, 50 * 1024 * 1024);
         assert_eq!(perf_config.cpu_thread_pool_size, None);
         assert_eq!(perf_config.enable_http2, true);
         assert_eq!(perf_config.connection_pool_size, 50);
         assert_eq!(perf_config.keep_alive_timeout, Duration::from_secs(60));
+        assert_eq!(perf_config.max_redirects, 5);
+        assert_eq!(perf_config.allowed_sources, None);
+        assert_eq!(perf_config.allow_loopback_source_addresses, false);
+        assert_eq!(perf_config.allow_link_local_source_addresses, false);
+        assert_eq!(perf_config.max_src_resolution_mp, 50);
+        assert_eq!(perf_config.max_output_width, 4096);
+        assert_eq!(perf_config.max_output_height, 4096);
     }
 
     #[test]
@@ -315,6 +439,15 @@ mod tests {
             connection_pool_size: Some(25),
             keep_alive_timeout_secs: Some(120),
             performance_profile: None,
+            max_redirects: Some(3),
+            allowed_sources: Some(
+                "https://trusted.example.com/, https://cdn.example.net/".to_string(),
+            ),
+            allow_loopback_source_addresses: Some(true),
+            allow_link_local_source_addresses: Some(true),
+            max_src_resolution_mp: Some(80),
+            max_output_width: Some(2048),
+            max_output_height: Some(1024),
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
@@ -327,5 +460,24 @@ mod tests {
         assert_eq!(perf_config.enable_http2, false);
         assert_eq!(perf_config.connection_pool_size, 25);
         assert_eq!(perf_config.keep_alive_timeout, Duration::from_secs(120));
+        assert_eq!(perf_config.max_redirects, 3);
+        assert_eq!(
+            perf_config.allowed_sources,
+            Some(vec![
+                "https://trusted.example.com/".to_string(),
+                "https://cdn.example.net/".to_string(),
+            ])
+        );
+        assert_eq!(perf_config.allow_loopback_source_addresses, true);
+        assert_eq!(perf_config.allow_link_local_source_addresses, true);
+        assert_eq!(perf_config.max_src_resolution_mp, 80);
+        assert_eq!(perf_config.max_output_width, 2048);
+        assert_eq!(perf_config.max_output_height, 1024);
+    }
+
+    #[test]
+    fn test_allowed_sources_blank_value_is_none() {
+        let raw = "  , ,";
+        assert_eq!(PerformanceConfig::parse_allowed_sources(raw), None);
     }
 }

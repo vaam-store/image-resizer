@@ -1,0 +1,15 @@
+---
+# hadolint configuration. This file was previously 0 bytes, which hadolint
+# cannot parse ("Error parsing your config file"). It only started mattering
+# once LINTER_RULES_PATH pointed super-linter at the repo root (GH #46) -
+# before that it was never read at all.
+failure-threshold: warning
+
+ignored:
+  # DL3008: pin apt versions. The builder stage installs no apt packages and
+  # the runtime stage is distroless, so there is nothing to pin.
+  - DL3008
+
+trustedRegistries:
+  - docker.io
+  - gcr.io
