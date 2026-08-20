@@ -68,7 +68,12 @@ services:
       # container's network namespace (see the header comment above) --
       # not because nginx itself listens on 3000.
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost/healthz"]
+      # 127.0.0.1, NOT localhost: /etc/hosts maps localhost to both 127.0.0.1
+      # and ::1, wget tries the IPv6 address first, and nginx binds IPv4 only
+      # (`listen 80;` in origin/nginx.conf). Via `localhost` the healthcheck
+      # gets ECONNREFUSED forever and every dependent container refuses to
+      # start with "dependency failed to start ... is unhealthy".
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -151,6 +156,18 @@ services:
       # imgproxy has no equivalent separate download-concurrency knob; see
       # README's fairness notes.
       MAX_CONCURRENT_DOWNLOADS: "8"
+      # CRITICAL FAIRNESS CONTROL. emgr ships a per-IP rate limiter (#43);
+      # imgproxy has no equivalent. Left at the production default
+      # (burst 20 / 100ms) the limiter starts returning 429 after the first
+      # 20 requests, and the benchmark measures *the rate limiter refusing
+      # traffic* rather than image processing — an early run produced 11
+      # successes against 206,217 non-2xx at a nonsense 13.6k rps.
+      # Raised far above anything the driver can generate so the comparison
+      # is engine-vs-engine. Do NOT remove without re-reading that history.
+      RATE_LIMIT_BURST: "1000000"
+      RATE_LIMIT_PERIOD_MS: "1"
+      # Same reasoning: emgr sheds with 503 above this, imgproxy does not.
+      MAX_CONCURRENT_REQUESTS: "4096"
       CPU_THREAD_POOL_SIZE: "2"
       TOKIO_WORKER_THREADS: "2"
       HTTP_TIMEOUT_SECS: "30"

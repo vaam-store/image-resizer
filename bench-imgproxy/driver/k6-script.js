@@ -120,7 +120,14 @@ const urlBuilders = {
   // in emgr's current API), so both engines are asked to do the same
   // "fit within WxH, preserve aspect ratio" operation.
   imgproxy(sourceUrl, w, h, format) {
-    const options = `w:${w}/h:${h}/rt:fit/f:${format}`;
+    // rt:fill, NOT rt:fit — because emgr IGNORES the resize type and always
+    // crops to exact WxH when both dimensions are given (GH #59). Asking
+    // imgproxy for `fit` made it return 800x450 for a 16:9 source while emgr
+    // returned 800x600: 33% more pixels of work on emgr's side, and a
+    // differently-composed image. That is not the same operation, so the
+    // comparison was invalid. `fill` matches what emgr actually does.
+    // Revert to rt:fit once #59 makes emgr honour the type.
+    const options = `w:${w}/h:${h}/rt:fill/f:${format}`;
     return `${ENGINE_BASE_URL}/insecure/${options}/plain/${imgproxyPlainEncode(sourceUrl)}`;
   },
 };
