@@ -1,100 +1,166 @@
+//! `GET /{signature}/{processing_options}/{plain|base64 source}.{extension}`
+//! (#53, #27) - imgproxy-compatible signed URL entry point. Replaces the
+//! old `GET /api/images/resize?...` query-parameter route entirely (hard
+//! cutover, no compatibility alias): same underlying `ResizeService::resize`
+//! call and same "301 redirect to the CDN-hosted result, never to the
+//! caller-supplied source" behaviour (#25), just parsed from the signed
+//! path instead of query parameters.
+
 use crate::models::params::ResizeQuery;
 use crate::modules::api::handler::ApiService;
+use crate::modules::signing::SigningConfig;
+use crate::modules::signing::verify::verify_signature;
+use crate::modules::url::{self, SignedRequest, UrlParseError};
 use crate::modules::utils::err::AppError;
-use async_trait::async_trait;
-use axum::http::Method;
-use axum_extra::extract::CookieJar;
-use gen_server::apis::images::{DownloadResponse, Images, ResizeResponse};
-use gen_server::models::{DownloadPathParams, ResizeQueryParams};
-use gen_server::types::ByteArray;
-use headers::Host;
+use axum::extract::State;
+use axum::http::header::{CACHE_CONTROL, LOCATION};
+use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use std::sync::Arc;
 use tracing::error;
 
-#[async_trait]
-impl Images<AppError> for ApiService {
-    async fn download(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-        path_params: &DownloadPathParams,
-    ) -> Result<DownloadResponse, AppError> {
-        let byte_array = self.resize_service.download(path_params).await;
+pub async fn resize_handler(State(api_service): State<Arc<ApiService>>, uri: Uri) -> Response {
+    match handle(&api_service, uri.path()).await {
+        Ok(location) => redirect_response(&location),
+        Err(err) => err.into_response(),
+    }
+}
 
-        match byte_array {
-            Ok(data) => Ok(DownloadResponse::Status200_OperationPerformedSuccessfully {
-                body: ByteArray(data),
-                cache_control: Some("public, max-age=31536000, immutable".to_string()),
-            }),
-            Err(e) => {
-                error!("Failed to download image: {}", e);
-                Err(AppError::classify_download_error(e))
-            }
-        }
+async fn handle(api_service: &ApiService, raw_path: &str) -> Result<String, AppError> {
+    let signed = url::split(raw_path).map_err(url_parse_error)?;
+
+    verify_or_reject(&api_service.signing, &signed)?;
+
+    let parsed = signed.parse().map_err(url_parse_error)?;
+    let query = parsed.into_resize_query();
+
+    perform_resize(api_service, &query).await
+}
+
+/// The actual resize call, split out from [`handle`] so tests can exercise
+/// it directly against a hand-built [`ResizeQuery`] without needing a real
+/// signed path - mirrors how the old `Images::resize` trait method used to
+/// be called directly in tests before #53.
+async fn perform_resize(api_service: &ApiService, query: &ResizeQuery) -> Result<String, AppError> {
+    api_service.resize_service.resize(query).await.map_err(|e| {
+        error!("Failed to resize image: {}", e);
+        // No fallback redirect to the caller-supplied URL here: that was an
+        // open redirect from a trusted domain (#25) and, since 301s are
+        // cached permanently by browsers regardless of Cache-Control, a
+        // transient origin failure would permanently steer that client away
+        // from the resizer.
+        AppError::classify_resize_error(e)
+    })
+}
+
+/// Checks the signature segment against `signing`, refusing the request
+/// with `403` if it's missing, wrong, or the `unsigned` escape isn't
+/// enabled. Runs *before* [`SignedRequest::parse`] so an unauthenticated
+/// caller can't use parse-error content as an oracle for the grammar, and
+/// so malformed-but-unsigned spam doesn't pay for full parsing.
+fn verify_or_reject(signing: &SigningConfig, signed: &SignedRequest) -> Result<(), AppError> {
+    if signed.signature_segment == "unsigned" {
+        return if signing.allow_unsigned {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden(
+                "unsigned requests are refused; signing is required (#27). Set \
+                 ALLOW_UNSIGNED_REQUESTS=true to enable the /unsigned/ escape for local \
+                 development."
+                    .to_string(),
+            ))
+        };
     }
 
-    async fn resize(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-        query_params: &ResizeQueryParams,
-    ) -> Result<ResizeResponse, AppError> {
-        let query = ResizeQuery::from(query_params.clone());
-        let url = self.resize_service.resize(&query).await;
+    if !signing.enabled() {
+        return Err(AppError::Forbidden(
+            "no signing key is configured; use /unsigned/... in local development".to_string(),
+        ));
+    }
 
-        match url {
-            Ok(url) => Ok(
-                ResizeResponse::Status301_TheImageWasResizeAndInTheLocationYou {
-                    location: Some(url),
-                },
-            ),
-            Err(e) => {
-                error!("Failed to resize image: {}", e);
-                // No fallback redirect to the caller-supplied URL here: that
-                // was an open redirect from a trusted domain (#25) and, since
-                // 301s are cached permanently by browsers regardless of
-                // Cache-Control, a transient origin failure would permanently
-                // steer that client away from the resizer.
-                Err(AppError::classify_resize_error(e))
-            }
+    if verify_signature(
+        &signing.key,
+        &signing.salt,
+        &signed.signed_path,
+        signed.signature_segment,
+    ) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("invalid signature".to_string()))
+    }
+}
+
+fn url_parse_error(err: UrlParseError) -> AppError {
+    AppError::BadRequest(err.to_string())
+}
+
+/// Builds the `301` redirect to the CDN-hosted result. Hand-built with an
+/// explicit `StatusCode::MOVED_PERMANENTLY` rather than
+/// `axum::response::Redirect::permanent` (#53) - that helper actually
+/// issues a `308 Permanent Redirect`, not `301`, and the old generated
+/// `ResizeResponse::Status301_...` response (and the test suite pinning
+/// this behaviour) is specifically `301`.
+fn redirect_response(location: &str) -> Response {
+    let mut response = (StatusCode::MOVED_PERMANENTLY, ()).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    match HeaderValue::from_str(location) {
+        Ok(value) => {
+            headers.insert(LOCATION, value);
+        }
+        Err(_) => {
+            // A CDN base URL that can't be a header value would be a
+            // deployment misconfiguration (`StorageConfig::cdn_base_url`),
+            // not a per-request failure - surface it as a clear 500 rather
+            // than silently omitting the Location header.
+            return AppError::AnyError(anyhow::anyhow!(
+                "generated CDN location {location:?} is not a valid HTTP header value"
+            ))
+            .into_response();
         }
     }
+    response
 }
 
 // This test module builds its fixture `ApiService` on top of local_fs
 // storage (`StorageConfig::with_local_fs_config`, `#[cfg(feature =
-// "local_fs")]` in `src/services/storage/handler.rs`) rather than parameterizing
-// over every enabled storage backend, so it only compiles when that feature is
-// on - matching how `cargo check --features s3` (without `local_fs`) is run
-// for this crate.
+// "local_fs")]` in `src/services/storage/handler.rs`) rather than
+// parameterizing over every enabled storage backend, so it only compiles
+// when that feature is on - matching how `cargo check --features s3`
+// (without `local_fs`) is run for this crate.
 #[cfg(all(test, feature = "local_fs"))]
 mod tests {
     use super::*;
+    use crate::models::params::ImageFormat;
     use crate::modules::api::handler::ApiServiceBuilder;
     use crate::services::cache::handler::CacheServiceBuilder;
     use crate::services::resize::handler::ResizeService;
     use crate::services::storage::handler::{StorageConfig, StorageService};
-    use axum::http::uri::Authority;
-    use gen_server::apis::images::{DownloadResponse, Images, ResizeResponse};
-    use gen_server::models::{DownloadPathParams, ResizeQueryParams};
-    use sha2::{Digest, Sha256};
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn test_host() -> Host {
-        Host::from(Authority::from_static("localhost"))
+    fn signing_enabled() -> SigningConfig {
+        SigningConfig {
+            key: b"test-signing-key".to_vec(),
+            salt: b"test-salt".to_vec(),
+            allow_unsigned: false,
+        }
     }
 
-    /// Build a syntactically valid cache key (`<64 lowercase hex>.<ext>`) -
-    /// the exact shape `CacheService::generate_key` produces, and the only
-    /// shape `StorageService::{check_cache,get_image}` will accept since
-    /// #23's key validation landed. `seed` just varies the digest so
-    /// different tests get different (but equally valid) keys.
-    fn valid_key(seed: &str, ext: &str) -> String {
-        let digest = Sha256::digest(seed.as_bytes());
-        format!("{:x}.{}", digest, ext)
+    fn signing_allow_unsigned() -> SigningConfig {
+        SigningConfig {
+            key: Vec::new(),
+            salt: Vec::new(),
+            allow_unsigned: true,
+        }
     }
 
     /// Owns a per-test local_fs storage directory under the OS temp dir and
@@ -114,14 +180,7 @@ mod tests {
         }
     }
 
-    /// Build an `ApiService` backed by an isolated, per-test local_fs storage
-    /// directory. Also returns a standalone `StorageService` handle (cheap:
-    /// it's an `Arc` clone) wired to the *same* directory, so tests can seed
-    /// files through the real, validated `upload_image` path - the storage
-    /// layer now shards on-disk paths and validates key shape (#23, #38),
-    /// so poking a raw file into the directory directly would no longer be
-    /// found by `download`.
-    fn build_test_api_service() -> (ApiService, StorageService, TestStorageDir) {
+    fn build_test_api_service(signing: SigningConfig) -> (ApiService, StorageService, TestStorageDir) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = TestStorageDir(std::env::temp_dir().join(format!(
@@ -157,6 +216,7 @@ mod tests {
 
         let api_service = ApiServiceBuilder::default()
             .resize_service(resize_service)
+            .signing(signing)
             .build()
             .expect("build api service");
 
@@ -200,127 +260,159 @@ mod tests {
         format!("http://{}/image.png", addr)
     }
 
-    #[tokio::test]
-    async fn download_missing_key_returns_not_found_not_200() {
-        let (api_service, _storage, _dir) = build_test_api_service();
-        // Validly-shaped key that was simply never uploaded.
-        let path_params = DownloadPathParams {
-            key: valid_key("never-uploaded", "png"),
-        };
-
-        let result = <ApiService as Images<AppError>>::download(
-            &api_service,
-            &Method::GET,
-            &test_host(),
-            &CookieJar::new(),
-            &path_params,
-        )
-        .await;
-
-        match result {
-            Err(AppError::NotFound(_)) => {}
-            other => panic!("expected AppError::NotFound, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
-    async fn download_success_still_returns_200_with_body() {
-        let (api_service, storage, _dir) = build_test_api_service();
-        let bytes = tiny_png_bytes();
-        let key = valid_key("present", "png");
-        storage
-            .upload_image(&key, "image/png", bytes.clone())
-            .await
-            .expect("seed storage via the real upload path");
-
-        let path_params = DownloadPathParams { key };
-
-        let result = <ApiService as Images<AppError>>::download(
-            &api_service,
-            &Method::GET,
-            &test_host(),
-            &CookieJar::new(),
-            &path_params,
-        )
-        .await;
-
-        match result {
-            Ok(DownloadResponse::Status200_OperationPerformedSuccessfully { body, .. }) => {
-                assert_eq!(body.0, bytes);
-            }
-            other => panic!("expected 200 with body, got {:?}", other),
+    fn query(url: String) -> ResizeQuery {
+        ResizeQuery {
+            url,
+            width: Some(4),
+            height: Some(4),
+            format: ImageFormat::Png,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
         }
     }
 
     #[tokio::test]
     async fn resize_failure_does_not_redirect_to_input_url() {
-        let (api_service, _storage, _dir) = build_test_api_service();
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
         // Not a resolvable URL: reqwest fails at request-build time, so this
         // is fast and deterministic without touching the network.
-        let bogus_url = "this is not a url".to_string();
+        let params = query("this is not a url".to_string());
 
-        let query_params = ResizeQueryParams {
-            url: bogus_url.clone(),
-            width: Some(10),
-            height: Some(10),
-            format: Some(gen_server::models::ImageFormat::Png),
-            blur_sigma: None,
-            grayscale: None,
-        };
+        let result = perform_resize(&api_service, &params).await;
 
-        let result = <ApiService as Images<AppError>>::resize(
-            &api_service,
-            &Method::GET,
-            &test_host(),
-            &CookieJar::new(),
-            &query_params,
-        )
-        .await;
-
-        match result {
-            Err(_) => {}
-            Ok(ResizeResponse::Status301_TheImageWasResizeAndInTheLocationYou { location }) => {
-                panic!(
-                    "resize failure must not redirect to caller-supplied URL, got redirect to {:?} (input was {:?})",
-                    location, bogus_url
-                );
-            }
-        }
+        assert!(result.is_err(), "expected a resize failure");
     }
 
     #[tokio::test]
     async fn resize_success_returns_redirect_to_cdn_not_source() {
-        let (api_service, _storage, _dir) = build_test_api_service();
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
         let source_url = spawn_test_image_server(tiny_png_bytes()).await;
+        let params = query(source_url.clone());
 
-        let query_params = ResizeQueryParams {
-            url: source_url.clone(),
-            width: Some(4),
-            height: Some(4),
-            format: Some(gen_server::models::ImageFormat::Png),
-            blur_sigma: None,
-            grayscale: None,
-        };
+        let location = perform_resize(&api_service, &params)
+            .await
+            .expect("resize should succeed");
 
-        let result = <ApiService as Images<AppError>>::resize(
-            &api_service,
-            &Method::GET,
-            &test_host(),
-            &CookieJar::new(),
-            &query_params,
+        assert_ne!(
+            location, source_url,
+            "success redirect must point at the CDN-hosted copy, not echo the source URL"
+        );
+        assert!(location.starts_with("http://cdn.test/"));
+    }
+
+    /// #27: a well-formed, correctly-signed URL is accepted end-to-end
+    /// through the real HTTP handler (path parse -> verify -> resize ->
+    /// redirect), not just at the unit level.
+    #[tokio::test]
+    async fn valid_signature_is_accepted_end_to_end() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
+        let source_url = spawn_test_image_server(tiny_png_bytes()).await;
+        let encoded = URL_SAFE_NO_PAD.encode(source_url.as_bytes());
+        let signed_path = format!("/rs:fill:4:4/{encoded}.png");
+        let signature = crate::modules::signing::verify::sign(
+            &api_service.signing.key,
+            &api_service.signing.salt,
+            &signed_path,
+        );
+        let raw_path = format!("/{signature}{signed_path}");
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
 
-        match result {
-            Ok(ResizeResponse::Status301_TheImageWasResizeAndInTheLocationYou { location }) => {
-                let location = location.expect("location header present on success");
-                assert_ne!(
-                    location, source_url,
-                    "success redirect must point at the CDN-hosted copy, not echo the source URL"
-                );
-                assert!(location.starts_with("http://cdn.test/"));
-            }
-            other => panic!("expected successful redirect, got {:?}", other),
-        }
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        let location = response
+            .headers()
+            .get("location")
+            .expect("redirect has a location header");
+        assert!(location.to_str().unwrap().starts_with("http://cdn.test/"));
+    }
+
+    /// #27: a tampered signature (correct shape, wrong bytes) must be
+    /// rejected with `403`, never processed.
+    #[tokio::test]
+    async fn tampered_signature_is_rejected_end_to_end() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
+        let encoded = URL_SAFE_NO_PAD.encode(b"http://example.com/img.png");
+        let raw_path = format!("/not-a-real-signature/{encoded}.png");
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #27: "Unsigned requests are refused by default" - the literal
+    /// `unsigned` escape must not work unless explicitly enabled.
+    #[tokio::test]
+    async fn unsigned_escape_is_refused_when_not_enabled() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
+        let encoded = URL_SAFE_NO_PAD.encode(b"http://example.com/img.png");
+        let raw_path = format!("/unsigned/{encoded}.png");
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #27: with `ALLOW_UNSIGNED_REQUESTS=true`, `/unsigned/...` bypasses
+    /// verification and the request is processed normally.
+    #[tokio::test]
+    async fn unsigned_escape_is_accepted_when_enabled() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_allow_unsigned());
+        let source_url = spawn_test_image_server(tiny_png_bytes()).await;
+        let encoded = URL_SAFE_NO_PAD.encode(source_url.as_bytes());
+        let raw_path = format!("/unsigned/rs:fill:4:4/{encoded}.png");
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+    }
+
+    /// A malformed signed-URL path (missing extension) must surface as
+    /// `400`, distinct from a `403` signature failure.
+    #[tokio::test]
+    async fn malformed_grammar_is_bad_request_not_forbidden() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_allow_unsigned());
+        let raw_path = "/unsigned/not-a-valid-source-without-extension".to_string();
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn error_response_bodies_are_readable() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
+        let encoded = URL_SAFE_NO_PAD.encode(b"http://example.com/img.png");
+        let raw_path = format!("/bad-signature/{encoded}.png");
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty());
     }
 }

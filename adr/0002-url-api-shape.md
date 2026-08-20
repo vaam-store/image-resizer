@@ -1,6 +1,10 @@
 # ADR 0002: URL API shape — path-based signed URLs vs. OpenAPI codegen
 
-- Status: **Proposed** — recommendation pending owner approval (@stephane-segning)
+- Status: **Accepted and implemented** — approved by the owner (@stephane-segning);
+  Option B landed across #53 (codegen removal, hand-written router) and #27
+  (HMAC-signed imgproxy-compatible URLs), done together since the signature
+  is part of the URL path shape. `packages/gen-server` and `openapi.yaml`
+  are deleted; the migration sequence below is complete through step 6.
 - Issue: [#53](https://github.com/vaam-store/image-resizer/issues/53) — "DECISION: path-based
   signed URL API vs OpenAPI codegen" (parent: #17, P1-parity)
 - Date: 2026-08-19

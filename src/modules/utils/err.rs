@@ -21,9 +21,17 @@ pub enum AppError {
     NotFound(String),
 
     /// The caller supplied invalid input (malformed URL, corrupt/unsupported
-    /// image, a source image exceeding the configured size limit, ...).
+    /// image, a source image exceeding the configured size limit, a
+    /// malformed signed-URL path, ...).
     #[error("bad request: {0}")]
     BadRequest(String),
+
+    /// Signature verification failed, or an unsigned request was refused
+    /// while signing is required (#27). `403`, not `401`: there's no
+    /// credential-negotiation challenge (`WWW-Authenticate`) to offer here,
+    /// matching imgproxy's own choice of `403` for exactly this case.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 
     /// A downstream/upstream dependency (origin server for `resize`, object
     /// storage for `download`) failed.
@@ -48,6 +56,7 @@ impl AppError {
         match self {
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             AppError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             AppError::IoError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -257,6 +266,7 @@ mod tests {
         let cases: Vec<(AppError, StatusCode)> = vec![
             (AppError::NotFound("x".into()), StatusCode::NOT_FOUND),
             (AppError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
+            (AppError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (AppError::BadGateway("x".into()), StatusCode::BAD_GATEWAY),
             (
                 AppError::ServiceUnavailable("x".into()),

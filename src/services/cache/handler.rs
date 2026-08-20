@@ -114,7 +114,10 @@ impl CacheService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gen_server::models::ImageFormat;
+    // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is now
+    // hand-written in `src/models/params.rs`. Mechanical import change
+    // only - no logic here changed.
+    use crate::models::params::ImageFormat;
     use std::collections::HashSet;
 
     fn cache_service() -> CacheService {
@@ -153,6 +156,7 @@ mod tests {
             blur_sigma,
             grayscale,
             enlarge,
+            quality: None,
         }
     }
 

@@ -129,4 +129,24 @@ pub struct EnvConfig {
     /// whatever the generated OpenAPI layer does or does not validate.
     #[envconfig(from = "MAX_OUTPUT_HEIGHT")]
     pub max_output_height: Option<u32>,
+
+    // Signed URLs (#27)
+    /// Hex-encoded HMAC-SHA256 key used to verify signed URLs. Required
+    /// unless `ALLOW_UNSIGNED_REQUESTS=true` - signing is the default, not
+    /// opt-in (`src/modules/signing`). imgproxy equivalent: `IMGPROXY_KEY`.
+    #[envconfig(from = "SIGNING_KEY")]
+    pub signing_key: Option<String>,
+
+    /// Hex-encoded salt mixed into every signed URL's HMAC input. Required
+    /// unless `ALLOW_UNSIGNED_REQUESTS=true`. imgproxy equivalent:
+    /// `IMGPROXY_SALT`.
+    #[envconfig(from = "SIGNING_SALT")]
+    pub signing_salt: Option<String>,
+
+    /// Opt-in escape hatch for local development: when `true`, a request
+    /// whose signature segment is the literal `unsigned` bypasses signature
+    /// verification entirely. Default `false` - signing itself is always
+    /// the default, this only ever widens the `unsigned` escape path.
+    #[envconfig(from = "ALLOW_UNSIGNED_REQUESTS")]
+    pub allow_unsigned_requests: Option<bool>,
 }

@@ -380,6 +380,9 @@ mod tests {
             max_src_resolution_mp: None,
             max_output_width: None,
             max_output_height: None,
+            signing_key: None,
+            signing_salt: None,
+            allow_unsigned_requests: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
@@ -448,6 +451,9 @@ mod tests {
             max_src_resolution_mp: Some(80),
             max_output_width: Some(2048),
             max_output_height: Some(1024),
+            signing_key: None,
+            signing_salt: None,
+            allow_unsigned_requests: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);

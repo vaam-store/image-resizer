@@ -52,6 +52,21 @@ of variables for both.
 | `MINIO_BUCKET` | Bucket resized images are written to. | `image-cache` |
 | `MINIO_REGION` | Bucket region. | `us-east-1` |
 
+## Signed URLs
+
+Added under [GH #27](https://github.com/vaam-store/image-resizer/issues/27),
+alongside the imgproxy-compatible signed-path URL scheme itself (see the
+[API reference](../user-guide/api-reference.md)). Signing is the default,
+not opt-in: with neither a key/salt configured nor
+`ALLOW_UNSIGNED_REQUESTS=true` set, the process refuses to start rather than
+silently serving `403` to every request.
+
+| Variable | Description | Default |
+|---|---|---|
+| `SIGNING_KEY` | Hex-encoded HMAC-SHA256 key used to verify signed URLs. Required unless `ALLOW_UNSIGNED_REQUESTS=true`. imgproxy equivalent: *IMGPROXY_KEY*. | _unset_ |
+| `SIGNING_SALT` | Hex-encoded salt mixed into every signed URL's HMAC input. Required unless `ALLOW_UNSIGNED_REQUESTS=true`. imgproxy equivalent: *IMGPROXY_SALT*. | _unset_ |
+| `ALLOW_UNSIGNED_REQUESTS` | Opt-in escape hatch for local development: when `true`, a request whose signature segment is the literal `unsigned` bypasses verification entirely. Does not weaken verification of a real signature - it only widens the `unsigned` escape path. | `false` |
+
 ## SSRF / source-fetch guard
 
 Added under [GH #21](https://github.com/vaam-store/image-resizer/issues/21)

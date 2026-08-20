@@ -7,7 +7,11 @@ use anyhow::Result;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as MapEntry;
 use derive_builder::Builder;
-use gen_server::models::DownloadPathParams;
+// #53: `gen_server` (OpenAPI codegen) was deleted; `DownloadPathParams` is
+// now hand-written in `src/models/params.rs` (owned by the URL-grammar/
+// signed-URL rewrite), same single `key: String` field. Mechanical import
+// change only - no logic here changed.
+use crate::models::params::DownloadPathParams;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -342,7 +346,8 @@ mod tests {
     use crate::services::cache::handler::CacheServiceBuilder;
     use crate::services::storage::core::StorageBackend;
     use crate::services::storage::handler::StorageServiceBuilder;
-    use gen_server::models::ImageFormat;
+    // #53: mechanical import change, same reasoning as the top-of-file one.
+    use crate::models::params::ImageFormat;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -490,6 +495,7 @@ mod tests {
             blur_sigma: None,
             grayscale: None,
             enlarge: false,
+            quality: None,
         });
 
         let mut handles = Vec::with_capacity(100);
@@ -564,6 +570,7 @@ mod tests {
             blur_sigma: None,
             grayscale: None,
             enlarge: false,
+            quality: None,
         });
 
         let mut handles = Vec::with_capacity(20);

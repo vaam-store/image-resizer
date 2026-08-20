@@ -68,15 +68,11 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "warn"
-# `gen-server` is the OpenAPI-generated crate, pulled in as a local `path`
-# dependency with no version field (Cargo.toml:52). cargo-deny flags that as
-# a "wildcard" dependency, and since `emgr`'s Cargo.toml has no `publish =
-# false`, `allow-wildcard-paths` refuses to suppress it ("does not apply to
-# public crates as crates.io disallows path dependencies" - crates.io would
-# reject this on a real publish). `emgr` is a deployed service, never meant
-# to be published; the real fix is `publish = false` in Cargo.toml (not
-# owned by this change - see PR description). Left as "warn" rather than
-# "deny" until that lands, so this one expected finding doesn't block CI.
+# The `gen-server` path dependency that originally forced this is gone (#53
+# deleted the OpenAPI codegen), and `publish = false` now sits in Cargo.toml,
+# so `allow-wildcard-paths` applies properly. Kept at "warn" rather than
+# tightened to "deny" in the same change that removed the cause - flip it to
+# "deny" once a CI run confirms nothing else trips it.
 wildcards = "warn"
 allow-wildcard-paths = true
 deny = []

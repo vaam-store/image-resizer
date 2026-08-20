@@ -1,9 +1,20 @@
+# MUST stay on bookworm (Debian 12) to match the distroless/cc-debian12
+# runtime below. The previous pin was a Debian 13/trixie image with glibc
+# 2.41 while the runtime has 2.36, so the s3 build - whose native C
+# dependency (aws-lc-sys) references GLIBC_2.38 symbols - produced an image
+# that built cleanly and then died instantly at startup with
+#   version 'GLIBC_2.38' not found
+# CI never caught it: the pipeline builds images and never runs one.
+# local_fs survived only by luck - it happens not to reference those
+# symbols. If you bump this, bump the runtime base in lockstep and actually
+# RUN the resulting image.
+#
 # Pinned by digest (GH #48) - "rust:1" is a floating tag that gets
 # repointed on every new 1.x release, which lets replicas built on
 # different days/nodes end up compiled with a different rustc. This is
 # rustc 1.97.1 as of the pin below; bump deliberately with
 # `docker pull rust:1 && docker inspect rust:1 --format='{{index .RepoDigests 0}}'`.
-FROM rust@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f as builder
+FROM rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 as builder
 
 ENV APP_NAME=emgr
 
@@ -16,7 +27,6 @@ FROM builder as local_fs_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -31,7 +41,6 @@ FROM builder as local_fs_otel_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -46,7 +55,6 @@ FROM builder as s3_fs_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -61,7 +69,6 @@ FROM builder as s3_fs_otel_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -76,7 +83,6 @@ FROM builder AS healthcheck_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \

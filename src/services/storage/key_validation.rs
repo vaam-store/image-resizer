@@ -20,7 +20,7 @@ use std::fmt;
 const HASH_LEN: usize = 64;
 
 /// Extensions `CacheService::generate_key` can produce (mirrors `ImageFormat`'s
-/// `Display` impl in `packages/gen-server/src/models.rs`).
+/// `Display` impl in `src/models/params.rs`).
 const ALLOWED_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 
 /// A cache key that failed validation.

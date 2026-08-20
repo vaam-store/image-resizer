@@ -16,10 +16,13 @@ THIS_FILE := $(lastword $(MAKEFILE_LIST))
 ##   Author: @stephane-segning
 ## ==========================================================
 
-.PHONY: help init build up up-app start pull down destroy stop restart logs logs-app ps stats git-pull
+.PHONY: help build up up-app start pull down destroy stop restart logs logs-app ps stats git-pull
 
-init: 				## Initialize the project
-	rm -rf packages/gen-server && docker compose -p emgr run --rm openapi-generator-cli $(c)
+# `init` (OpenAPI-codegen bootstrap, `rm -rf packages/gen-server && docker
+# compose run --rm openapi-generator-cli`) is gone (#53): the HTTP router is
+# hand-written now, so a fresh clone builds with plain `cargo build` and no
+# Docker step at all. Every target below that used to depend on `init`
+# no longer needs to.
 
 help:				## Show this help
 	@sed -ne '/@sed/!s/## //p' $(MAKEFILE_LIST)
@@ -27,14 +30,14 @@ help:				## Show this help
 pull:				## Pull the image
 	docker compose -p emgr -f compose.yaml pull $(c)
 
-build: init			## Build the project
+build:				## Build the project
 	docker compose -p emgr -f compose.yaml build $(c)
-up: init 			## Start the project
+up: 				## Start the project
 	docker compose -p emgr -f compose.yaml up -d --remove-orphans --build $(c)
-up-app: init			## Start app
+up-app:				## Start app
 	docker compose -p emgr -f compose.yaml up -d --remove-orphans --build app $(c)
 
-start: init			## Start the project
+start:				## Start the project
 	docker compose -p emgr -f compose.yaml start $(c)
 down: 				## Stop the project
 	docker compose -p emgr -f compose.yaml down $(c)
@@ -42,7 +45,7 @@ destroy: 			## Destroy the project
 	docker compose -p emgr -f compose.yaml down -v $(c)
 stop: 				## Stop the project
 	docker compose -p emgr -f compose.yaml stop $(c)
-restart: init			## Restart the project
+restart:			## Restart the project
 	docker compose -p emgr -f compose.yaml stop $(c)
 	docker compose -p emgr -f compose.yaml up -d $(c)
 

@@ -178,33 +178,6 @@ services:
       minio:
         condition: service_started
 
-  openapi-generator-cli:
-    # Pinned (GH #45) - the "latest" tag tracks openapi-generator's
-    # unreleased master-branch snapshot builds (the previously-generated
-    # packages/gen-server on disk carries a "7.25.0-SNAPSHOT" marker in
-    # its .openapi-generator/VERSION), not the newest stable release. That
-    # snapshot is a moving target: nothing pins which commit "latest"
-    # resolves to on any given day, so `make init` can silently regenerate
-    # gen-server with different (possibly source-incompatible) codegen
-    # output between two otherwise-identical CI runs. v7.24.0 is the
-    # newest actual stable release and was verified here to regenerate
-    # gen-server with the same `headers::Host` extractor shape the current
-    # source expects. Bump deliberately, not by moving back to `latest`.
-    image: openapitools/openapi-generator-cli:v7.24.0@sha256:5bf3dc75f764c584da8e3344c51b2f3f1e74703461d46a035b5ac1d31515cc88
-    volumes:
-      - ./openapi.yaml:/packages/openapi.yaml
-      - ./packages/gen-server:/packages/gen-server
-    command:
-      - generate
-      - -i
-      - /packages/openapi.yaml
-      - -g
-      - rust-axum
-      - -o
-      - /packages/gen-server
-      - --package-name
-      - gen-server
-
 volumes:
   files:
   minio:

@@ -1,0 +1,412 @@
+# Three-way benchmark harness: imgproxy vs. emgr-on-local_fs vs. emgr-on-S3.
+#
+# Fairness controls applied here (see README.md for the full rationale and
+# caveats -- read it before trusting any number this produces):
+#
+#   - `emgr` (local_fs), `emgr_s3` and `imgproxy` get IDENTICAL cpu/memory
+#     limits (`&engine_limits` anchor below) and identical explicit
+#     concurrency knobs (MAX_CONCURRENT_PROCESSING == IMGPROXY_WORKERS,
+#     TOKIO_WORKER_THREADS == GOMAXPROCS) across all three services. This is
+#     the single most important fairness control in this file -- an unequal
+#     limit invalidates the whole comparison.
+#   - All three fetch source images from the same local `origin` nginx
+#     service, never the public internet.
+#   - Signature checking is disabled on all three: imgproxy via unset
+#     IMGPROXY_KEY/IMGPROXY_SALT (its documented "insecure mode"); both emgr
+#     services via ALLOW_UNSIGNED_REQUESTS=true + the `unsigned` signature
+#     segment (emgr now has HMAC-signed URLs, #27, and fails closed at
+#     startup without this opt-out).
+#   - `emgr`/`emgr_s3` run the `fs_deploy`/`s3_deploy` build targets (no
+#     OTel instrumentation) so neither proxy pays a tracing tax the other
+#     doesn't.
+#
+# THE POINT OF THE THREE-WAY SPLIT: `emgr` (local_fs) 301-redirects the
+# client back to itself (CDN_BASE_URL = http://origin:3000/...) -- so emgr
+# pays the cost of *serving* the derivative bytes on top of *producing*
+# them. `emgr_s3` 301-redirects the client to MinIO instead
+# (CDN_BASE_URL = http://minio:9000/...) -- emgr never touches the response
+# bytes once it has stored them. That architectural asymmetry is invisible
+# in a two-way emgr-vs-imgproxy comparison and may well favour S3. See
+# README.md's "Three engines, one asymmetry" section.
+#
+# Non-obvious wiring: both `emgr` and `emgr_s3` are started with
+# `network_mode: "service:origin"` -- each shares the `origin` container's
+# network namespace instead of getting its own. This is NOT a
+# benchmark-only hack; it is the same pattern the project's own internal
+# load tester (`src/bin/benchmark.rs`, see its
+# `ALLOW_LOOPBACK_SOURCE_ADDRESSES` usage) already uses, made necessary by
+# `src/services/image/source_guard.rs`: that SSRF guard unconditionally
+# blocks every RFC1918 address (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+# with NO override -- and a plain docker-compose bridge network address for
+# a sibling "origin" container is always in one of those ranges. The
+# guard's one sanctioned escape hatch is
+# `ALLOW_LOOPBACK_SOURCE_ADDRESSES=true` plus reaching the origin at
+# 127.0.0.1, which requires sharing a network namespace with it. `imgproxy`
+# has no equivalent restriction and reaches `origin` normally, over the
+# regular `bench` bridge network, by service name.
+#
+# MinIO does NOT need this treatment. The SSRF guard
+# (`src/services/image/source_guard.rs`) sits in front of the *source image
+# fetch* path only (`src/services/image/handler.rs`'s `fetch_validated`,
+# which is what calls into `source_guard`) -- it is never consulted by the
+# storage layer (`src/services/storage/s3_handler.rs`'s `MinIOStorage`,
+# which talks to MinIO purely through the `aws-sdk-s3` client, never
+# through `reqwest`/`source_guard`). So `emgr_s3` reaches `minio` as a
+# normal peer on the `bench` bridge network, by service name -- exactly
+# like `imgproxy` reaches `origin` -- with no loopback tricks and no
+# ALLOW_LOOPBACK_SOURCE_ADDRESSES involvement for that leg. The RFC1918
+# guard only had to be worked around for the origin-fetch leg, not the
+# storage leg.
+#
+# Since `emgr` and `emgr_s3` both share `origin`'s network namespace, they
+# cannot both bind the same port there -- `emgr` listens on 3000, `emgr_s3`
+# on 3001, both published for debugging via `origin`'s own `ports:` list
+# below (a container in `network_mode: "service:X"` cannot publish its own
+# ports -- only `X` can).
+#
+# Consequence worth knowing before you read timings: emgr's (both flavours)
+# requests to the origin traverse a shared loopback interface, while
+# imgproxy's traverse a normal container-to-container bridge hop. Both are
+# "local, no internet" and both are sub-millisecond compared to
+# decode/resize/encode cost, but they are not bit-for-bit the same network
+# path. See README.md.
+
+x-engine-resources: &engine_limits
+  cpus: "2"
+  memory: 1g
+
+services:
+  origin:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    networks:
+      - bench
+    volumes:
+      - ./origin/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./fixtures/corpus:/usr/share/nginx/html/corpus:ro
+    # Deliberately generous and un-equalized: origin serving cost is shared
+    # equally by both proxies (same files, same server), so it is not part
+    # of the emgr-vs-imgproxy comparison and doesn't need parity with
+    # `engine_limits`. It only needs to never be the bottleneck.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256m
+    ports:
+      # Host-published for manual debugging only (curl from the host). The
+      # load driver never uses these -- it talks to `origin`/`imgproxy` by
+      # service name on the `bench` network.
+      - "18080:80" # nginx corpus
+      - "18081:3000" # emgr (local_fs), reachable here because it shares
+      # this container's network namespace (see the header comment above)
+      # -- not because nginx itself listens on 3000.
+      - "18087:3001" # emgr_s3, same reasoning, different port because it
+      # shares this same namespace alongside `emgr` and can't reuse 3000.
+    healthcheck:
+      # 127.0.0.1, NOT localhost: /etc/hosts maps localhost to both 127.0.0.1
+      # and ::1, wget tries the IPv6 address first, and nginx binds IPv4 only
+      # (`listen 80;` in origin/nginx.conf). Via `localhost` the healthcheck
+      # gets ECONNREFUSED forever and every dependent container refuses to
+      # start with "dependency failed to start ... is unhealthy".
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Distroless nonroot (uid 65532, the base_deploy image emgr runs from)
+  # can't write to a fresh named volume, which docker creates root-owned.
+  # One-shot chown, same pattern the root compose.yaml uses for the same
+  # reason -- see that file's own `volume_init` service.
+  volume_init:
+    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    volumes:
+      - emgr_data:/app/data/images
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -ex
+        chown -R 65532:65532 /app/data/images
+        chmod -R 775 /app/data/images
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 32m
+
+  # emgr on the local_fs backend: stores derivatives on a docker volume and
+  # 301-redirects the client back to itself to serve them (CDN_BASE_URL
+  # below points at `origin:3000`, i.e. this very container). See the
+  # header comment's "THE POINT OF THE THREE-WAY SPLIT" section -- this is
+  # the flavour that pays for serving bytes it already produced.
+  emgr:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      # No OTel: keeps this comparison to image-processing cost, not
+      # instrumentation overhead imgproxy doesn't pay either.
+      target: fs_deploy
+    # Shares `origin`'s network namespace -- see the header comment. This
+    # also means emgr's own port 3000 is reachable at `origin:3000` /
+    # `localhost:18081`, NOT at an `emgr:3000` DNS name (this container has
+    # no network identity of its own to publish a hostname for).
+    network_mode: "service:origin"
+    depends_on:
+      origin:
+        condition: service_healthy
+      volume_init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits: *engine_limits
+    volumes:
+      - emgr_data:/app/data/images
+    environment:
+      STORAGE_TYPE: LOCAL_FS
+      LOCAL_FS_STORAGE_PATH: /app/data/images
+      HOST: 0.0.0.0
+      PORT: "3000"
+      # Points back at emgr's own shared-namespace address so the load
+      # driver's 301 redirect-follow (see driver/k6-script.js) resolves
+      # without leaving the compose network.
+      CDN_BASE_URL: http://origin:3000/api/images/files
+      ENABLE_HTTP2: "false" # origin speaks plain HTTP/1.1
+      # The origin is only reachable at 127.0.0.1 from inside this shared
+      # namespace -- this is the documented, sanctioned opt-in
+      # (src/services/image/source_guard.rs), not a weakened guard: RFC1918
+      # ranges stay blocked regardless of this flag.
+      ALLOW_LOOPBACK_SOURCE_ADDRESSES: "true"
+      # emgr fails closed at startup without a signing key (#27), so this
+      # opt-out is mandatory, not incidental. Mirrors imgproxy running with
+      # IMGPROXY_KEY/SALT unset and an `insecure` signature segment: both
+      # engines skip verification, keeping the comparison about image
+      # processing rather than HMAC throughput.
+      ALLOW_UNSIGNED_REQUESTS: "true"
+      # Explicit, equal-to-imgproxy concurrency knobs -- see the file
+      # header. Left un-set, these size off `effective_cpu_count()`
+      # (src/config/performance.rs), which *should* already be
+      # cgroup-aware (#44), but pinning them explicitly here means the
+      # comparison doesn't depend on trusting that detection to have
+      # picked up `engine_limits.cpus` correctly on every host.
+      MAX_CONCURRENT_PROCESSING: "2"
+      # Downloads are I/O-bound against a local origin, not CPU-bound --
+      # deliberately given more headroom than MAX_CONCURRENT_PROCESSING so
+      # download concurrency is never the bottleneck being measured.
+      # imgproxy has no equivalent separate download-concurrency knob; see
+      # README's fairness notes.
+      MAX_CONCURRENT_DOWNLOADS: "8"
+      # CRITICAL FAIRNESS CONTROL. emgr ships a per-IP rate limiter (#43);
+      # imgproxy has no equivalent. Left at the production default
+      # (burst 20 / 100ms) the limiter starts returning 429 after the first
+      # 20 requests, and the benchmark measures *the rate limiter refusing
+      # traffic* rather than image processing — an early run produced 11
+      # successes against 206,217 non-2xx at a nonsense 13.6k rps.
+      # Raised far above anything the driver can generate so the comparison
+      # is engine-vs-engine. Do NOT remove without re-reading that history.
+      RATE_LIMIT_BURST: "1000000"
+      RATE_LIMIT_PERIOD_MS: "1"
+      # Same reasoning: emgr sheds with 503 above this, imgproxy does not.
+      MAX_CONCURRENT_REQUESTS: "4096"
+      CPU_THREAD_POOL_SIZE: "2"
+      TOKIO_WORKER_THREADS: "2"
+      HTTP_TIMEOUT_SECS: "30"
+      MAX_IMAGE_SIZE_MB: "100"
+      MAX_SRC_RESOLUTION_MP: "50" # matches imgproxy's IMGPROXY_MAX_SRC_RESOLUTION below
+
+  # Object store for `emgr_s3`. Digest-pinned, same convention as every
+  # other image in this file.
+  #
+  # Deliberately generous, un-equalized resource limits -- see the header
+  # comment's "MinIO does NOT need this treatment" section for why MinIO
+  # itself is not part of the `engine_limits` comparison: it only serves
+  # the S3 variant of emgr, so its own CPU/memory use is NOT counted
+  # against emgr's benchmark budget. This is a real, deliberate asymmetry
+  # in this harness: imgproxy and `emgr` (local_fs) have no equivalent
+  # helper process at all, so there is nothing to give them a matching
+  # allowance for. Read the S3-vs-local_fs numbers with that in mind --
+  # `emgr_s3`'s throughput benefits from a process that isn't charged
+  # against its own limits, in a way neither of the other two configurations
+  # has an equivalent for.
+  minio:
+    image: minio/minio@sha256:ac591851803a79aee64bc37f66d77c56b0a4b6e12d9e5356380f4105510f2332
+    command: ["server", "/data", "--console-address", ":9001"]
+    networks:
+      - bench
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1g
+    ports:
+      # Host-published for manual debugging only (curl/mc from the host).
+      - "18085:9000" # S3 API
+      - "18086:9001" # web console
+    healthcheck:
+      # 127.0.0.1, not localhost -- same IPv6-first pitfall as `origin`'s
+      # healthcheck below; MinIO's image ships `curl` (verified directly:
+      # `docker run --rm --entrypoint sh minio/minio@<digest> -c 'ls
+      # /usr/bin'` lists it), unlike a from-scratch image.
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: creates the bucket `emgr_s3` uploads to and makes it publicly
+  # readable, so the 301 redirect `emgr_s3` sends the client resolves
+  # without any request signing -- MinIO's default bucket ACL is private,
+  # which would otherwise turn every benchmark request into a 403 once the
+  # client follows the redirect.
+  minio_init:
+    image: minio/mc@sha256:ba8af71554963bb6ad5c4301ff3d82176e96f0b0c7595047da989cacfae83682
+    networks:
+      - bench
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -ex
+        mc alias set local http://minio:9000 minioadmin minioadmin123
+        mc mb --ignore-existing local/emgr-bench
+        mc anonymous set public local/emgr-bench
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128m
+
+  # emgr on the S3 backend: stores derivatives in MinIO and 301-redirects
+  # the client straight to MinIO (CDN_BASE_URL below points at
+  # `minio:9000`, NOT at this container) -- emgr never serves the
+  # derivative bytes itself once they're written. See the header comment's
+  # "THE POINT OF THE THREE-WAY SPLIT" section.
+  emgr_s3:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      # No OTel, matching `emgr` (local_fs) and imgproxy.
+      target: s3_deploy
+    # Shares `origin`'s network namespace, same reasoning as `emgr` (local_fs)
+    # -- the SSRF guard's loopback escape hatch is what lets this container
+    # fetch source images from `origin` at all. See the header comment's
+    # "MinIO does NOT need this treatment" section: this sharing is ONLY
+    # for the source-fetch leg (reqwest -> source_guard), not for reaching
+    # MinIO, which this container talks to over the normal `bench` network
+    # via the S3 SDK (a path source_guard never sees).
+    network_mode: "service:origin"
+    depends_on:
+      origin:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio_init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits: *engine_limits
+    environment:
+      STORAGE_TYPE: S3
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: minioadmin123
+      MINIO_BUCKET: emgr-bench
+      MINIO_REGION: us-east-1
+      HOST: 0.0.0.0
+      # Different port from `emgr` (local_fs)'s 3000 -- both share
+      # `origin`'s network namespace and can't both bind 3000.
+      PORT: "3001"
+      # THE architectural distinction this three-way benchmark exists to
+      # measure: this points at MinIO, NOT at `emgr_s3` itself (contrast
+      # `emgr` (local_fs)'s CDN_BASE_URL, which points back at `origin:3000`
+      # -- itself). The bucket is public (see `minio_init` above), so this
+      # redirect resolves with no signing.
+      CDN_BASE_URL: http://minio:9000/emgr-bench
+      ENABLE_HTTP2: "false" # origin speaks plain HTTP/1.1
+      # Same sanctioned opt-in as `emgr` (local_fs) -- see the header
+      # comment. Only affects the source-image-fetch leg.
+      ALLOW_LOOPBACK_SOURCE_ADDRESSES: "true"
+      # emgr fails closed at startup without a signing key (#27); mirrors
+      # `emgr` (local_fs) and imgproxy's own signature-skipping setup.
+      ALLOW_UNSIGNED_REQUESTS: "true"
+      # Every concurrency/rate-limit knob below is IDENTICAL to `emgr`
+      # (local_fs)'s and to imgproxy's equivalent settings -- see that
+      # service's own comments for the full rationale on each. Re-stating
+      # here rather than only in one place because a future edit to one
+      # copy silently drifting from the other would invalidate the
+      # comparison without any error or warning.
+      MAX_CONCURRENT_PROCESSING: "2"
+      MAX_CONCURRENT_DOWNLOADS: "8"
+      RATE_LIMIT_BURST: "1000000"
+      RATE_LIMIT_PERIOD_MS: "1"
+      MAX_CONCURRENT_REQUESTS: "4096"
+      CPU_THREAD_POOL_SIZE: "2"
+      TOKIO_WORKER_THREADS: "2"
+      HTTP_TIMEOUT_SECS: "30"
+      MAX_IMAGE_SIZE_MB: "100"
+      MAX_SRC_RESOLUTION_MP: "50"
+
+  imgproxy:
+    # Pinned to a specific patch release (not `latest`), same rationale as
+    # the root Dockerfile's own pinning comments: reproducible builds
+    # across machines/days.
+    image: darthsim/imgproxy:v4.0.13@sha256:f6af7f85266fdc0d5b396e0f2f8b87f655edb960d2bcb6524fb690998a21f11c
+    networks:
+      - bench
+    deploy:
+      resources:
+        limits: *engine_limits
+    environment:
+      IMGPROXY_BIND: ":8080"
+      # No IMGPROXY_KEY / IMGPROXY_SALT set => "insecure mode": the
+      # signature segment of the URL is accepted unchecked. This is
+      # imgproxy's own documented way to disable signing, matching emgr
+      # having no signature scheme at all today.
+      GOMAXPROCS: "2"
+      IMGPROXY_WORKERS: "2" # == MAX_CONCURRENT_PROCESSING above
+      IMGPROXY_MAX_SRC_RESOLUTION: "50" # == MAX_SRC_RESOLUTION_MP above
+      IMGPROXY_READ_TIMEOUT: "30"
+      IMGPROXY_WRITE_TIMEOUT: "30"
+      IMGPROXY_TTL: "0" # disable client-side Cache-Control on responses;
+      # nothing in this harness relies on browser caching, and leaving it
+      # at imgproxy's default would make imgproxy's HTTP responses look
+      # cheaper to re-fetch than they actually were to produce.
+      IMGPROXY_USE_ETAG: "false"
+    ports:
+      - "18082:8080" # host-published for manual debugging only
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Load driver, run on demand via `docker compose run --rm driver ...`
+  # (see driver/run.sh) -- not started by `docker compose up`. Not part of
+  # the fairness comparison, so it gets no matching resource limit; it
+  # only needs to not itself be the bottleneck. If you're benchmarking on
+  # a host with few cores, don't run the driver against both engines'
+  # containers at once (run.sh doesn't, by default) -- their combined
+  # demand can exceed a small host's real core count even though each is
+  # individually capped at `engine_limits.cpus`.
+  driver:
+    image: grafana/k6:2.2.0@sha256:9bd01d6941fca969cb61bb57d2da5ee9b385fe2aa8881df3798c196564d6ace6
+    networks:
+      - bench
+    volumes:
+      - ./driver:/scripts:ro
+      - ./results:/results
+    profiles:
+      - driver
+    entrypoint: ["k6"]
+
+networks:
+  bench:
+    driver: bridge
+
+volumes:
+  emgr_data:

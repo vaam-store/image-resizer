@@ -187,3 +187,86 @@ impl StorageBackend for MinIOStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `new_minio` only builds an `aws_sdk_s3::Client` from a static config
+    /// (`s3::config::Builder`) - the AWS SDK is lazy, so this never makes a
+    /// network call. Confirms construction succeeds with typical inputs
+    /// (this also doubles as the "does this compile/link with force_path_style"
+    /// smoke test).
+    #[test]
+    fn new_minio_succeeds_with_typical_inputs_and_makes_no_network_call() {
+        let result = MinIOStorage::new_minio(
+            "http://127.0.0.1:9999".to_string(),
+            "test-access-key".to_string(),
+            "test-secret-key".to_string(),
+            "test-bucket".to_string(),
+            "us-east-1".to_string(),
+        );
+        assert!(
+            result.is_ok(),
+            "new_minio should succeed with no network involved"
+        );
+    }
+
+    /// `None` (no `Expires` set - i.e. `upload_image_with_ttl` was called
+    /// with `ttl: None`) must mean "never expires".
+    #[test]
+    fn is_expired_none_is_never_expired() {
+        assert!(!MinIOStorage::is_expired(None));
+    }
+
+    /// A well-formed HTTP-date clearly in the future must not be expired.
+    #[test]
+    fn is_expired_future_http_date_is_not_expired() {
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let http_date = DateTime::from(future)
+            .fmt(DateTimeFormat::HttpDate)
+            .expect("format future date as HTTP-date");
+        assert!(!MinIOStorage::is_expired(Some(&http_date)));
+    }
+
+    /// A well-formed HTTP-date clearly in the past must be expired.
+    #[test]
+    fn is_expired_past_http_date_is_expired() {
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        let http_date = DateTime::from(past)
+            .fmt(DateTimeFormat::HttpDate)
+            .expect("format past date as HTTP-date");
+        assert!(MinIOStorage::is_expired(Some(&http_date)));
+    }
+
+    /// An unparsable/garbage `Expires` value must fail open (treated as
+    /// "not expired") - same contract as every other backend's expiry
+    /// check, and safer than treating a malformed value as an outright
+    /// eviction trigger.
+    #[test]
+    fn is_expired_malformed_string_fails_open() {
+        assert!(!MinIOStorage::is_expired(Some("not-a-real-http-date")));
+        assert!(!MinIOStorage::is_expired(Some("")));
+        assert!(!MinIOStorage::is_expired(Some(
+            "Wed, 99 Foo 9999 99:99:99 GMT"
+        )));
+    }
+
+    /// Right at the boundary: `is_expired` uses `now_secs >= expires.secs()`,
+    /// so a value equal to "now" (truncated to whole seconds, matching
+    /// HTTP-date's own second-granularity) must already count as expired.
+    #[test]
+    fn is_expired_boundary_at_exactly_now_is_expired() {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_secs() as i64;
+        // HttpDate only carries second-granularity, so DateTime::from_secs
+        // round-trips exactly through fmt/parse - no truncation surprises.
+        let now = DateTime::from_secs(now_secs);
+        let http_date = now
+            .fmt(DateTimeFormat::HttpDate)
+            .expect("format boundary date as HTTP-date");
+        assert!(MinIOStorage::is_expired(Some(&http_date)));
+    }
+}

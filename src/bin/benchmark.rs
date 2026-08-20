@@ -1,4 +1,4 @@
-//! Load-test harness for the image-resize service's `/api/images/resize`
+//! Load-test harness for the image-resize service's signed-path API
 //! endpoint.
 //!
 //! Fixes relative to the previous version of this file:
@@ -307,6 +307,21 @@ async fn run_requests(
     (start.elapsed(), results)
 }
 
+/// Builds a request URL for the signed-path grammar that replaced the old
+/// `/api/images/resize?url=...` query endpoint (GH #53/#27):
+///
+/// ```text
+/// /{signature}/{processing_options}/{base64url source}.{extension}
+/// ```
+///
+/// The source is base64url-encoded rather than `plain/...` because the
+/// fixture URL contains slashes, and a base64url segment never does — one
+/// segment, no percent-encoding ambiguity about what actually got signed.
+///
+/// If `SIGNING_KEY`/`SIGNING_SALT` are set, the path is signed for real so
+/// the benchmark exercises the verification path. Otherwise it emits the
+/// `unsigned` escape, which the service only honours when
+/// `ALLOW_UNSIGNED_REQUESTS=true`.
 fn build_url(
     target_base_url: &str,
     fixture_base_url: &str,
@@ -315,21 +330,42 @@ fn build_url(
     height: Option<u32>,
     output_format: &str,
 ) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
     let source_url = format!("{fixture_base_url}/fixtures/{fixture_name}");
-    let encoded_source = urlencoding::encode(&source_url);
+    let encoded_source = URL_SAFE_NO_PAD.encode(source_url.as_bytes());
 
-    let mut query_params = vec![format!("format={output_format}")];
-    if let Some(w) = width {
-        query_params.push(format!("width={w}"));
-    }
-    if let Some(h) = height {
-        query_params.push(format!("height={h}"));
-    }
+    // `0` means "not set", matching imgproxy's own rs/resize convention.
+    let mut options = vec![format!(
+        "rs:fill:{}:{}",
+        width.unwrap_or(0),
+        height.unwrap_or(0)
+    )];
+    options.push("el:0".to_string()); // never upscale — the service rejects it anyway
 
-    format!(
-        "{target_base_url}/api/images/resize?url={encoded_source}&{}",
-        query_params.join("&")
-    )
+    let signed_path = format!(
+        "/{}/{}.{}",
+        options.join("/"),
+        encoded_source,
+        output_format
+    );
+
+    let signature = match (
+        std::env::var("SIGNING_KEY").ok().filter(|v| !v.is_empty()),
+        std::env::var("SIGNING_SALT").ok().filter(|v| !v.is_empty()),
+    ) {
+        (Some(key), Some(salt)) => {
+            emgr::modules::signing::verify::sign(
+                key.as_bytes(),
+                salt.as_bytes(),
+                &signed_path,
+            )
+        }
+        _ => "unsigned".to_string(),
+    };
+
+    format!("{target_base_url}/{signature}{signed_path}")
 }
 
 // ---- Stats ----------------------------------------------------------------
