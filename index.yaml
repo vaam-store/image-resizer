@@ -5,6 +5,28 @@ entries:
       category: Application
     apiVersion: v2
     appVersion: 0.1.2
+    created: "2026-08-20T00:50:22.418043503Z"
+    dependencies:
+    - name: common
+      repository: https://bjw-s-labs.github.io/helm-charts
+      version: 4.0.1
+    description: A Helm chart for Kubernetes
+    digest: 7e6188d7c3b87b6c251ef0687fbd18358e7a5964a99b0b52bea80a94c95ddeab
+    home: https://github.com/vaam-store/image-resizer
+    maintainers:
+    - email: team@vaam.com
+      name: VAAM Team
+    name: emgr
+    sources:
+    - https://github.com/vaam-store/image-resizer
+    type: application
+    urls:
+    - https://github.com/vaam-store/image-resizer/releases/download/emgr-0.1.9/emgr-0.1.9.tgz
+    version: 0.1.9
+  - annotations:
+      category: Application
+    apiVersion: v2
+    appVersion: 0.1.2
     created: "2025-07-08T21:52:40.599648731Z"
     dependencies:
     - name: common
@@ -111,4 +133,4 @@ entries:
     urls:
     - https://github.com/vaam-store/image-resizer/releases/download/emgr-serverless-0.1.1/emgr-serverless-0.1.1.tgz
     version: 0.1.1
-generated: "2025-07-08T22:20:48.073238882Z"
+generated: "2026-08-20T00:50:22.606164815Z"
