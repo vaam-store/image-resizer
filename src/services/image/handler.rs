@@ -4,6 +4,7 @@ use crate::services::image::source_guard;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use derive_builder::Builder;
+use fast_image_resize as fir;
 use futures::StreamExt;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -447,16 +448,27 @@ impl ImageService {
         // `resize_exact` (force) - only ever shrinks each axis to at most
         // its capped target, so none of them can upscale past the source:
         // the #36 guard holds for every resize type, not just fill.
+        // #63 stage 1: the actual resampling is now done by
+        // `fast_image_resize` (SIMD, pure Rust) via the `Self::fir_*`
+        // helpers below instead of `DynamicImage::resize`/
+        // `resize_to_fill`/`resize_exact` directly - resize was the
+        // single most expensive stage in the committed benchmark baseline
+        // (17.39ms lanczos3 downscale vs 6.78ms JPEG decode), not decode.
+        // Every `fir_*` helper reproduces the exact target-dimension math
+        // its `image`-crate counterpart uses internally (see their doc
+        // comments), so only the resampling kernel changes here - the
+        // fit/fill/force/auto branching below, and the #36 enlarge-guard
+        // reasoning it documents, are unchanged.
         let img = match (effective_width, effective_height) {
-            (Some(w), None) => img.resize(w, u32::MAX, filter),
-            (None, Some(h)) => img.resize(u32::MAX, h, filter),
+            (Some(w), None) => Self::fir_resize(&img, w, u32::MAX, filter)?,
+            (None, Some(h)) => Self::fir_resize(&img, u32::MAX, h, filter)?,
             (Some(w), Some(h)) => match params.resize_type {
                 // Fit inside the box, preserving aspect ratio - neither
                 // output dimension exceeds `w`/`h`. This is also what a
                 // lone width or height already did above, so `Fit` (the
                 // default, see `ResizeType`) keeps that existing behaviour
                 // consistent once both dimensions are given (#59).
-                ResizeType::Fit => img.resize(w, h, filter),
+                ResizeType::Fit => Self::fir_resize(&img, w, h, filter)?,
                 // Cover the box, preserving aspect ratio, then crop the
                 // overflow. `resize_to_fill` already crops to exactly
                 // `w x h` internally (verified against image-0.25.10's
@@ -465,9 +477,9 @@ impl ImageService {
                 // calls `.crop(...)` on the scaled image before
                 // returning), so no separate manual crop step is needed
                 // here (#36).
-                ResizeType::Fill => img.resize_to_fill(w, h, filter),
+                ResizeType::Fill => Self::fir_resize_to_fill(&img, w, h, filter)?,
                 // Stretch to exactly `w x h`, ignoring aspect ratio.
-                ResizeType::Force => img.resize_exact(w, h, filter),
+                ResizeType::Force => Self::fir_resize_exact(&img, w, h, filter)?,
                 // imgproxy's documented `auto` rule
                 // (https://docs.imgproxy.net/usage/processing#resizing-type):
                 // "if both source and resulting dimensions have the same
@@ -480,9 +492,9 @@ impl ImageService {
                     let src_landscape = src_width >= src_height;
                     let dst_landscape = w >= h;
                     if src_landscape == dst_landscape {
-                        img.resize_to_fill(w, h, filter)
+                        Self::fir_resize_to_fill(&img, w, h, filter)?
                     } else {
-                        img.resize(w, h, filter)
+                        Self::fir_resize(&img, w, h, filter)?
                     }
                 }
             },
@@ -593,6 +605,167 @@ impl ImageService {
         };
 
         Ok((output_bytes, content_type.to_string()))
+    }
+
+    /// Reproduces `image` crate's own aspect-ratio scaling formula exactly
+    /// (image-0.25.10 `src/math/utils.rs::resize_dimensions` - `pub(crate)`
+    /// there, so not callable directly) so the `fast_image_resize`-backed
+    /// helpers below compute the *identical* target size
+    /// `DynamicImage::resize`/`resize_to_fill` would have, before #63
+    /// stage 1 swapped out only the resampling kernel underneath them.
+    /// `fill=false` is the "fit inside the box" ratio (`ResizeType::Fit`,
+    /// `min(wratio, hratio)`); `fill=true` is the "cover the box" ratio
+    /// used as the intermediate step before `resize_to_fill`'s crop
+    /// (`max(wratio, hratio)`).
+    fn resize_dimensions(width: u32, height: u32, nwidth: u32, nheight: u32, fill: bool) -> (u32, u32) {
+        let wratio = f64::from(nwidth) / f64::from(width);
+        let hratio = f64::from(nheight) / f64::from(height);
+
+        let ratio = if fill {
+            f64::max(wratio, hratio)
+        } else {
+            f64::min(wratio, hratio)
+        };
+
+        let nw = (f64::from(width) * ratio).round().max(1.0) as u64;
+        let nh = (f64::from(height) * ratio).round().max(1.0) as u64;
+
+        if nw > u64::from(u32::MAX) {
+            let ratio = f64::from(u32::MAX) / f64::from(width);
+            (
+                u32::MAX,
+                (f64::from(height) * ratio).round().max(1.0) as u32,
+            )
+        } else if nh > u64::from(u32::MAX) {
+            let ratio = f64::from(u32::MAX) / f64::from(height);
+            (
+                (f64::from(width) * ratio).round().max(1.0) as u32,
+                u32::MAX,
+            )
+        } else {
+            (nw as u32, nh as u32)
+        }
+    }
+
+    /// Maps this service's existing filter heuristic (Triangle for
+    /// thumbnails, Lanczos3 otherwise - see the call site above) onto its
+    /// `fast_image_resize` equivalent (#63 stage 1). `Triangle` ->
+    /// `Bilinear` is a naming difference, not a quality one: both are the
+    /// same linear/tent kernel, just named after the interpolation
+    /// (`fast_image_resize`) rather than the kernel shape (`image`).
+    /// `Lanczos3` matches by name exactly and is `fast_image_resize`'s own
+    /// default algorithm. `Nearest`/`CatmullRom`/`Gaussian` are mapped for
+    /// completeness even though the heuristic above never selects them
+    /// today, so this stays a total function instead of needing a
+    /// `_ => unreachable!()` a future heuristic change could silently
+    /// falsify.
+    fn fir_resize_alg(filter: FilterType) -> fir::ResizeAlg {
+        match filter {
+            FilterType::Nearest => fir::ResizeAlg::Nearest,
+            FilterType::Triangle => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
+            FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
+            FilterType::Gaussian => fir::ResizeAlg::Convolution(fir::FilterType::Gaussian),
+            FilterType::Lanczos3 => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+        }
+    }
+
+    /// Resizes `img` to exactly `nwidth x nheight` via `fast_image_resize`
+    /// (SIMD-accelerated) instead of the `image` crate's own scalar
+    /// resampler - the #63 stage-1 change, targeting the single most
+    /// expensive stage in the committed benchmark baseline (17.39ms
+    /// lanczos3 downscale vs 6.78ms JPEG decode).
+    ///
+    /// `fast_image_resize::Resizer::resize` writes directly into a
+    /// `DynamicImage` destination - it implements `IntoImageViewMut` for
+    /// every colour-type variant this service ever produces (the `image`
+    /// cargo feature on `fast_image_resize`) - so no manual pixel-buffer
+    /// reinterpretation is needed in either direction; the destination is
+    /// allocated via `DynamicImage::new` with `img.color()`, so it is
+    /// always the same colour-type variant as the source.
+    ///
+    /// `ResizeOptions::mul_div_alpha` defaults to `true`, so a source with
+    /// an alpha channel (`Rgba8`/`LumaA8`/...) is premultiplied before
+    /// resampling and un-premultiplied after, internally - this is what
+    /// keeps #34/#60's alpha handling from regressing into
+    /// fringing/halos at transparent edges (verified empirically with
+    /// DSSIM against the `alpha_fringe_rgba` fixture, not just asserted
+    /// from reading the option's default).
+    fn fir_resize_exact(
+        img: &DynamicImage,
+        nwidth: u32,
+        nheight: u32,
+        filter: FilterType,
+    ) -> Result<DynamicImage> {
+        // `fast_image_resize` rejects a zero-sized destination outright.
+        // Floor at 1px/axis - the same floor `resize_dimensions` above
+        // already applies to every *computed* fit/fill target - so a
+        // `Force` request naming 0 explicitly still produces a
+        // (degenerate) image instead of a hard error, matching the
+        // pre-existing `image`-crate behaviour for that same edge case.
+        let nwidth = nwidth.max(1);
+        let nheight = nheight.max(1);
+
+        if (nwidth, nheight) == img.dimensions() {
+            // Mirrors `image::imageops::resize`'s own no-op short-circuit
+            // (image-0.25.10 `src/imageops/sample.rs`): nothing to
+            // resample, so skip the round trip through
+            // `fast_image_resize` entirely.
+            return Ok(img.clone());
+        }
+
+        let mut dst = DynamicImage::new(nwidth, nheight, img.color());
+        let mut resizer = fir::Resizer::new();
+        let options = fir::ResizeOptions::new().resize_alg(Self::fir_resize_alg(filter));
+        resizer
+            .resize(img, &mut dst, &options)
+            .map_err(|e| anyhow::anyhow!("fast_image_resize failed for {nwidth}x{nheight}: {e}"))?;
+        Ok(dst)
+    }
+
+    /// `fast_image_resize`-backed equivalent of `DynamicImage::resize`
+    /// (fit inside `nwidth x nheight`, preserving aspect ratio) - same
+    /// `resize_dimensions(..., fill: false)` target-size math as before,
+    /// only the resampling kernel itself is swapped (#63 stage 1).
+    fn fir_resize(
+        img: &DynamicImage,
+        nwidth: u32,
+        nheight: u32,
+        filter: FilterType,
+    ) -> Result<DynamicImage> {
+        if (nwidth, nheight) == img.dimensions() {
+            return Ok(img.clone());
+        }
+        let (width2, height2) =
+            Self::resize_dimensions(img.width(), img.height(), nwidth, nheight, false);
+        Self::fir_resize_exact(img, width2, height2, filter)
+    }
+
+    /// `fast_image_resize`-backed equivalent of
+    /// `DynamicImage::resize_to_fill` (cover `nwidth x nheight`,
+    /// preserving aspect ratio, then centre-crop the overflow) - reuses
+    /// `image`'s own `DynamicImage::crop` for the crop step (untouched by
+    /// this change) and reproduces `resize_to_fill`'s exact crop-offset
+    /// arithmetic (image-0.25.10 `src/images/dynimage.rs:943-962`) so the
+    /// output is pixel-region-identical to before, just resampled by
+    /// `fast_image_resize` (#63 stage 1).
+    fn fir_resize_to_fill(
+        img: &DynamicImage,
+        nwidth: u32,
+        nheight: u32,
+        filter: FilterType,
+    ) -> Result<DynamicImage> {
+        let (width2, height2) =
+            Self::resize_dimensions(img.width(), img.height(), nwidth, nheight, true);
+        let mut intermediate = Self::fir_resize_exact(img, width2, height2, filter)?;
+        let (iwidth, iheight) = intermediate.dimensions();
+        let ratio = u64::from(iwidth) * u64::from(nheight);
+        let nratio = u64::from(nwidth) * u64::from(iheight);
+
+        Ok(if nratio > ratio {
+            intermediate.crop(0, (iheight - nheight) / 2, nwidth, nheight)
+        } else {
+            intermediate.crop((iwidth - nwidth) / 2, 0, nwidth, nheight)
+        })
     }
 
     /// Composites `img` onto an opaque `background` colour, producing a
