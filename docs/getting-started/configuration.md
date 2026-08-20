@@ -91,6 +91,19 @@ interact with the `width`/`height` query parameters.
 | `MAX_SRC_RESOLUTION_MP` | Maximum decoded *source* resolution in megapixels, checked against header dimensions before a full decode. imgproxy default: *IMGPROXY_MAX_SRC_RESOLUTION* = 50. | `50` |
 | `MAX_OUTPUT_WIDTH` | Maximum requested output width in pixels. | `4096` |
 | `MAX_OUTPUT_HEIGHT` | Maximum requested output height in pixels. | `4096` |
+| `MAX_ANIMATION_FRAMES` | Maximum number of frames read from an animated GIF/WebP source before the animated encode path ([GH #49](https://github.com/vaam-store/image-resizer/issues/49)) refuses the request. Enforced while iterating frames, not after decoding all of them, so it bounds work spent on attacker-supplied input rather than just rejecting after the fact - a many-tiny-frames animation can be individually well within `MAX_SRC_RESOLUTION_MP` per frame while still being a real memory/CPU amplification via frame count alone. | `512` |
+
+## Watermarking, presets and the processing-option allowlist
+
+Added under [GH #52](https://github.com/vaam-store/image-resizer/issues/52).
+See the [API reference](../user-guide/api-reference.md) for the `wm:`/`wmu:`,
+`pr:` request-option syntax these variables back.
+
+| Variable | Description | Default |
+|---|---|---|
+| `WATERMARK_URL` | Default watermark image URL, used when a request sets `wm:` without its own `wmu:{base64url}`. Fetched through the same SSRF guard (`ALLOWED_SOURCES`, private-range block, redirect re-validation) as any other source URL. A request's own `wmu:` always takes priority over this default. imgproxy: *IMGPROXY_WATERMARK_URL*. | _unset_ |
+| `PRESETS` | Preset definitions: comma-separated `{name}={options}` entries, `{options}` itself `/`-separated processing-option segments - e.g. `thumbnail=rs:fill:300:300/q:80,default=el:1`. A preset named `default` is special: it is prepended ahead of every request's own segments automatically, even when the request never names a preset at all. A preset's own definition cannot contain a `pr:` segment (presets don't recurse). imgproxy: *IMGPROXY_PRESETS*. | _unset_ |
+| `ALLOWED_PROCESSING_OPTIONS` | Comma-separated allowlist of processing-option short codes (e.g. `rs,q,pr`) permitted directly in a request URL. Unset/blank means unrestricted. Restricts what a request can do directly - it does **not** apply to options used *inside* a preset's own definition, which is what lets an operator hand out a restricted set of presets while forbidding the raw options they're built from. imgproxy: *IMGPROXY_ALLOWED_PROCESSING_OPTIONS*. | _unset_ (unrestricted) |
 
 ## Performance tuning
 

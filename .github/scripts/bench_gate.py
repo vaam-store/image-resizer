@@ -14,6 +14,22 @@ if any benchmark's mean regressed by more than `--threshold` percent.
 A benchmark id with no `main/` directory (new benchmark, or first-ever
 run before any baseline has been captured on the default branch) is
 reported with no delta rather than treated as a failure.
+
+A percentage threshold on its own is meaningless for a benchmark whose
+absolute cost is already negligible against a real request. `emgr`'s
+end-to-end pipeline is ~10-30 ms (see `.bench-baseline/BASELINE.md`), so a
+benchmark running in ~1 us is ~0.004% of one request: even a +100%
+"regression" there is invisible to every user, and gating on it blocks
+merges over measurement noise. `--floor-ns` excludes benchmarks below an
+absolute duration from the *blocking* decision only. They are still run,
+still shown in the table, and still labelled with their true percentage
+change - the floor changes whether a regression fails the build, never
+whether it is reported.
+
+The floor is deliberately far below anything user-visible. Raising it to
+where it would hide a real regression defeats the point; it exists to stop
+nanosecond-scale noise from blocking merges, not to make slow code
+mergeable.
 """
 
 from __future__ import annotations
@@ -71,6 +87,16 @@ def main() -> int:
         help="Regression threshold in percent (GH #20: 'start loose, ~15%%')",
     )
     parser.add_argument(
+        "--floor-ns",
+        type=float,
+        default=100_000.0,
+        help=(
+            "Benchmarks faster than this many nanoseconds are reported but "
+            "never fail the build - under ~100us is <1%% of a 10-30ms "
+            "request even if it doubles (default: 100000, i.e. 100us)"
+        ),
+    )
+    parser.add_argument(
         "--output",
         default="bench-report.md",
         help="Where to write the PR-comment markdown table",
@@ -78,8 +104,9 @@ def main() -> int:
     args = parser.parse_args()
 
     criterion_dir = Path(args.criterion_dir)
-    rows: list[tuple[str, float, float | None, float | None]] = []
+    rows: list[tuple[str, float, float | None, float | None, bool]] = []
     regressions: list[tuple[str, float]] = []
+    below_floor_changes: list[tuple[str, float]] = []
 
     for bench_id, new_path, base_path in find_benchmarks(criterion_dir):
         new_ns = load_point_estimate(new_path)
@@ -87,11 +114,17 @@ def main() -> int:
             continue
         base_ns = load_point_estimate(base_path)
         pct_change = None
+        # Judged on the *new* measurement: a benchmark that is fast now is
+        # negligible now, whatever it happened to cost before.
+        below_floor = new_ns < args.floor_ns
         if base_ns is not None and base_ns > 0:
             pct_change = (new_ns - base_ns) / base_ns * 100.0
             if pct_change > args.threshold:
-                regressions.append((bench_id, pct_change))
-        rows.append((bench_id, new_ns, base_ns, pct_change))
+                if below_floor:
+                    below_floor_changes.append((bench_id, pct_change))
+                else:
+                    regressions.append((bench_id, pct_change))
+        rows.append((bench_id, new_ns, base_ns, pct_change, below_floor))
 
     lines = [
         "<!-- bench-gate-report -->",
@@ -100,6 +133,12 @@ def main() -> int:
         f"Regression gate: fails at **>{args.threshold:.0f}%** slower than the "
         "`main` baseline (start-loose threshold, GH #20 - tighten once the "
         "numbers are stable across a few runs).",
+        "",
+        f"Benchmarks faster than **{human_time(args.floor_ns)}** are measured and "
+        "reported but never fail the build: at that scale they are under 1% of a "
+        "10-30ms request even if they double, so a percentage gate there measures "
+        "noise rather than user-visible performance. Those rows are marked "
+        "_below floor_ and still show their real change.",
         "",
         "| Benchmark | This PR | `main` baseline | Change |",
         "|---|---|---|---|",
@@ -110,13 +149,16 @@ def main() -> int:
             "| _no comparable benchmarks found_ | - | - | - |"
         )
     else:
-        for bench_id, new_ns, base_ns, pct_change in rows:
+        for bench_id, new_ns, base_ns, pct_change, below_floor in rows:
             base_cell = human_time(base_ns) if base_ns is not None else "_no baseline_"
             if pct_change is None:
                 change_cell = "-"
             else:
                 arrow = "🔺" if pct_change > 0 else "🔻"
-                flag = " **REGRESSION**" if pct_change > args.threshold else ""
+                if pct_change > args.threshold:
+                    flag = " _(below floor)_" if below_floor else " **REGRESSION**"
+                else:
+                    flag = ""
                 change_cell = f"{arrow} {pct_change:+.1f}%{flag}"
             lines.append(
                 f"| `{bench_id}` | {human_time(new_ns)} | {base_cell} | {change_cell} |"
@@ -129,6 +171,19 @@ def main() -> int:
             f"{args.threshold:.0f}% threshold:**"
         )
         for bench_id, pct_change in regressions:
+            lines.append(f"- `{bench_id}`: {pct_change:+.1f}%")
+
+    # Reported, never silently swallowed: a below-floor benchmark that keeps
+    # creeping upward run after run is still worth someone's attention, even
+    # though no single run of it should block a merge.
+    if below_floor_changes:
+        lines.append("")
+        lines.append(
+            f"**{len(below_floor_changes)} benchmark(s) moved past the "
+            f"{args.threshold:.0f}% threshold but sit below the "
+            f"{human_time(args.floor_ns)} floor, so they do not fail the build:**"
+        )
+        for bench_id, pct_change in below_floor_changes:
             lines.append(f"- `{bench_id}`: {pct_change:+.1f}%")
 
     report = "\n".join(lines) + "\n"
