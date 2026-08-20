@@ -1350,7 +1350,7 @@ impl ImageService {
     /// `output_width`/`output_height`) - exactly, so this prediction matches
     /// what `Decompress::scale` will actually produce.
     fn mozjpeg_scaled_dimension(dim: u32, scale_num: u8) -> u32 {
-        ((u64::from(dim) * u64::from(scale_num) + 7) / 8) as u32
+        (u64::from(dim) * u64::from(scale_num)).div_ceil(8) as u32
     }
 
     /// Runs the actual mozjpeg/libjpeg-turbo pixel decode at `scale_num/8`

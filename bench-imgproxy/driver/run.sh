@@ -32,7 +32,17 @@ if [ ! -f fixtures/corpus/photo_4k.jpg ]; then
 fi
 
 echo "==> Building and starting origin + minio (+ bucket init) + imgproxy + emgr + emgr_s3"
-docker compose up -d --build origin volume_init minio minio_init imgproxy emgr emgr_s3
+# Only bring up the engines actually being measured. Previously this list
+# was unconditional, so a run of just `imgproxy emgr` still built emgr_s3 —
+# and any unrelated build failure there aborted the whole sweep before a
+# single request was sent.
+services="origin volume_init"
+case " $ENGINES " in *" imgproxy "*) services="$services imgproxy";; esac
+case " $ENGINES " in *" emgr "*) services="$services emgr";; esac
+case " $ENGINES " in *" emgr_s3 "*) services="$services minio minio_init emgr_s3";; esac
+
+# shellcheck disable=SC2086 # word splitting is intended: $services is a list
+docker compose up -d --build $services
 
 echo "==> Waiting for origin, minio, imgproxy, emgr and emgr_s3 healthchecks"
 # #57: emgr/emgr_s3 are on the normal `bench` bridge network now (see
