@@ -22,6 +22,9 @@ fn bench_cache_key(c: &mut Criterion) {
         grayscale: Some(false),
         enlarge: false,
         quality: None,
+        jpeg_quality: None,
+        webp_quality: None,
+        webp_lossless: None,
         background: None,
     };
 

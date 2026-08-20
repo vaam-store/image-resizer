@@ -6,8 +6,9 @@ use crate::models::params::ResizeType;
 /// own short option codes (`rs`, `q`, `bl`, `g`, `el`) so a client library
 /// written for imgproxy's URL format produces something this parser accepts
 /// for the capability set #53 keeps: width, height, resize type, blur,
-/// grayscale, enlarge, quality (format comes from the trailing
-/// `.{extension}` instead - see [`super::source`]).
+/// grayscale, enlarge, quality, per-format quality override, webp lossless
+/// (format comes from the trailing `.{extension}` instead - see
+/// [`super::source`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcessingOptions {
     pub width: Option<u32>,
@@ -21,6 +22,15 @@ pub struct ProcessingOptions {
     pub grayscale: Option<bool>,
     pub enlarge: Option<bool>,
     pub quality: Option<u8>,
+    /// `fq`'s parsed `jpg`/`jpeg` slot (#35) - see
+    /// [`crate::models::params::ResizeQuery::jpeg_quality`].
+    pub jpeg_quality: Option<u8>,
+    /// `fq`'s parsed `webp` slot (#35) - see
+    /// [`crate::models::params::ResizeQuery::webp_quality`].
+    pub webp_quality: Option<u8>,
+    /// `webpo`'s parsed `compression` slot (#35) - see
+    /// [`crate::models::params::ResizeQuery::webp_lossless`].
+    pub webp_lossless: Option<bool>,
     /// `bg`'s parsed `[R, G, B]` triple (#34) - see
     /// [`crate::models::params::ResizeQuery::background`] for how it's
     /// consumed.
@@ -66,6 +76,81 @@ impl ProcessingOptions {
                 "q" => {
                     let [value] = require_args::<1>(&args, segment)?;
                     opts.quality = Some(parse_bounded(value, segment, 0, 100)?);
+                }
+                // fq:{format1}:{quality1}:{format2}:{quality2}:... - imgproxy's
+                // `format_quality`/`fq` option (#35,
+                // <https://docs.imgproxy.net/usage/processing#format-quality>):
+                // "adds or redefines format_quality values" for the current
+                // request, on top of `q`'s global default. Only `jpg`/`jpeg`
+                // and `webp` are accepted - PNG output always uses this
+                // crate's fixed `CompressionType::Best` (no continuous 0-100
+                // quality knob exists to override), so `fq:png:N` is rejected
+                // with 400 rather than silently ignored. Repeating a format
+                // (`fq:jpg:80:jpg:90`) lets the later pair win, same as
+                // imgproxy's own "redefines" wording implies.
+                "fq" => {
+                    if args.is_empty() || !args.len().is_multiple_of(2) {
+                        return Err(UrlParseError::InvalidOptionValue {
+                            option: segment.to_string(),
+                            reason: "expected one or more format:quality pairs".to_string(),
+                        });
+                    }
+                    for pair in args.chunks(2) {
+                        let (format, value) = (pair[0], pair[1]);
+                        let quality = parse_bounded(value, segment, 0, 100)?;
+                        match format {
+                            "jpg" | "jpeg" => opts.jpeg_quality = Some(quality),
+                            "webp" => opts.webp_quality = Some(quality),
+                            "png" => {
+                                return Err(UrlParseError::InvalidOptionValue {
+                                    option: segment.to_string(),
+                                    reason: "png has no adjustable quality in this encoder \
+                                             (PNG output always uses fixed CompressionType::Best)"
+                                        .to_string(),
+                                });
+                            }
+                            other => {
+                                return Err(UrlParseError::InvalidOptionValue {
+                                    option: segment.to_string(),
+                                    reason: format!(
+                                        "unsupported format {other:?} for format_quality \
+                                         (expected jpg, jpeg or webp)"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                // webpo:{compression} - a deliberately partial implementation
+                // of imgproxy's `webp_options`/`webpo:{compression}:
+                // {smart_subsample}:{preset}` option (#35,
+                // <https://docs.imgproxy.net/usage/processing#webp-options>).
+                // Only the `compression` slot is implemented - the `webp`
+                // crate (0.3.1) this project depends on exposes exactly two
+                // encode modes, `Encoder::encode` (lossy) and
+                // `Encoder::encode_lossless`, with no `smart_subsample` or
+                // `preset` knob at all, and no `mixed` mode either. Requiring
+                // exactly one argument (rather than silently accepting and
+                // ignoring imgproxy's other two slots) is deliberate: a
+                // caller who actually needs `smart_subsample`/`preset` gets a
+                // clear 400 here instead of a silently-ignored parameter.
+                "webpo" => {
+                    let [compression] = require_args::<1>(&args, segment)?;
+                    opts.webp_lossless = Some(match compression {
+                        "lossy" => false,
+                        "lossless" => true,
+                        other => {
+                            return Err(UrlParseError::InvalidOptionValue {
+                                option: segment.to_string(),
+                                reason: format!(
+                                    "{other:?} is not a supported webp compression mode \
+                                     (expected lossy or lossless - this encoder has no \
+                                     mixed mode, and does not support imgproxy's \
+                                     smart_subsample/preset slots)"
+                                ),
+                            });
+                        }
+                    });
                 }
                 "bl" => {
                     let [value] = require_args::<1>(&args, segment)?;
@@ -285,6 +370,81 @@ mod tests {
     }
 
     #[test]
+    fn parses_format_quality_for_jpeg_and_webp() {
+        let opts = ProcessingOptions::parse(&["fq:jpg:80:webp:90"]).unwrap();
+        assert_eq!(opts.jpeg_quality, Some(80));
+        assert_eq!(opts.webp_quality, Some(90));
+    }
+
+    #[test]
+    fn format_quality_accepts_jpeg_alias() {
+        let opts = ProcessingOptions::parse(&["fq:jpeg:70"]).unwrap();
+        assert_eq!(opts.jpeg_quality, Some(70));
+    }
+
+    #[test]
+    fn format_quality_later_pair_overrides_earlier_for_same_format() {
+        let opts = ProcessingOptions::parse(&["fq:jpg:80:jpg:40"]).unwrap();
+        assert_eq!(opts.jpeg_quality, Some(40));
+    }
+
+    #[test]
+    fn format_quality_rejects_png() {
+        assert!(ProcessingOptions::parse(&["fq:png:80"]).is_err());
+    }
+
+    #[test]
+    fn format_quality_rejects_unknown_format() {
+        assert!(ProcessingOptions::parse(&["fq:avif:80"]).is_err());
+    }
+
+    #[test]
+    fn format_quality_rejects_odd_argument_count() {
+        assert!(ProcessingOptions::parse(&["fq:jpg:80:webp"]).is_err());
+    }
+
+    #[test]
+    fn format_quality_rejects_out_of_range_value() {
+        assert!(ProcessingOptions::parse(&["fq:jpg:101"]).is_err());
+    }
+
+    #[test]
+    fn format_quality_rejects_empty_args() {
+        assert!(ProcessingOptions::parse(&["fq"]).is_err());
+    }
+
+    #[test]
+    fn parses_webp_lossless() {
+        assert_eq!(
+            ProcessingOptions::parse(&["webpo:lossless"])
+                .unwrap()
+                .webp_lossless,
+            Some(true)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["webpo:lossy"])
+                .unwrap()
+                .webp_lossless,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn webp_lossless_rejects_unsupported_mode() {
+        assert!(ProcessingOptions::parse(&["webpo:mixed"]).is_err());
+        assert!(ProcessingOptions::parse(&["webpo:nope"]).is_err());
+    }
+
+    #[test]
+    fn webp_lossless_rejects_extra_arguments() {
+        // imgproxy's own 3-slot grammar (compression:smart_subsample:preset)
+        // - this crate only implements the first slot, and rejects rather
+        // than silently ignoring the other two (see the `webpo` match arm's
+        // doc comment).
+        assert!(ProcessingOptions::parse(&["webpo:lossless::4"]).is_err());
+    }
+
+    #[test]
     fn parses_blur() {
         let opts = ProcessingOptions::parse(&["bl:5"]).unwrap();
         assert_eq!(opts.blur_sigma, Some(5.0));
@@ -327,6 +487,8 @@ mod tests {
         let opts = ProcessingOptions::parse(&[
             "rs:fill:300:300",
             "q:80",
+            "fq:webp:90",
+            "webpo:lossless",
             "bl:5",
             "g:true",
             "el:1",
@@ -337,6 +499,8 @@ mod tests {
         assert_eq!(opts.height, Some(300));
         assert_eq!(opts.resize_type, ResizeType::Fill);
         assert_eq!(opts.quality, Some(80));
+        assert_eq!(opts.webp_quality, Some(90));
+        assert_eq!(opts.webp_lossless, Some(true));
         assert_eq!(opts.blur_sigma, Some(5.0));
         assert_eq!(opts.grayscale, Some(true));
         assert_eq!(opts.enlarge, Some(true));

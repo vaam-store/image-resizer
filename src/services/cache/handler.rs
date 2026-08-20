@@ -30,8 +30,17 @@ use sha2::{Digest, Sha256};
 /// bytes. Now that it changes what gets encoded - both the flatten colour
 /// for alpha->no-alpha conversions and the fill colour for fully-transparent
 /// pixels when alpha is kept - two requests differing only in `background`
-/// must not collide onto a v4 key that never hashed it.
-const CACHE_KEY_VERSION: u8 = 5;
+/// must not collide onto a v4 key that never hashed it. v6 adds `quality`,
+/// `jpeg_quality`, `webp_quality` and `webp_lossless` (#35): `quality` was
+/// already parsed into `ResizeQuery` (from the URL grammar's `q:{0-100}`)
+/// before this change, but was never fed into `generate_key` at all - a
+/// pure oversight, not a deliberate "doesn't affect output" omission like
+/// `resize_type` was pre-#59, since quality has always affected encoded
+/// bytes for whatever encoder actually used it. Now that the encoders in
+/// `src/services/image/handler.rs` honour these fields, two requests
+/// differing only in quality/format-quality/losslessness must not collide
+/// onto a v5 key that never hashed any of them.
+const CACHE_KEY_VERSION: u8 = 6;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -104,6 +113,29 @@ impl CacheService {
         // Always-present (not `Option<bool>`, so no "None" bucket needed
         // here unlike `grayscale`/`blur_sigma`).
         Self::update_field(&mut hasher, params.enlarge.to_string().as_bytes());
+
+        // `quality`/`jpeg_quality`/`webp_quality`/`webp_lossless` (#35, v6)
+        // change the encoder's output bytes directly - see the v6
+        // `CACHE_KEY_VERSION` note above for why these were missing before.
+        match params.quality {
+            Some(quality) => Self::update_field(&mut hasher, &[quality]),
+            None => Self::update_field(&mut hasher, b"None"),
+        }
+
+        match params.jpeg_quality {
+            Some(quality) => Self::update_field(&mut hasher, &[quality]),
+            None => Self::update_field(&mut hasher, b"None"),
+        }
+
+        match params.webp_quality {
+            Some(quality) => Self::update_field(&mut hasher, &[quality]),
+            None => Self::update_field(&mut hasher, b"None"),
+        }
+
+        match params.webp_lossless {
+            Some(lossless) => Self::update_field(&mut hasher, lossless.to_string().as_bytes()),
+            None => Self::update_field(&mut hasher, b"None"),
+        }
 
         // `background` (#34/#60, v5) changes the resize pipeline's output
         // bytes wherever alpha is flattened or transparent pixels are
@@ -192,6 +224,9 @@ mod tests {
             grayscale,
             enlarge,
             quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
             background: None,
         }
     }
@@ -359,6 +394,9 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
             background,
         };
 
@@ -371,6 +409,120 @@ mod tests {
             keys.len(),
             4,
             "each distinct background (including unset) must produce a distinct cache key"
+        );
+    }
+
+    /// #35 (v6 bump): `quality` changes the encoded output bytes, so
+    /// distinct qualities - and the unset ("use the encoder's default")
+    /// case - must not collide onto the same cache key.
+    #[test]
+    fn quality_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |quality: Option<u8>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
+            background: None,
+        };
+
+        let keys: HashSet<String> = [None, Some(30), Some(75), Some(90)]
+            .into_iter()
+            .map(|q| cache.generate_key(&base(q)))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            4,
+            "each distinct quality (including unset) must produce a distinct cache key"
+        );
+    }
+
+    /// #35 (v6 bump): a per-format quality override changes the encoded
+    /// output bytes independently of the global `quality`, so it must be
+    /// its own dimension in the cache key rather than being folded into (or
+    /// ignored relative to) `quality`.
+    #[test]
+    fn format_quality_produces_distinct_keys_from_global_quality() {
+        let cache = cache_service();
+
+        let base = |quality: Option<u8>, jpeg_quality: Option<u8>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality,
+            jpeg_quality,
+            webp_quality: None,
+            webp_lossless: None,
+            background: None,
+        };
+
+        let global_only = cache.generate_key(&base(Some(80), None));
+        let override_only = cache.generate_key(&base(None, Some(80)));
+        let both = cache.generate_key(&base(Some(80), Some(80)));
+        let neither = cache.generate_key(&base(None, None));
+
+        let keys: HashSet<String> = [
+            global_only.clone(),
+            override_only.clone(),
+            both.clone(),
+            neither.clone(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            keys.len(),
+            4,
+            "quality and jpeg_quality must each be an independent cache-key dimension"
+        );
+    }
+
+    /// #35 (v6 bump): `webp_lossless` changes the encoded output bytes
+    /// (an entirely different codec path - `encode_lossless` vs `encode`),
+    /// so it must not collide with the lossy default.
+    #[test]
+    fn webp_lossless_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |webp_lossless: Option<bool>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Webp,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless,
+            background: None,
+        };
+
+        let keys: HashSet<String> = [None, Some(false), Some(true)]
+            .into_iter()
+            .map(|l| cache.generate_key(&base(l)))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            3,
+            "each distinct webp_lossless value (including unset) must produce a distinct cache key"
         );
     }
 
@@ -396,6 +548,9 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
             background: None,
         };
 
