@@ -24,6 +24,9 @@ fn query(width: Option<u32>, height: Option<u32>, format: ApiImageFormat) -> Res
         grayscale: None,
         enlarge: false,
         quality: None,
+        jpeg_quality: None,
+        webp_quality: None,
+        webp_lossless: None,
         background: None,
     }
 }

@@ -137,10 +137,35 @@ pub struct ResizeQuery {
     pub enlarge: bool,
 
     /// Output encode quality (imgproxy's `q:{0-100}` processing option).
-    /// `None` lets the encoder pick its own default. Threaded through for
-    /// the concurrently-landing lossy-WebP encoding work
-    /// (`src/services/image/handler.rs`, owned by another agent).
+    /// `None` lets the encoder pick its own default
+    /// (`ImageService::DEFAULT_JPEG_QUALITY` / `DEFAULT_WEBP_QUALITY`,
+    /// `src/services/image/handler.rs`). Overridden per-format by
+    /// `jpeg_quality`/`webp_quality` below when those are set (#35) -
+    /// mirrors imgproxy's own `q` (global) vs `format_quality` (per-format)
+    /// precedence (<https://docs.imgproxy.net/usage/processing#quality>).
     pub quality: Option<u8>,
+
+    /// Per-format quality override (imgproxy's `format_quality`/`fq:{format}:
+    /// {quality}:...` processing option, #35). Takes precedence over
+    /// `quality` for JPEG output when set - see
+    /// `ImageService::process_image_blocking_with_limits`
+    /// (`src/services/image/handler.rs`) for the exact precedence.
+    pub jpeg_quality: Option<u8>,
+
+    /// Per-format quality override for WebP output - see `jpeg_quality`
+    /// above for the general shape; same precedence over `quality`.
+    pub webp_quality: Option<u8>,
+
+    /// Encode WebP losslessly instead of lossily (imgproxy's `webp_options`/
+    /// `webpo:{compression}` processing option, #35 - only the `compression`
+    /// slot is implemented, see [`crate::modules::url::options`] for why).
+    /// `None`/`Some(false)` keeps the existing lossy path
+    /// (`ImageService::encode_webp`'s `lossless` parameter); `Some(true)`
+    /// encodes losslessly and ignores `quality`/`webp_quality` entirely,
+    /// matching `encode_webp`'s own "quality is used only when lossless is
+    /// false" contract. Meaningless (silently ignored) for non-WebP output,
+    /// same as every other format-specific option in this struct.
+    pub webp_lossless: Option<bool>,
 
     /// Background colour, as an `[R, G, B]` triple (imgproxy's
     /// `background`/`bg:{R}:{G}:{B}` or `bg:{hex}` processing option, #34).

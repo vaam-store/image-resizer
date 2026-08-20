@@ -114,6 +114,9 @@ impl ParsedRequest {
             grayscale: self.options.grayscale,
             enlarge: self.options.enlarge.unwrap_or(false),
             quality: self.options.quality,
+            jpeg_quality: self.options.jpeg_quality,
+            webp_quality: self.options.webp_quality,
+            webp_lossless: self.options.webp_lossless,
             background: self.options.background,
         }
     }
@@ -152,8 +155,9 @@ mod tests {
     #[test]
     fn full_grammar_round_trips_every_capability() {
         let encoded = b64("https://example.com/img.jpg");
-        let path =
-            format!("/SIG/rs:fill:300:300/q:80/bl:5/g:true/el:1/bg:255:0:0/{encoded}.webp");
+        let path = format!(
+            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/{encoded}.webp"
+        );
         let signed = split(&path).unwrap();
         let parsed = signed.parse().unwrap();
         let query = parsed.into_resize_query();
@@ -163,6 +167,9 @@ mod tests {
         assert_eq!(query.height, Some(300));
         assert_eq!(query.resize_type, crate::models::params::ResizeType::Fill);
         assert_eq!(query.quality, Some(80));
+        assert_eq!(query.webp_quality, Some(90));
+        assert_eq!(query.webp_lossless, Some(true));
+        assert_eq!(query.jpeg_quality, None);
         assert_eq!(query.blur_sigma, Some(5.0));
         assert_eq!(query.grayscale, Some(true));
         assert!(query.enlarge);
@@ -184,6 +191,9 @@ mod tests {
             crate::models::params::ResizeType::default()
         );
         assert_eq!(query.quality, None);
+        assert_eq!(query.jpeg_quality, None);
+        assert_eq!(query.webp_quality, None);
+        assert_eq!(query.webp_lossless, None);
         assert_eq!(query.blur_sigma, None);
         assert_eq!(query.grayscale, None);
         assert!(!query.enlarge);

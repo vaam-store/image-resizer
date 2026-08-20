@@ -16,19 +16,31 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use url::Url;
 
-/// Placeholder lossy-WebP encode quality (0.0-100.0, libwebp's own scale).
-/// `ResizeQuery` (`src/models/params.rs`) now carries a real `quality:
-/// Option<u8>` field, parsed from the signed URL grammar's `q:{0-100}`
-/// processing option (#53/#27) - wiring it into the call site below instead
-/// of this placeholder is a one-line change (`ImageService::encode_webp`
-/// already accepts `quality`/`lossless` as plain parameters), just not made
-/// here since it's this file's own call to make. 82.0 is a commonly-cited
-/// "high quality, still meaningfully smaller than lossless" WebP setting.
+/// Default lossy-WebP encode quality (0.0-100.0, libwebp's own scale), used
+/// when neither `ResizeQuery::webp_quality` nor `ResizeQuery::quality` is
+/// set (#35). 82.0 is a commonly-cited "high quality, still meaningfully
+/// smaller than lossless" WebP setting, and is corroborated by
+/// `adr/0003-webp-measurement.md`'s matched-DSSIM sweep against the Kodak
+/// corpus: 82 falls between the measured q80 bucket (median WebP/JPEG size
+/// ratio 0.8497, n=23 images) and q85 bucket (0.8596, n=18), both inside the
+/// flat, no-crossover 40-85 range where WebP is consistently 15-19% smaller
+/// than JPEG at equal perceptual quality. That ADR explicitly re-checked
+/// this constant and requested no change.
 ///
 /// `pub` (like `encode_webp` itself) so `benches/encode.rs` can benchmark
 /// the exact default production uses instead of a hardcoded duplicate that
 /// could silently drift from it.
 pub const DEFAULT_WEBP_QUALITY: f32 = 82.0;
+
+/// Default JPEG encode quality (1-100, the `image` crate's own scale), used
+/// when neither `ResizeQuery::jpeg_quality` nor `ResizeQuery::quality` is
+/// set (#35). Matches `image::codecs::jpeg::JpegEncoder::new`'s own default
+/// (`image-0.25.10/src/codecs/jpeg/encoder.rs:392`, `new_with_quality(w,
+/// 75)`) - this crate's JPEG output already encoded at 75 before #35 (via
+/// `DynamicImage::write_to`'s default encoder construction), just without a
+/// named constant or a way to override it per-request. `adr/0003` measured
+/// against this exact default and requested no change to it either.
+pub const DEFAULT_JPEG_QUALITY: u8 = 75;
 
 /// Default background colour (#34) used both to flatten alpha before
 /// encoding to a format with no alpha channel, and as the fill colour for
@@ -571,11 +583,33 @@ impl ImageService {
         // for #60 that doesn't touch `Cargo.toml`: `PngEncoder` and its
         // `CompressionType`/`FilterType` enums are already part of the
         // `image` crate's own public API under the `png` feature this crate
-        // already depends on, not a new dependency. JPEG is unaffected and
-        // keeps going through `write_to` exactly as before.
+        // already depends on, not a new dependency. JPEG now uses an
+        // explicit `JpegEncoder::new_with_quality` (#35) instead of
+        // `write_to`'s implicit default-quality construction, so
+        // `params.quality`/`params.jpeg_quality` actually reach the encoder.
+        //
+        // PNG has no quality knob in `params` to honour - `CompressionType`
+        // is a fixed lossless setting, not a continuous 0-100 scale, and
+        // `fq:png:N` is rejected at parse time
+        // (`src/modules/url/options.rs`) rather than silently accepted and
+        // ignored here.
         let output_bytes = match output_format {
-            ImageFormat::WebP => Self::encode_webp(&img, DEFAULT_WEBP_QUALITY, false)
-                .context(format!("Failed to encode image to {:?}", output_format))?,
+            ImageFormat::WebP => {
+                let lossless = params.webp_lossless.unwrap_or(false);
+                // `quality` is meaningless (and unused by `encode_webp`)
+                // when `lossless` is set - see that function's own doc
+                // comment - but still resolved unconditionally here since
+                // that's simpler than threading an `Option` through just to
+                // skip computing a value nothing will read.
+                let quality = params
+                    .webp_quality
+                    .or(params.quality)
+                    .map(f32::from)
+                    .unwrap_or(DEFAULT_WEBP_QUALITY);
+
+                Self::encode_webp(&img, quality, lossless)
+                    .context(format!("Failed to encode image to {:?}", output_format))?
+            }
             ImageFormat::Png => {
                 let estimated_size = Self::estimate_output_size(&img, &output_format);
                 let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
@@ -590,18 +624,28 @@ impl ImageService {
 
                 buf.into_inner()
             }
-            _ => {
-                // Pre-allocate buffer based on estimated size - only
-                // meaningful for the `write_to` path below; the WebP path
-                // above gets its output buffer from libwebp itself.
+            ImageFormat::Jpeg => {
+                let quality = params
+                    .jpeg_quality
+                    .or(params.quality)
+                    .unwrap_or(DEFAULT_JPEG_QUALITY);
+
                 let estimated_size = Self::estimate_output_size(&img, &output_format);
                 let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
 
-                img.write_to(&mut buf, output_format)
+                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+                img.write_with_encoder(encoder)
                     .context(format!("Failed to encode image to {:?}", output_format))?;
 
                 buf.into_inner()
             }
+            // `output_format` is only ever constructed from `params.format`
+            // (`crate::models::params::ImageFormat`, three variants: `Jpg`,
+            // `Png`, `Webp`) a few lines above, so every value the `match`
+            // above doesn't already handle is unreachable in practice - kept
+            // as a hard error rather than a silent generic `write_to` fallback
+            // so a future fourth format doesn't quietly skip quality handling.
+            other => anyhow::bail!("unsupported output format {other:?}"),
         };
 
         Ok((output_bytes, content_type.to_string()))
@@ -1055,6 +1099,9 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
             background: None,
         }
     }
@@ -1972,6 +2019,9 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
             background,
         }
     }
@@ -2157,6 +2207,177 @@ mod tests {
             output.len() < 3_000,
             "expected flat-colour PNG under 3,000 bytes with Best compression, got {}",
             output.len()
+        );
+    }
+
+    // ---- #35: quality wiring (JpegEncoder::new_with_quality, encode_webp's
+    // quality/lossless parameters, per-format override, cache-key coverage
+    // for these tested separately in `src/services/cache/handler.rs`) ----
+
+    /// A lower JPEG quality must always produce a smaller (or equal, but in
+    /// practice smaller for a real photographic fixture) output than a
+    /// higher one, for the same source and dimensions - the whole point of
+    /// exposing the knob at all.
+    #[test]
+    fn jpeg_quality_changes_output_size_monotonically() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+
+        let size_at = |quality: u8| {
+            let params = ResizeQuery {
+                format: ApiImageFormat::Jpg,
+                quality: Some(quality),
+                ..query(Some(400), Some(300))
+            };
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed")
+                .0
+                .len()
+        };
+
+        let small = size_at(30);
+        let large = size_at(90);
+        assert!(
+            small < large,
+            "expected q=30 ({small} bytes) to be smaller than q=90 ({large} bytes)"
+        );
+    }
+
+    /// Same monotonicity property as `jpeg_quality_changes_output_size_monotonically`,
+    /// but through the lossy-WebP path (`Self::encode_webp`'s `quality`
+    /// parameter) instead of JPEG's.
+    #[test]
+    fn webp_quality_changes_output_size_monotonically() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+
+        let size_at = |quality: u8| {
+            let params = ResizeQuery {
+                format: ApiImageFormat::Webp,
+                quality: Some(quality),
+                ..query(Some(400), Some(300))
+            };
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed")
+                .0
+                .len()
+        };
+
+        let small = size_at(30);
+        let large = size_at(90);
+        assert!(
+            small < large,
+            "expected q=30 ({small} bytes) to be smaller than q=90 ({large} bytes)"
+        );
+    }
+
+    /// `jpeg_quality` (the `fq:jpg:{quality}` per-format override) must win
+    /// over the lower global `quality` - imgproxy's own documented
+    /// precedence for `format_quality` over `quality`.
+    #[test]
+    fn format_quality_override_beats_global_quality() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let base = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(Some(400), Some(300))
+        };
+
+        let global_low = ResizeQuery {
+            quality: Some(30),
+            ..base.clone()
+        };
+        let override_high = ResizeQuery {
+            quality: Some(30),
+            jpeg_quality: Some(90),
+            ..base
+        };
+
+        let (out_global, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &global_low, &config)
+                .expect("processing should succeed");
+        let (out_override, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &override_high, &config)
+                .expect("processing should succeed");
+
+        assert!(
+            out_override.len() > out_global.len(),
+            "expected jpeg_quality=90 ({} bytes) to override the lower global quality=30 \
+             ({} bytes), producing larger output",
+            out_override.len(),
+            out_global.len()
+        );
+    }
+
+    /// Lossless WebP (`webp_lossless: Some(true)`) must round-trip the
+    /// source pixels exactly - no resize/blur/grayscale filter applied, and
+    /// a source with no alpha channel so the #34/#60 flatten/normalise
+    /// stage is a no-op, isolating this to purely the encoder's own
+    /// lossless-ness.
+    #[test]
+    fn webp_lossless_round_trips_byte_identical_pixels() {
+        let bytes = fixtures::photo_like(); // 1920x1080, no alpha channel
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Webp,
+            webp_lossless: Some(true),
+            ..query(None, None)
+        };
+
+        let (output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        let original = image::load_from_memory(&bytes)
+            .expect("source should decode")
+            .to_rgba8();
+        let decoded = image::load_from_memory(&output)
+            .expect("lossless webp output should decode")
+            .to_rgba8();
+
+        assert_eq!(decoded.dimensions(), original.dimensions());
+        assert_eq!(
+            decoded.as_raw(),
+            original.as_raw(),
+            "lossless webp round-trip must be byte-identical to the source pixels"
+        );
+    }
+
+    /// Lossless WebP must actually take the `encode_lossless` path, not
+    /// merely happen to look identical - `lossless: Some(false)` (still
+    /// lossy) on the exact same source/dimensions must produce different
+    /// (and, for a real photographic fixture, larger) output, proving the
+    /// flag is wired through rather than a no-op that always round-trips
+    /// because e.g. quality was already 100.
+    #[test]
+    fn webp_lossless_differs_from_lossy_output() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let base = ResizeQuery {
+            format: ApiImageFormat::Webp,
+            ..query(Some(400), Some(300))
+        };
+
+        let lossy = ResizeQuery {
+            webp_lossless: Some(false),
+            ..base.clone()
+        };
+        let lossless = ResizeQuery {
+            webp_lossless: Some(true),
+            ..base
+        };
+
+        let (out_lossy, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &lossy, &config)
+                .expect("processing should succeed");
+        let (out_lossless, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &lossless, &config)
+                .expect("processing should succeed");
+
+        assert_ne!(
+            out_lossy.len(),
+            out_lossless.len(),
+            "lossy and lossless webp encodes of the same photographic source should differ in size"
         );
     }
 }
