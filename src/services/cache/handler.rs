@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 /// bytes. Now that it changes what gets encoded - both the flatten colour
 /// for alpha->no-alpha conversions and the fill colour for fully-transparent
 /// pixels when alpha is kept - two requests differing only in `background`
-/// must not collide onto a v4 key that never hashed it. v6 adds `quality`,
+/// must not collide onto a v4 key that never hashed it. v7 adds `quality`,
 /// `jpeg_quality`, `webp_quality` and `webp_lossless` (#35): `quality` was
 /// already parsed into `ResizeQuery` (from the URL grammar's `q:{0-100}`)
 /// before this change, but was never fed into `generate_key` at all - a
@@ -40,7 +40,16 @@ use sha2::{Digest, Sha256};
 /// `src/services/image/handler.rs` honour these fields, two requests
 /// differing only in quality/format-quality/losslessness must not collide
 /// onto a v5 key that never hashed any of them.
-const CACHE_KEY_VERSION: u8 = 6;
+///
+/// v7 also adds
+/// `autorotate` (#33): before this, EXIF orientation was parsed but never
+/// applied, so every request produced un-rotated output regardless of
+/// `autorotate` and the field had no effect on output bytes. Now that a
+/// non-identity source orientation changes the output whenever autorotate
+/// is on, two requests differing only in `autorotate` - or any request
+/// against a since-fixed cache entry produced before this change existed at
+/// all - must not collide onto a v5 key that never hashed it.
+const CACHE_KEY_VERSION: u8 = 7;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -147,6 +156,13 @@ impl CacheService {
             None => Self::update_field(&mut hasher, b"None"),
         }
 
+        // `autorotate` (#33, v6) changes the resize pipeline's output
+        // whenever the source carries a non-identity EXIF orientation, so
+        // it must be part of the key like every other output-affecting
+        // field - see the v6 `CACHE_KEY_VERSION` note above. Always-present
+        // (not `Option<bool>`), so no "None" bucket is needed here.
+        Self::update_field(&mut hasher, params.autorotate.to_string().as_bytes());
+
         let result = hasher.finalize();
         format!("{:}{:x}.{}", self.minio_sub_path, result, params.format)
     }
@@ -228,6 +244,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         }
     }
 
@@ -376,6 +393,37 @@ mod tests {
         );
     }
 
+    /// #33 (v6 bump): `autorotate` changes the resize pipeline's output
+    /// whenever the source has a non-identity EXIF orientation, so two
+    /// requests differing only in `autorotate` must not collide onto the
+    /// same cache key.
+    #[test]
+    fn autorotate_true_and_false_produce_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |autorotate: bool| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
+            background: None,
+            autorotate,
+        };
+
+        assert_ne!(
+            cache.generate_key(&base(true)),
+            cache.generate_key(&base(false))
+        );
+    }
+
     /// #34/#60 (v5 bump): `background` changes the resize pipeline's output
     /// bytes (flatten/normalise colour), so distinct backgrounds - and the
     /// unset ("use the default") case - must not collide onto the same
@@ -398,6 +446,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background,
+            autorotate: true,
         };
 
         let keys: HashSet<String> = [None, Some([255, 255, 255]), Some([0, 0, 0]), Some([1, 2, 3])]
@@ -433,6 +482,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         };
 
         let keys: HashSet<String> = [None, Some(30), Some(75), Some(90)]
@@ -469,6 +519,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         };
 
         let global_only = cache.generate_key(&base(Some(80), None));
@@ -512,6 +563,7 @@ mod tests {
             webp_quality: None,
             webp_lossless,
             background: None,
+            autorotate: true,
         };
 
         let keys: HashSet<String> = [None, Some(false), Some(true)]
@@ -552,6 +604,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         };
 
         let keys: HashSet<String> = [

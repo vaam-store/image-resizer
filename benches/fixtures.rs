@@ -192,6 +192,111 @@ pub fn photo_like_sized(width: u32, height: u32, format: ImageFormat) -> Vec<u8>
     })
 }
 
+pub const ORIENTED_W: u32 = 120;
+pub const ORIENTED_H: u32 = 80;
+/// Marker block side length, in canonical (already-upright) pixels - well
+/// inside both the marker and background regions, so sampling a few pixels
+/// in from any edge lands solidly in one colour even after JPEG's lossy
+/// compression and any resize filtering a test applies on top.
+const ORIENTED_MARKER: u32 = 20;
+
+/// Canonical (already-upright) marker image used to build the EXIF-
+/// orientation fixtures below (#33): a deliberately non-square `W`x`H`
+/// image (so a 90/270-degree rotation bug shows up as a dimension swap, not
+/// just a same-shape pixel mismatch) with a solid red marker block in its
+/// top-left corner and solid blue everywhere else - "upright" here means
+/// exactly this layout.
+pub fn oriented_canonical() -> RgbImage {
+    ImageBuffer::from_fn(ORIENTED_W, ORIENTED_H, |x, y| {
+        if x < ORIENTED_MARKER && y < ORIENTED_MARKER {
+            Rgb([220, 30, 30]) // marker: red
+        } else {
+            Rgb([30, 30, 220]) // background: blue
+        }
+    })
+}
+
+/// Builds a minimal, valid Exif TIFF blob - the `APP1` payload *minus* the
+/// leading `"Exif\0\0"` marker, which `JpegEncoder::set_exif_metadata`
+/// prepends itself (image-0.25.10 `src/codecs/jpeg/encoder.rs::write_exif`)
+/// and the decode-side `zune-jpeg` strips back off before handing the
+/// remainder to `Orientation::from_exif_chunk` (`zune-jpeg-0.5.15`
+/// `src/headers.rs::parse_app1`) - containing exactly one IFD0 entry: the
+/// Orientation tag (`0x0112`, TIFF type 3/SHORT, count 1) set to
+/// `exif_orientation` (the standard 1-8 EXIF orientation code). Byte layout
+/// mirrors exactly what `Orientation::from_exif_chunk`'s
+/// `locate_orientation_entry` helper (image-0.25.10 `src/metadata.rs`)
+/// parses: little-endian TIFF header, one directory entry, no next-IFD.
+fn minimal_exif_orientation(exif_orientation: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(26);
+    buf.extend_from_slice(b"II"); // little-endian byte order
+    buf.extend_from_slice(&42u16.to_le_bytes()); // TIFF magic
+    buf.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset (right after this 8-byte header)
+    buf.extend_from_slice(&1u16.to_le_bytes()); // 1 directory entry
+    buf.extend_from_slice(&0x0112u16.to_le_bytes()); // tag: Orientation
+    buf.extend_from_slice(&3u16.to_le_bytes()); // type: SHORT
+    buf.extend_from_slice(&1u32.to_le_bytes()); // count: 1
+    buf.extend_from_slice(&u16::from(exif_orientation).to_le_bytes()); // value (low 2 bytes of the 4-byte value field)
+    buf.extend_from_slice(&0u16.to_le_bytes()); // padding (high 2 bytes of the value field)
+    buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD offset: none
+    buf
+}
+
+/// A JPEG fixture whose *stored* pixel data is the algebraic inverse of
+/// [`oriented_canonical`]'s transform for EXIF orientation `exif_orientation`
+/// (1-8), tagged with that orientation in its Exif `Orientation` field -
+/// exactly how a real camera's sensor output plus its orientation sensor
+/// reading works: the pixels are stored however the sensor happened to be
+/// held, and the tag says how to correct them for display.
+///
+/// Correctly decoding + autorotating this fixture must reproduce
+/// `oriented_canonical()` exactly, dimensions included (orientations 5-8
+/// swap width and height). The inverse per code is derived directly from
+/// `DynamicImage::apply_orientation`'s own match arms (image-0.25.10
+/// `src/images/dynimage.rs:1161-1179`):
+///
+/// | code | `apply_orientation` forward transform | inverse used to build `stored` |
+/// |------|----------------------------------------|-------------------------------|
+/// | 1    | identity                                | identity                      |
+/// | 2    | `fliph`                                 | `fliph` (self-inverse)        |
+/// | 3    | `rotate180`                             | `rotate180` (self-inverse)    |
+/// | 4    | `flipv`                                 | `flipv` (self-inverse)        |
+/// | 5    | `fliph(rotate90(x))`                    | `rotate270(fliph(x))`         |
+/// | 6    | `rotate90(x)`                           | `rotate270(x)`                |
+/// | 7    | `fliph(rotate270(x))`                   | `rotate90(fliph(x))`          |
+/// | 8    | `rotate270(x)`                          | `rotate90(x)`                 |
+///
+/// so this is a from-first-principles inverse of the exact production
+/// transform, not a round-trip through it.
+pub fn oriented(exif_orientation: u8) -> Vec<u8> {
+    cached(&format!("oriented_{exif_orientation}.jpg"), || {
+        let canonical = DynamicImage::ImageRgb8(oriented_canonical());
+        let stored = match exif_orientation {
+            1 => canonical,
+            2 => canonical.fliph(),
+            3 => canonical.rotate180(),
+            4 => canonical.flipv(),
+            5 => canonical.fliph().rotate270(),
+            6 => canonical.rotate270(),
+            7 => canonical.fliph().rotate90(),
+            8 => canonical.rotate90(),
+            other => panic!("unsupported EXIF orientation value {other} (expected 1-8)"),
+        };
+
+        use image::ImageEncoder;
+
+        let mut buf = Cursor::new(Vec::new());
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut buf);
+        encoder
+            .set_exif_metadata(minimal_exif_orientation(exif_orientation))
+            .expect("JpegEncoder supports Exif metadata");
+        stored
+            .write_with_encoder(encoder)
+            .expect("fixture encoding should never fail");
+        buf.into_inner()
+    })
+}
+
 /// content-type for a fixture identified by name, as served by the
 /// `benchmark` bin's local origin server and used to pick a decode/encode
 /// extension in tests.

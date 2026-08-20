@@ -118,6 +118,7 @@ impl ParsedRequest {
             webp_quality: self.options.webp_quality,
             webp_lossless: self.options.webp_lossless,
             background: self.options.background,
+            autorotate: self.options.autorotate.unwrap_or(true),
         }
     }
 }
@@ -155,8 +156,10 @@ mod tests {
     #[test]
     fn full_grammar_round_trips_every_capability() {
         let encoded = b64("https://example.com/img.jpg");
+        // Exercises every option the grammar accepts in one path, so a new
+        // option that silently fails to round-trip shows up here.
         let path = format!(
-            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/{encoded}.webp"
+            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/ar:0/{encoded}.webp"
         );
         let signed = split(&path).unwrap();
         let parsed = signed.parse().unwrap();
@@ -175,6 +178,7 @@ mod tests {
         assert!(query.enlarge);
         assert_eq!(query.format, ImageFormat::Webp);
         assert_eq!(query.background, Some([255, 0, 0]));
+        assert!(!query.autorotate, "ar:0 in the URL must disable autorotate");
     }
 
     #[test]
@@ -198,6 +202,10 @@ mod tests {
         assert_eq!(query.grayscale, None);
         assert!(!query.enlarge);
         assert_eq!(query.background, None);
+        assert!(
+            query.autorotate,
+            "autorotate must default to true when no `ar` segment is present"
+        );
     }
 
     #[test]

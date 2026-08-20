@@ -26,6 +26,7 @@ fn bench_cache_key(c: &mut Criterion) {
         webp_quality: None,
         webp_lossless: None,
         background: None,
+        autorotate: true,
     };
 
     c.bench_function("cache_key/generate_key", |b| {

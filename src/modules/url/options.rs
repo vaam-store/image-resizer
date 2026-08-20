@@ -35,6 +35,12 @@ pub struct ProcessingOptions {
     /// [`crate::models::params::ResizeQuery::background`] for how it's
     /// consumed.
     pub background: Option<[u8; 3]>,
+    /// `ar`'s parsed boolean (#33) - see
+    /// [`crate::models::params::ResizeQuery::autorotate`]. `None` means
+    /// "use the default", which is `true` (autorotate stays on) unlike
+    /// every other `Option<bool>` field here - see `ResizeQuery::autorotate`'s
+    /// own doc comment for why.
+    pub autorotate: Option<bool>,
 }
 
 /// A processing-option path segment always contains a `:` (`rs:fill:300:300`,
@@ -169,6 +175,17 @@ impl ProcessingOptions {
                 // argument shapes.
                 "bg" => {
                     opts.background = Some(parse_background(&args, segment)?);
+                }
+                // ar:{0|1|true|false} - imgproxy's `auto_rotate`/`ar`
+                // processing option (#33,
+                // <https://docs.imgproxy.net/usage/processing#auto-rotate>):
+                // rotates/flips the decoded image per its EXIF orientation
+                // tag before any resize happens. Carried through to
+                // `ResizeQuery::autorotate`, defaulting to `true` when this
+                // segment is absent (see that field's doc comment).
+                "ar" => {
+                    let [value] = require_args::<1>(&args, segment)?;
+                    opts.autorotate = Some(parse_bool(value, segment)?);
                 }
                 other => return Err(UrlParseError::UnknownOption(other.to_string())),
             }
@@ -483,6 +500,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_autorotate() {
+        assert_eq!(
+            ProcessingOptions::parse(&["ar:1"]).unwrap().autorotate,
+            Some(true)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["ar:0"]).unwrap().autorotate,
+            Some(false)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["ar:true"]).unwrap().autorotate,
+            Some(true)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["ar:false"]).unwrap().autorotate,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn autorotate_defaults_to_none_when_absent() {
+        let opts = ProcessingOptions::parse(&[]).unwrap();
+        assert_eq!(opts.autorotate, None);
+    }
+
+    #[test]
     fn combines_multiple_options() {
         let opts = ProcessingOptions::parse(&[
             "rs:fill:300:300",
@@ -493,6 +536,7 @@ mod tests {
             "g:true",
             "el:1",
             "bg:255:0:0",
+            "ar:0",
         ])
         .unwrap();
         assert_eq!(opts.width, Some(300));
@@ -505,6 +549,7 @@ mod tests {
         assert_eq!(opts.grayscale, Some(true));
         assert_eq!(opts.enlarge, Some(true));
         assert_eq!(opts.background, Some([255, 0, 0]));
+        assert_eq!(opts.autorotate, Some(false));
     }
 
     #[test]
