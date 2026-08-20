@@ -16,6 +16,17 @@
 # `docker pull rust:1 && docker inspect rust:1 --format='{{index .RepoDigests 0}}'`.
 FROM rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 as builder
 
+# nasm is required by mozjpeg-sys (#63 stage 2) to build libjpeg-turbo's
+# x86_64 SIMD paths. It is NOT needed on aarch64, which uses its own NEON
+# path — but CI builds linux/amd64 as well as arm64, so it must be present
+# unconditionally. Without it the amd64 build either fails or silently falls
+# back to scalar C, which would quietly give up most of the 2.2x scaled-decode
+# win this dependency was added for.
+# DL3008 (pin apt versions) is ignored repo-wide in .hadolint.yaml.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends nasm \
+  && rm -rf /var/lib/apt/lists/*
+
 ENV APP_NAME=emgr
 
 WORKDIR /app

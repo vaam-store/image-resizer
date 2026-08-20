@@ -15,6 +15,7 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::warn;
 use url::Url;
 
 /// Default lossy-WebP encode quality (0.0-100.0, libwebp's own scale), used
@@ -425,7 +426,7 @@ impl ImageService {
         Self::check_source_resolution(src_width, src_height, config.max_src_resolution_mp)?;
 
         let (mut img, orientation, icc_profile) =
-            Self::decode_with_limits(image_bytes, format, config.max_src_resolution_mp)?;
+            Self::decode_with_limits(image_bytes, format, config.max_src_resolution_mp, params)?;
 
         // #33: autorotate (imgproxy's `auto_rotate`/`ar` option, on by
         // default - see `ResizeQuery::autorotate`) must be applied *before*
@@ -1029,6 +1030,41 @@ impl ImageService {
             .context("Failed to read image dimensions")
     }
 
+    /// Decodes `image_bytes`, enforcing every guard `decode_with_image_crate`
+    /// carries, with one addition (#63 stage 2): for JPEG, tries a DCT-scaled
+    /// decode through mozjpeg/libjpeg-turbo first, which can decode directly
+    /// at a fraction of the source resolution instead of always decoding
+    /// full-size and discarding most of the data during resize - see
+    /// `decode_jpeg_scaled`'s doc comment for the measured win. PNG and WebP
+    /// are untouched, always going straight to `decode_with_image_crate`.
+    ///
+    /// If the mozjpeg path fails for any reason - including a caught panic,
+    /// see `mozjpeg_decode` - this falls back to `decode_with_image_crate`
+    /// (the exact same full-decode path every non-JPEG format already uses)
+    /// rather than failing the request outright (#4), logging a warning so a
+    /// real regression in the mozjpeg path stays visible instead of quietly
+    /// becoming the normal path for every request.
+    fn decode_with_limits(
+        image_bytes: &[u8],
+        format: Option<ImageFormat>,
+        max_src_resolution_mp: u64,
+        params: &ResizeQuery,
+    ) -> Result<(image::DynamicImage, Orientation, Option<Vec<u8>>)> {
+        if format == Some(ImageFormat::Jpeg) {
+            match Self::decode_jpeg_scaled(image_bytes, max_src_resolution_mp, params) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "mozjpeg scaled JPEG decode failed; falling back to full image-crate decode"
+                    );
+                }
+            }
+        }
+
+        Self::decode_with_image_crate(image_bytes, format, max_src_resolution_mp)
+    }
+
     /// Decodes `image_bytes` with explicit `image::Limits` derived from
     /// `max_src_resolution_mp`, instead of inheriting the crate's
     /// accidental 512MiB `max_alloc` default (#26). This is defense in
@@ -1044,7 +1080,11 @@ impl ImageService {
     /// failing the whole request) if it can't be read - a source with
     /// malformed EXIF should still decode and process, just without
     /// autorotation.
-    fn decode_with_limits(
+    ///
+    /// This is the only decode path for PNG/WebP, and the fallback path for
+    /// JPEG when `decode_jpeg_scaled` (#63 stage 2) fails - see
+    /// `decode_with_limits`.
+    fn decode_with_image_crate(
         image_bytes: &[u8],
         format: Option<ImageFormat>,
         max_src_resolution_mp: u64,
@@ -1077,6 +1117,294 @@ impl ImageService {
 
         let img = image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
         Ok((img, orientation, icc_profile))
+    }
+
+    /// JPEG-only DCT-scaled decode via mozjpeg/libjpeg-turbo (#63 stage 2):
+    /// decodes directly at a reduced resolution using libjpeg's native
+    /// `scale_num/8` support, instead of always decoding at full resolution
+    /// and discarding most of the data during resize. This is the large-
+    /// downscale path that drove the p90/p99 gap against imgproxy (see the
+    /// #63 issue thread) - measured 58.03ms (full decode + resize) vs
+    /// 26.21ms (1/8-scale decode + resize) for a 4K source to a 200x113
+    /// thumbnail, 2.21x.
+    ///
+    /// Every guard `decode_with_image_crate` carries is preserved here too.
+    /// An `image`-crate `ImageDecoder` is always opened first, purely to
+    /// read the header:
+    /// - #26's allocation guard (`Limits::reserve` against
+    ///   `decoder.total_bytes()`) is applied to it before any pixel data is
+    ///   decoded through *either* decoder below. (#26's *resolution* check
+    ///   itself already ran in the caller, against the header-peeked
+    ///   dimensions, before `decode_with_limits` is ever reached - not
+    ///   repeated here.)
+    /// - #33's EXIF orientation and ICC profile are read off it too.
+    ///
+    /// If `select_jpeg_dct_scale` decides no DCT reduction is safe/useful
+    /// for this request (`scale_num == 8`), this decoder is then reused
+    /// directly for the actual pixel decode - the exact same
+    /// `image::DynamicImage::from_decoder` call `decode_with_image_crate`
+    /// makes - rather than opening mozjpeg for zero benefit and risking a
+    /// gratuitous pixel-value difference from a second decoder's rounding.
+    /// Only when a real DCT scale is chosen does this drop the `image`-crate
+    /// decoder and hand off to mozjpeg. See `select_jpeg_dct_scale` for how
+    /// the scale factor itself is chosen - the "never decode smaller than
+    /// the target" requirement lives there.
+    fn decode_jpeg_scaled(
+        image_bytes: &[u8],
+        max_src_resolution_mp: u64,
+        params: &ResizeQuery,
+    ) -> Result<(DynamicImage, Orientation, Option<Vec<u8>>)> {
+        let mut reader = Self::make_reader(image_bytes, Some(ImageFormat::Jpeg))?;
+        let limits = Self::build_decode_limits(max_src_resolution_mp);
+        reader.limits(limits.clone());
+
+        let mut decoder = reader
+            .into_decoder()
+            .context("Failed to construct image decoder for header read")?;
+
+        // Same allocation guard as `decode_with_image_crate` - see that
+        // function's doc comment. Applied here even though this decoder
+        // never decodes a pixel: it's the cheapest possible place to keep
+        // the guard, and keeps this path's defense-in-depth identical to
+        // the fallback's.
+        let mut reserved_limits = limits;
+        reserved_limits
+            .reserve(decoder.total_bytes())
+            .context("Failed to decode image")?;
+        decoder
+            .set_limits(reserved_limits)
+            .context("Failed to decode image")?;
+
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        let icc_profile = decoder.icc_profile().ok().flatten();
+        let (header_width, header_height) = decoder.dimensions();
+
+        // `Orientation::Rotate90`/`Rotate270`/`Rotate90FlipH`/`Rotate270FlipH`
+        // swap width and height when applied (see `DynamicImage::apply_orientation`,
+        // image-0.25.10 `src/images/dynimage.rs:1161-1179`) - mirrored here
+        // via `axis_swap` so every dimension computed below is in the same
+        // axis space the *real* resize stage will see. Gated on
+        // `params.autorotate`: when it's off, orientation is never applied
+        // (see the call site in `process_image_blocking_with_limits`), so
+        // the image stays in its raw axes regardless of what the EXIF tag
+        // says.
+        let axis_swap = params.autorotate
+            && matches!(
+                orientation,
+                Orientation::Rotate90
+                    | Orientation::Rotate270
+                    | Orientation::Rotate90FlipH
+                    | Orientation::Rotate270FlipH
+            );
+
+        // The dimensions the resize stage will actually see, i.e. what
+        // `img.dimensions()` reports right after `apply_orientation` in
+        // `process_image_blocking_with_limits` (that call site's own
+        // `src_width`/`src_height`).
+        let (post_orientation_width, post_orientation_height) = if axis_swap {
+            (header_height, header_width)
+        } else {
+            (header_width, header_height)
+        };
+
+        let (target_width, target_height) = Self::effective_resize_target(
+            post_orientation_width,
+            post_orientation_height,
+            params,
+        );
+
+        // Map the target back into the JPEG's raw (pre-rotation) axis space:
+        // mozjpeg's `scale()` operates on the raw raster as stored in the
+        // file, before any EXIF rotation - that correction happens
+        // afterwards, in Rust, exactly as it already did before this change
+        // (`img.apply_orientation(orientation)` in
+        // `process_image_blocking_with_limits`).
+        let (raw_target_width, raw_target_height) = if axis_swap {
+            (target_height, target_width)
+        } else {
+            (target_width, target_height)
+        };
+
+        let scale_num = Self::select_jpeg_dct_scale(
+            header_width,
+            header_height,
+            raw_target_width,
+            raw_target_height,
+        );
+
+        // `scale_num == 8` means no DCT reduction is safe/useful for this
+        // request (either no resize was requested at all, or the requested
+        // output is close enough to source resolution that even the
+        // gentlest 1/2 scale would decode below target) - mozjpeg would buy
+        // nothing here, so decode through the already-open `image`-crate
+        // decoder instead of opening a second decoder over the same bytes.
+        // This also keeps output byte-for-byte identical to
+        // `decode_with_image_crate` for every request that isn't actually
+        // downscaling, rather than introducing a second JPEG decoder's
+        // slightly different IDCT/chroma-upsampling rounding into a path
+        // that was never going to benefit from mozjpeg anyway.
+        if scale_num == 8 {
+            let img =
+                image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
+            return Ok((img, orientation, icc_profile));
+        }
+        drop(decoder);
+
+        let img = Self::mozjpeg_decode(image_bytes, scale_num)?;
+
+        Ok((img, orientation, icc_profile))
+    }
+
+    /// Predicts the exact target dimensions the resize stage in
+    /// `process_image_blocking_with_limits` (its `effective_width`/
+    /// `effective_height` computation and the `Fit`/`Fill`/`Force`/`Auto`
+    /// match right after it) will compute for a decoded (and, if
+    /// `params.autorotate` is set, already-rotated) image of
+    /// `src_width x src_height` - the #36 upscale guard and every resize-type
+    /// branch, reproduced verbatim from that call site, sharing the same
+    /// `resize_dimensions` aspect-ratio helper so the two can't drift on the
+    /// underlying arithmetic.
+    ///
+    /// Exists so `decode_jpeg_scaled` (#63 stage 2) can pick a DCT scale
+    /// *before* decoding, without duplicating the real resize call itself.
+    /// If this function and the real resize stage are ever changed
+    /// independently of each other, `decode_jpeg_scaled` could end up
+    /// picking a scale that decodes below what the real resize needs -
+    /// violating the "never decode smaller than target" requirement - so
+    /// keep them in sync.
+    fn effective_resize_target(src_width: u32, src_height: u32, params: &ResizeQuery) -> (u32, u32) {
+        let effective_width = params
+            .width
+            .map(|w| if params.enlarge { w } else { w.min(src_width) });
+        let effective_height = params
+            .height
+            .map(|h| if params.enlarge { h } else { h.min(src_height) });
+
+        match (effective_width, effective_height) {
+            (Some(w), None) => Self::resize_dimensions(src_width, src_height, w, u32::MAX, false),
+            (None, Some(h)) => Self::resize_dimensions(src_width, src_height, u32::MAX, h, false),
+            (Some(w), Some(h)) => match params.resize_type {
+                ResizeType::Fit => Self::resize_dimensions(src_width, src_height, w, h, false),
+                // `Fill` resizes to the *intermediate* (pre-crop) cover size
+                // before cropping down to exactly `w x h` (see
+                // `fir_resize_to_fill`) - that intermediate size, not the
+                // final `w x h` box, is the real minimum decode requirement:
+                // decoding only as small as the post-crop box would force
+                // the intermediate resize step to upscale back up.
+                ResizeType::Fill => Self::resize_dimensions(src_width, src_height, w, h, true),
+                ResizeType::Force => (w.max(1), h.max(1)),
+                ResizeType::Auto => {
+                    let src_landscape = src_width >= src_height;
+                    let dst_landscape = w >= h;
+                    Self::resize_dimensions(
+                        src_width,
+                        src_height,
+                        w,
+                        h,
+                        src_landscape == dst_landscape,
+                    )
+                }
+            },
+            // No resize requested at all - the decoded image is the output,
+            // so nothing smaller than full resolution is safe.
+            (None, None) => (src_width, src_height),
+        }
+    }
+
+    /// Picks the most aggressive libjpeg DCT scale (`scale_num/8`, see
+    /// `mozjpeg::Decompress::scale`) whose decoded output is still `>=` the
+    /// requested target in *both* dimensions - i.e. the smallest safe
+    /// decode. Never returns a scale that would decode smaller than
+    /// `target_width`/`target_height`: doing so would force
+    /// `fast_image_resize` to upscale back up before its final downscale,
+    /// destroying quality for no benefit (the whole point of this function).
+    ///
+    /// libjpeg-turbo supports any `scale_num` in 1..=16 (any N/8), but only
+    /// the well-known fractions are tried here - 1/8, 1/4, 1/2, and 8/8 (no
+    /// scaling) - the useful ratios for shrink-on-load per #63 stage 2.
+    /// Tried from most to least aggressive, so the first match is the
+    /// smallest valid decode; falls through to 8 (full resolution, i.e. no
+    /// DCT scaling at all) if even 1/2 would decode below target - which is
+    /// always the outcome when no resize was requested at all, since
+    /// `effective_resize_target`'s `(None, None)` branch sets the target to
+    /// the full source size.
+    fn select_jpeg_dct_scale(
+        raw_width: u32,
+        raw_height: u32,
+        target_width: u32,
+        target_height: u32,
+    ) -> u8 {
+        for scale_num in [1u8, 2, 4] {
+            let scaled_width = Self::mozjpeg_scaled_dimension(raw_width, scale_num);
+            let scaled_height = Self::mozjpeg_scaled_dimension(raw_height, scale_num);
+            if scaled_width >= target_width && scaled_height >= target_height {
+                return scale_num;
+            }
+        }
+        8
+    }
+
+    /// Reproduces libjpeg's own output-size formula for a scaled decode -
+    /// `jdiv_round_up(dim * scale_num, 8)` (`jdiv_round_up` in libjpeg-turbo's
+    /// `jutils.c`, used by `jdmaster.c`'s `jinit_master_decompress` to set
+    /// `output_width`/`output_height`) - exactly, so this prediction matches
+    /// what `Decompress::scale` will actually produce.
+    fn mozjpeg_scaled_dimension(dim: u32, scale_num: u8) -> u32 {
+        ((u64::from(dim) * u64::from(scale_num) + 7) / 8) as u32
+    }
+
+    /// Runs the actual mozjpeg/libjpeg-turbo pixel decode at `scale_num/8`
+    /// scale, producing an `Rgb8` `DynamicImage`.
+    ///
+    /// Wrapped in `catch_unwind`: mozjpeg's error manager (see the
+    /// `mozjpeg` crate's `errormgr.rs::unwind_error_exit`, which this crate
+    /// vendors as a dependency but does not modify) deliberately *unwinds*
+    /// on a fatal libjpeg error rather than returning an `Err` - upstream's
+    /// documented behaviour, not a bug. Left uncaught, that panic would
+    /// bypass `decode_jpeg_scaled`'s `Result`-based error handling entirely
+    /// and skip straight past the graceful-fallback path #4 requires.
+    /// `catch_unwind` turns it into a normal `Err` here so a malformed or
+    /// hostile JPEG that trips it falls back to `decode_with_image_crate`
+    /// exactly like any other mozjpeg failure - `Cargo.toml`'s
+    /// `panic = "unwind"` (kept specifically for #29, decoding untrusted
+    /// input) is what makes this catchable at all, rather than aborting the
+    /// process. `AssertUnwindSafe` is sound here: `image_bytes` is a shared
+    /// `&[u8]` with no interior mutability to leave torn, and `scale_num` is
+    /// `Copy`.
+    fn mozjpeg_decode(image_bytes: &[u8], scale_num: u8) -> Result<DynamicImage> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::mozjpeg_decode_inner(image_bytes, scale_num)
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "mozjpeg panicked with a non-string payload".to_string());
+            Err(anyhow::anyhow!("mozjpeg decode panicked: {msg}"))
+        })
+    }
+
+    fn mozjpeg_decode_inner(image_bytes: &[u8], scale_num: u8) -> Result<DynamicImage> {
+        let mut decompress = mozjpeg::Decompress::new_mem(image_bytes)
+            .context("mozjpeg: failed to read JPEG header")?;
+        decompress.scale(scale_num);
+
+        let mut started = decompress
+            .rgb()
+            .context("mozjpeg: failed to start decompression")?;
+        let width = started.width() as u32;
+        let height = started.height() as u32;
+        let pixels: Vec<u8> = started
+            .read_scanlines()
+            .context("mozjpeg: failed to read scanlines")?;
+        started
+            .finish()
+            .context("mozjpeg: failed to finish decompression")?;
+
+        image::RgbImage::from_raw(width, height, pixels)
+            .map(DynamicImage::ImageRgb8)
+            .context("mozjpeg: decoded pixel buffer size did not match reported dimensions")
     }
 
     /// Explicit decode limits derived from the configured max source
@@ -1258,6 +1586,215 @@ mod tests {
         let img = image::DynamicImage::new_rgb8(1, 1);
         let size = ImageService::estimate_output_size(&img, &ImageFormat::Png);
         assert_eq!(size, 4);
+    }
+
+    // ---- #63 stage 2: mozjpeg DCT-scaled decode ----
+
+    /// `mozjpeg_scaled_dimension` must reproduce libjpeg's own
+    /// `jdiv_round_up(dim * scale_num, 8)` ceiling formula exactly, or the
+    /// scale planner in `select_jpeg_dct_scale` could mispredict what
+    /// `Decompress::scale` actually produces.
+    #[test]
+    fn mozjpeg_scaled_dimension_matches_libjpeg_ceil_formula() {
+        // 1/8 scale of 3840 is an exact 480, no rounding involved.
+        assert_eq!(ImageService::mozjpeg_scaled_dimension(3840, 1), 480);
+        // 1/4 and 1/2 of the same source.
+        assert_eq!(ImageService::mozjpeg_scaled_dimension(3840, 2), 960);
+        assert_eq!(ImageService::mozjpeg_scaled_dimension(3840, 4), 1920);
+        // Full resolution (8/8) is a no-op.
+        assert_eq!(ImageService::mozjpeg_scaled_dimension(3840, 8), 3840);
+        // A dimension libjpeg's ceiling rounds up rather than truncates:
+        // 1000 * 1 / 8 = 125.0 exactly, but 1001 * 1 / 8 = 125.125, which
+        // must round *up* to 126, not truncate to 125.
+        assert_eq!(ImageService::mozjpeg_scaled_dimension(1001, 1), 126);
+        // Degenerate 1px source must never round down to 0.
+        assert_eq!(ImageService::mozjpeg_scaled_dimension(1, 1), 1);
+    }
+
+    /// For a large source and a small target, `select_jpeg_dct_scale` must
+    /// pick the most aggressive (smallest numerator) scale that still meets
+    /// the target - this is the entire performance win of #63 stage 2.
+    #[test]
+    fn select_jpeg_dct_scale_picks_most_aggressive_safe_reduction() {
+        // 3840x2160 (4K) -> 200x113 thumbnail: even 1/8 scale (480x270)
+        // comfortably covers the target, so the most aggressive scale wins.
+        assert_eq!(ImageService::select_jpeg_dct_scale(3840, 2160, 200, 113), 1);
+
+        // A target that only 1/4 scale (960x540), not 1/8 (480x270), can
+        // cover.
+        assert_eq!(ImageService::select_jpeg_dct_scale(3840, 2160, 700, 400), 2);
+
+        // A target only 1/2 scale (1920x1080) can cover.
+        assert_eq!(
+            ImageService::select_jpeg_dct_scale(3840, 2160, 1800, 1000),
+            4
+        );
+
+        // A target close to full source resolution - no scale below full
+        // (8) is safe.
+        assert_eq!(
+            ImageService::select_jpeg_dct_scale(3840, 2160, 3800, 2140),
+            8
+        );
+
+        // No resize at all (target == source, `effective_resize_target`'s
+        // `(None, None)` case) must never scale down.
+        assert_eq!(
+            ImageService::select_jpeg_dct_scale(3840, 2160, 3840, 2160),
+            8
+        );
+    }
+
+    /// Property check standing in for an exhaustive one: across a spread of
+    /// source/target combinations, the scale `select_jpeg_dct_scale` picks
+    /// must never decode smaller than the target in either axis - the exact
+    /// safety requirement #63 stage 2 depends on (decoding below target
+    /// would force `fast_image_resize` to upscale back up before its final
+    /// downscale, destroying quality for no benefit).
+    #[test]
+    fn select_jpeg_dct_scale_never_decodes_below_target() {
+        let sources = [(320, 240), (1920, 1080), (3840, 2160), (7000, 5000)];
+        let target_fractions = [1, 2, 3, 5, 7, 8];
+
+        for (raw_w, raw_h) in sources {
+            for &num in &target_fractions {
+                let target_w = raw_w * num / 8;
+                let target_h = raw_h * num / 8;
+                let scale = ImageService::select_jpeg_dct_scale(raw_w, raw_h, target_w, target_h);
+
+                let scaled_w = ImageService::mozjpeg_scaled_dimension(raw_w, scale);
+                let scaled_h = ImageService::mozjpeg_scaled_dimension(raw_h, scale);
+
+                assert!(
+                    scaled_w >= target_w && scaled_h >= target_h,
+                    "source {raw_w}x{raw_h}, target {target_w}x{target_h}: chosen scale {scale}/8 \
+                     decoded to {scaled_w}x{scaled_h}, which is smaller than the target in at \
+                     least one axis"
+                );
+            }
+        }
+    }
+
+    /// `effective_resize_target` must mirror the real resize stage's own
+    /// `Fit`/`Fill` target math (`resize_dimensions` with `fill: false`/
+    /// `true` respectively) - this pins the two together so they can't
+    /// silently drift, which is the entire correctness argument for using
+    /// this function to plan a DCT scale ahead of decode.
+    #[test]
+    fn effective_resize_target_matches_resize_dimensions_for_fit_and_fill() {
+        let params_fit = query_with_type(Some(800), Some(600), ResizeType::Fit);
+        assert_eq!(
+            ImageService::effective_resize_target(1920, 1080, &params_fit),
+            ImageService::resize_dimensions(1920, 1080, 800, 600, false)
+        );
+
+        let params_fill = query_with_type(Some(800), Some(600), ResizeType::Fill);
+        assert_eq!(
+            ImageService::effective_resize_target(1920, 1080, &params_fill),
+            ImageService::resize_dimensions(1920, 1080, 800, 600, true)
+        );
+
+        // `Force` ignores aspect ratio entirely - exact target, not a
+        // `resize_dimensions` call.
+        let params_force = query_with_type(Some(800), Some(600), ResizeType::Force);
+        assert_eq!(
+            ImageService::effective_resize_target(1920, 1080, &params_force),
+            (800, 600)
+        );
+
+        // No resize requested - the full source is the target, so no DCT
+        // scale should ever be selected against it.
+        let params_none = query(None, None);
+        assert_eq!(
+            ImageService::effective_resize_target(1920, 1080, &params_none),
+            (1920, 1080)
+        );
+    }
+
+    /// The #36 upscale guard must still apply inside the DCT-scale planner:
+    /// requesting an output larger than the source, with `enlarge` left at
+    /// its default `false`, must predict a target capped at the source
+    /// resolution - never a target that would make `select_jpeg_dct_scale`
+    /// think a smaller-than-source decode is unsafe when it's actually fine.
+    #[test]
+    fn effective_resize_target_honours_the_upscale_guard() {
+        let params = query(Some(5000), Some(5000));
+        assert_eq!(
+            ImageService::effective_resize_target(1920, 1080, &params),
+            (1920, 1080),
+            "expected the target capped at the source resolution, matching the #36 guard"
+        );
+    }
+
+    /// `mozjpeg_decode` wraps the actual libjpeg-turbo call in
+    /// `catch_unwind` because mozjpeg's error manager unwinds (panics) on a
+    /// fatal libjpeg error rather than returning `Err` (see that function's
+    /// doc comment) - bytes with no valid JPEG SOI marker at all trip
+    /// exactly this path (libjpeg's `read_markers` calls `ERREXIT` for "Not
+    /// a JPEG file" unconditionally, not gated behind the `require_image`
+    /// flag `Decompress::read_header` otherwise relies on). This must come
+    /// back as a normal `Err`, not tear down the test process - proving the
+    /// safety net #4 depends on (graceful fallback rather than a panic
+    /// escaping past `decode_jpeg_scaled`) actually works, not just that it
+    /// compiles.
+    #[test]
+    fn mozjpeg_decode_returns_err_instead_of_panicking_on_non_jpeg_bytes() {
+        let garbage = vec![0u8; 256];
+        let result = ImageService::mozjpeg_decode(&garbage, 8);
+        assert!(
+            result.is_err(),
+            "expected a graceful Err for non-JPEG bytes, not a panic or success"
+        );
+    }
+
+    /// End-to-end: a corrupt-but-JPEG-tagged source (valid SOI marker so
+    /// `detect_format_from_bytes` picks the JPEG path, garbage after it)
+    /// must still surface as a clean `Err` from the full pipeline entry
+    /// point - covering both `decode_jpeg_scaled`'s own early failure (its
+    /// header-only `image`-crate read also can't parse this) and, via
+    /// `decode_with_limits`, the fallback to `decode_with_image_crate`,
+    /// which fails the same way. Neither failure should panic the calling
+    /// thread.
+    #[test]
+    fn corrupt_jpeg_tagged_source_fails_cleanly_through_the_full_pipeline() {
+        let mut bytes = vec![0xFFu8, 0xD8, 0xFF, 0xE0]; // valid JPEG SOI + APP0 marker start
+        bytes.extend(std::iter::repeat_n(0u8, 64)); // garbage instead of a real header
+        let config = PerformanceConfig::default();
+        let params = query(Some(100), Some(100));
+
+        let result = ImageService::process_image_blocking_with_limits(&bytes, &params, &config);
+        assert!(
+            result.is_err(),
+            "expected a clean error for a corrupt JPEG-tagged source, not a panic or success"
+        );
+    }
+
+    /// #63 stage 2's actual target scenario: a large (4K) source downscaled
+    /// to a small thumbnail. This is exactly the shape of request that
+    /// should select an aggressive DCT scale (see
+    /// `select_jpeg_dct_scale_picks_most_aggressive_safe_reduction`) and
+    /// decode through mozjpeg rather than the full-resolution fallback -
+    /// asserted here indirectly, through the one thing that must never be
+    /// wrong regardless of which decoder produced the pixels: the final
+    /// output dimensions, which must match what `resize_dimensions` (the
+    /// same aspect-ratio math the non-scaled path already uses) predicts.
+    #[test]
+    fn large_downscale_through_mozjpeg_produces_correct_output_dimensions() {
+        let bytes = fixtures::photo_like_sized(3840, 2160, ImageFormat::Jpeg);
+        let config = PerformanceConfig::default();
+        let params = query_with_type(Some(200), Some(113), ResizeType::Fit);
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing a large downscale should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        let expected = ImageService::resize_dimensions(3840, 2160, 200, 113, false);
+        assert_eq!(
+            decoded.dimensions(),
+            expected,
+            "expected the same Fit target dimensions the non-scaled path would produce"
+        );
     }
 
     /// #36: requesting a much larger output than a tiny source, with

@@ -58,6 +58,15 @@ allow = [
     # dependency to drop this (and the rest of the avif/rav1e stack)
     # entirely rather than allow-listing around it.
     "NCSA",
+
+    # mozjpeg / mozjpeg-sys (#63 stage 2), for DCT-scaled JPEG decode. IJG is
+    # permissive and OSI-recognised, but UNLIKE every other licence above it
+    # carries an actual obligation: distributed documentation must state that
+    # the software is "based in part on the work of the Independent JPEG
+    # Group". That notice is in README.md and NOTICE — if this allow-list
+    # entry is ever removed, remove the notice with it; if mozjpeg is kept,
+    # the notice must stay. Do not treat this as a routine allow-list add.
+    "IJG",
 ]
 confidence-threshold = 0.8
 
