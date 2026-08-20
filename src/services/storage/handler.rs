@@ -468,6 +468,7 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            background: None,
         };
         let key = cache.generate_key(&params);
         assert!(

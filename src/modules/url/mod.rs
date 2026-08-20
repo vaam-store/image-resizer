@@ -114,6 +114,7 @@ impl ParsedRequest {
             grayscale: self.options.grayscale,
             enlarge: self.options.enlarge.unwrap_or(false),
             quality: self.options.quality,
+            background: self.options.background,
         }
     }
 }
@@ -151,7 +152,8 @@ mod tests {
     #[test]
     fn full_grammar_round_trips_every_capability() {
         let encoded = b64("https://example.com/img.jpg");
-        let path = format!("/SIG/rs:fill:300:300/q:80/bl:5/g:true/el:1/{encoded}.webp");
+        let path =
+            format!("/SIG/rs:fill:300:300/q:80/bl:5/g:true/el:1/bg:255:0:0/{encoded}.webp");
         let signed = split(&path).unwrap();
         let parsed = signed.parse().unwrap();
         let query = parsed.into_resize_query();
@@ -165,6 +167,7 @@ mod tests {
         assert_eq!(query.grayscale, Some(true));
         assert!(query.enlarge);
         assert_eq!(query.format, ImageFormat::Webp);
+        assert_eq!(query.background, Some([255, 0, 0]));
     }
 
     #[test]
@@ -184,6 +187,7 @@ mod tests {
         assert_eq!(query.blur_sigma, None);
         assert_eq!(query.grayscale, None);
         assert!(!query.enlarge);
+        assert_eq!(query.background, None);
     }
 
     #[test]

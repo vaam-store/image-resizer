@@ -22,6 +22,7 @@ fn bench_cache_key(c: &mut Criterion) {
         grayscale: Some(false),
         enlarge: false,
         quality: None,
+        background: None,
     };
 
     c.bench_function("cache_key/generate_key", |b| {

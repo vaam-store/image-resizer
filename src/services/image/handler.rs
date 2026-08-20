@@ -29,6 +29,19 @@ use url::Url;
 /// could silently drift from it.
 pub const DEFAULT_WEBP_QUALITY: f32 = 82.0;
 
+/// Default background colour (#34) used both to flatten alpha before
+/// encoding to a format with no alpha channel, and as the fill colour for
+/// fully-transparent pixels when the output format keeps alpha (#60), when
+/// `ResizeQuery::background` (the `bg:` processing option) isn't set.
+///
+/// Deliberately opaque white rather than imgproxy's own default of
+/// "disabled" (no flattening at all unless `bg:` is given) - this crate
+/// always flattens/normalises rather than treating it as opt-in, since a
+/// bare PNG-with-transparency -> JPEG conversion with no explicit `bg:`
+/// should still produce a sane image instead of the undefined-RGB fringing
+/// #34 exists to fix.
+pub const DEFAULT_BACKGROUND: [u8; 3] = [255, 255, 255];
+
 #[derive(Clone, Builder)]
 pub struct ImageService {
     // Limit concurrent downloads to prevent memory exhaustion
@@ -499,15 +512,72 @@ impl ImageService {
             crate::models::params::ImageFormat::Webp => (ImageFormat::WebP, "image/webp"),
         };
 
+        // Alpha handling (#34/#60). Gated on `img.has_alpha()` so a source
+        // that never carried an alpha channel (the common case) pays zero
+        // extra cost - there's nothing to flatten or normalise.
+        let img = if img.has_alpha() {
+            let background = params.background.unwrap_or(DEFAULT_BACKGROUND);
+            match output_format {
+                // JPEG has no alpha channel - flatten (composite) onto
+                // `background` explicitly instead of letting the encoder's
+                // own to_rgb8() conversion drop the channel outright
+                // (`cast_in_color_space`, a raw channel drop, not a
+                // composite - see #34's issue body for the exact vendored
+                // code path this replaces). Without this, transparent
+                // pixels whose RGB was never meaningful (undefined/garbage
+                // under alpha=0) show up as visible fringing instead of a
+                // clean edge against the configured background.
+                ImageFormat::Jpeg => Self::flatten_onto_background(&img, background),
+                // PNG/WebP keep their alpha channel, so this is not a
+                // flatten - but a fully-transparent pixel's RGB is
+                // invisible by definition, and the source frequently
+                // carries undefined/noisy values there that cost real
+                // encoded bytes for a region nobody can see (#60).
+                // Normalising just those pixels to a constant lets
+                // DEFLATE/VP8L collapse the region instead. Only exactly
+                // `alpha == 0` pixels are touched - partial transparency is
+                // visibly blended with whatever is behind it, so rewriting
+                // its RGB would be a real (lossy) visual change, not the
+                // lossless one this is meant to be.
+                _ => DynamicImage::ImageRgba8(Self::normalize_transparent_pixels(
+                    img.to_rgba8(),
+                    background,
+                )),
+            }
+        } else {
+            img
+        };
+
         // WebP goes through the dedicated `webp` crate (`Self::encode_webp`),
         // not `DynamicImage::write_to` - the `image` crate's own WebP
         // encoder (`image-webp`, pulled in via the `webp` cargo feature) is
         // lossless-only, which produced far larger output than intended.
-        // JPEG/PNG are unaffected and keep going through `write_to` exactly
-        // as before.
+        // PNG uses an explicit `PngEncoder` (rather than `write_to`'s
+        // default) to pick `CompressionType::Best` over the crate's own
+        // default of `Fast` (`image-0.25.10/src/codecs/png.rs`,
+        // `CompressionType::default()`) - a real, dependency-free size win
+        // for #60 that doesn't touch `Cargo.toml`: `PngEncoder` and its
+        // `CompressionType`/`FilterType` enums are already part of the
+        // `image` crate's own public API under the `png` feature this crate
+        // already depends on, not a new dependency. JPEG is unaffected and
+        // keeps going through `write_to` exactly as before.
         let output_bytes = match output_format {
             ImageFormat::WebP => Self::encode_webp(&img, DEFAULT_WEBP_QUALITY, false)
                 .context(format!("Failed to encode image to {:?}", output_format))?,
+            ImageFormat::Png => {
+                let estimated_size = Self::estimate_output_size(&img, &output_format);
+                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+
+                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                    &mut buf,
+                    image::codecs::png::CompressionType::Best,
+                    image::codecs::png::FilterType::Adaptive,
+                );
+                img.write_with_encoder(encoder)
+                    .context(format!("Failed to encode image to {:?}", output_format))?;
+
+                buf.into_inner()
+            }
             _ => {
                 // Pre-allocate buffer based on estimated size - only
                 // meaningful for the `write_to` path below; the WebP path
@@ -523,6 +593,72 @@ impl ImageService {
         };
 
         Ok((output_bytes, content_type.to_string()))
+    }
+
+    /// Composites `img` onto an opaque `background` colour, producing a
+    /// plain RGB image with no alpha channel at all (#34). Only meaningful
+    /// as a pre-encode step for a format with no alpha channel (JPEG) - see
+    /// the call site's comment for why this exists instead of letting the
+    /// encoder itself drop the channel.
+    ///
+    /// Standard "over" alpha compositing per channel:
+    /// `out = src * alpha + background * (1 - alpha)`, computed in floating
+    /// point and rounded (not truncated) so a fully-opaque source pixel
+    /// (`alpha == 255`) round-trips to itself exactly, and the `alpha == 0`
+    /// case is special-cased to exactly `background` rather than relying on
+    /// the general formula to reduce to it (it does, but the special case
+    /// avoids float rounding surprises on the boundary the golden-image
+    /// tests assert pixel-exact equality against).
+    fn flatten_onto_background(img: &DynamicImage, background: [u8; 3]) -> DynamicImage {
+        let rgba = img.to_rgba8();
+        let mut out = image::RgbImage::new(rgba.width(), rgba.height());
+
+        for (src, dst) in rgba.pixels().zip(out.pixels_mut()) {
+            let [r, g, b, a] = src.0;
+            *dst = image::Rgb(match a {
+                255 => [r, g, b],
+                0 => background,
+                _ => {
+                    let alpha = f32::from(a) / 255.0;
+                    let blend = |c: u8, bg: u8| -> u8 {
+                        (f32::from(c) * alpha + f32::from(bg) * (1.0 - alpha)).round() as u8
+                    };
+                    [
+                        blend(r, background[0]),
+                        blend(g, background[1]),
+                        blend(b, background[2]),
+                    ]
+                }
+            });
+        }
+
+        DynamicImage::ImageRgb8(out)
+    }
+
+    /// Rewrites the RGB of every fully-transparent (`alpha == 0`) pixel to
+    /// `background`, leaving every other pixel - including partially
+    /// transparent ones - byte-for-byte untouched (#60).
+    ///
+    /// Safe by construction: a pixel with `alpha == 0` is invisible
+    /// regardless of its RGB, so this cannot change what any viewer sees -
+    /// only what bytes the encoder has to spend compressing an invisible
+    /// region (a solid-colour region compresses far better than whatever
+    /// noise the source had there). Partial transparency is deliberately
+    /// left alone: its RGB is visible (blended with whatever ends up
+    /// behind it), so rewriting it would be a real, lossy visual change,
+    /// not the lossless one this is meant to be.
+    fn normalize_transparent_pixels(
+        mut rgba: image::RgbaImage,
+        background: [u8; 3],
+    ) -> image::RgbaImage {
+        for pixel in rgba.pixels_mut() {
+            if pixel.0[3] == 0 {
+                pixel.0[0] = background[0];
+                pixel.0[1] = background[1];
+                pixel.0[2] = background[2];
+            }
+        }
+        rgba
     }
 
     /// Encodes `img` to WebP via the `webp` crate directly (libwebp
@@ -746,6 +882,7 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            background: None,
         }
     }
 
@@ -1642,5 +1779,211 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ---- #34/#60: alpha flattening and transparent-pixel normalisation ----
+
+    /// Builds a `ResizeQuery` requesting no resize at all (keeps the
+    /// fixture's original pixel grid so boundary assertions below land on
+    /// exact, known pixel coordinates instead of whatever a resize filter's
+    /// interpolation produces near the edge) with the given output format
+    /// and `background`.
+    fn query_for_alpha(format: ApiImageFormat, background: Option<[u8; 3]>) -> ResizeQuery {
+        ResizeQuery {
+            url: "https://images.example.com/alpha.png".to_string(),
+            width: None,
+            height: None,
+            resize_type: ResizeType::Fit,
+            format,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
+            background,
+        }
+    }
+
+    /// #34: pure unit test of the compositing formula itself, independent
+    /// of any lossy encoding - `alpha == 255` must reproduce the source
+    /// exactly, `alpha == 0` must land exactly on `background` (not
+    /// whatever garbage RGB the source carried there), and partial
+    /// transparency must genuinely blend rather than equal either input.
+    #[test]
+    fn flatten_onto_background_composites_alpha_correctly() {
+        let mut img = image::RgbaImage::new(1, 3);
+        img.put_pixel(0, 0, image::Rgba([10, 20, 30, 255])); // opaque
+        img.put_pixel(0, 1, image::Rgba([10, 20, 30, 0])); // fully transparent, garbage rgb
+        img.put_pixel(0, 2, image::Rgba([0, 0, 0, 128])); // ~50% transparent, black
+
+        let dynamic = DynamicImage::ImageRgba8(img);
+        let background = [255, 255, 255];
+        let flattened = ImageService::flatten_onto_background(&dynamic, background).to_rgb8();
+
+        assert_eq!(
+            flattened.get_pixel(0, 0).0,
+            [10, 20, 30],
+            "opaque pixel must pass through unchanged"
+        );
+        assert_eq!(
+            flattened.get_pixel(0, 1).0,
+            background,
+            "fully transparent pixel must land exactly on the background, not its garbage RGB"
+        );
+
+        let blended = flattened.get_pixel(0, 2).0;
+        assert_ne!(blended, [0, 0, 0], "must not equal the source colour");
+        assert_ne!(blended, background, "must not equal the background either");
+        // alpha = 128/255 ~= 0.502; out = 0*0.502 + 255*0.498 ~= 127.
+        for channel in blended {
+            assert!(
+                (120..=135).contains(&channel),
+                "expected the 50%-alpha blend near 127, got {blended:?}"
+            );
+        }
+    }
+
+    /// #60: only pixels with exactly `alpha == 0` are rewritten - partial
+    /// transparency and full opacity must be byte-for-byte untouched, since
+    /// their RGB is actually visible (blended with whatever is behind them
+    /// for partial alpha, directly for opaque).
+    #[test]
+    fn normalize_transparent_pixels_only_rewrites_fully_transparent_pixels() {
+        let mut img = image::RgbaImage::new(1, 3);
+        img.put_pixel(0, 0, image::Rgba([10, 20, 30, 255])); // opaque
+        img.put_pixel(0, 1, image::Rgba([99, 88, 77, 0])); // fully transparent, garbage rgb
+        img.put_pixel(0, 2, image::Rgba([1, 2, 3, 128])); // partial
+
+        let background = [255, 0, 0];
+        let normalized = ImageService::normalize_transparent_pixels(img, background);
+
+        assert_eq!(normalized.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(
+            normalized.get_pixel(0, 1).0,
+            [background[0], background[1], background[2], 0],
+            "fully transparent pixel's RGB must be rewritten to the background, alpha unchanged"
+        );
+        assert_eq!(
+            normalized.get_pixel(0, 2).0,
+            [1, 2, 3, 128],
+            "partially transparent pixel must be left byte-for-byte untouched"
+        );
+    }
+
+    /// #34: the alpha fixture (`fixtures::alpha`, mirrored by
+    /// `bench-imgproxy/fixtures/generate.py`'s `alpha_fringe_rgba`) has a
+    /// transparent border with deliberately garbage (non-zero) RGB
+    /// underneath - exactly the vendored `to_rgb8()` raw-channel-drop bug
+    /// the issue's source citation identified. Converting it to JPEG (no
+    /// alpha channel) must flatten that border onto the default background
+    /// (white, since `background` is `None` here) instead of letting the
+    /// garbage show through. Golden-image style: asserts actual decoded
+    /// pixel values at the boundary, not just a successful conversion.
+    #[test]
+    fn alpha_fixture_flattens_to_default_white_background_when_converted_to_jpeg() {
+        let bytes = fixtures::alpha(); // 512x512, border width 32px
+        let config = PerformanceConfig::default();
+        let params = query_for_alpha(ApiImageFormat::Jpg, None);
+
+        let (output, content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+        assert_eq!(content_type, "image/jpeg");
+
+        let decoded = image::load_from_memory_with_format(&output, ImageFormat::Jpeg)
+            .expect("output should decode")
+            .to_rgb8();
+
+        // (0, 0) is deep inside the transparent border - garbage RGB
+        // pre-fix, must be near-white post-fix (JPEG is lossy, so allow a
+        // small tolerance rather than requiring exactly 255).
+        let pixel = decoded.get_pixel(0, 0).0;
+        for (channel, value) in ["r", "g", "b"].into_iter().zip(pixel) {
+            assert!(
+                value > 235,
+                "expected boundary pixel channel {channel} near white (255), got {value} \
+                 (full pixel: {pixel:?})"
+            );
+        }
+    }
+
+    /// #34: a caller-supplied `background` (the `bg:` processing option)
+    /// must be honoured instead of the default white - proven against the
+    /// same boundary pixel as the default-background test above.
+    #[test]
+    fn custom_background_is_honoured_when_flattening_to_jpeg() {
+        let bytes = fixtures::alpha();
+        let config = PerformanceConfig::default();
+        let params = query_for_alpha(ApiImageFormat::Jpg, Some([0, 0, 255])); // pure blue
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        let decoded = image::load_from_memory_with_format(&output, ImageFormat::Jpeg)
+            .expect("output should decode")
+            .to_rgb8();
+
+        let [r, g, b] = decoded.get_pixel(0, 0).0;
+        assert!(r < 40, "expected low red near a blue background, got {r}");
+        assert!(g < 40, "expected low green near a blue background, got {g}");
+        assert!(b > 200, "expected high blue near a blue background, got {b}");
+    }
+
+    /// #60: output-size regression guard for the exact adversarial shape
+    /// the issue measured. Pre-fix, the analogous corpus fixture
+    /// (`bench-imgproxy/fixtures/corpus/alpha_1024.png`, same generator,
+    /// same seed - see `bench-imgproxy/fixtures/generate.py`) encoded to
+    /// PNG at `fill:400:300` measured 85,347 bytes. Post-fix, the in-repo
+    /// 512px fixture at the same request measures 11,337 bytes - the
+    /// 25,000-byte threshold asserted here gives ~2.2x headroom over that
+    /// measurement (so the assertion isn't flaky against encoder-internals
+    /// drift) while staying well under an order of magnitude below the
+    /// pre-fix floor, so a regression that turns normalisation back into a
+    /// no-op is still caught.
+    #[test]
+    fn alpha_fixture_encoded_to_png_stays_under_size_threshold() {
+        let bytes = fixtures::alpha();
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            ..query_with_type(Some(400), Some(300), ResizeType::Fill)
+        };
+
+        let (output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        assert!(
+            output.len() < 25_000,
+            "expected normalised alpha PNG under 25,000 bytes, got {} \
+             (pre-fix, the analogous corpus fixture measured 85,347 bytes)",
+            output.len()
+        );
+    }
+
+    /// #60 (the non-adversarial case the issue explicitly calls out): a
+    /// flat/solid-colour PNG has no transparency at all, so this exercises
+    /// only the `CompressionType::Best` PNG-encoder change, not
+    /// flattening/normalisation. Measured 2,596 -> 1,063 bytes for the
+    /// analogous 1024px corpus fixture; asserted here against the in-repo
+    /// fixture with headroom.
+    #[test]
+    fn flat_colour_png_benefits_from_best_compression() {
+        let bytes = fixtures::flat();
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            ..query_with_type(Some(400), Some(300), ResizeType::Fill)
+        };
+
+        let (output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        assert!(
+            output.len() < 3_000,
+            "expected flat-colour PNG under 3,000 bytes with Best compression, got {}",
+            output.len()
+        );
     }
 }

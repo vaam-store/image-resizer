@@ -141,6 +141,19 @@ pub struct ResizeQuery {
     /// the concurrently-landing lossy-WebP encoding work
     /// (`src/services/image/handler.rs`, owned by another agent).
     pub quality: Option<u8>,
+
+    /// Background colour, as an `[R, G, B]` triple (imgproxy's
+    /// `background`/`bg:{R}:{G}:{B}` or `bg:{hex}` processing option, #34).
+    /// `None` means "use the default" - `ImageService` (`src/services/image/handler.rs`)
+    /// defaults to opaque white, not imgproxy's own "disabled" default,
+    /// since this crate always flattens alpha before encoding to a format
+    /// without an alpha channel rather than treating flattening as opt-in.
+    /// Used two ways there: to flatten transparency against when encoding
+    /// to a format with no alpha channel (JPEG), and as the fill colour for
+    /// fully-transparent pixels when encoding to a format that keeps alpha
+    /// (PNG/WebP), so invisible pixels compress instead of carrying whatever
+    /// garbage RGB the source had under `alpha=0` (#60).
+    pub background: Option<[u8; 3]>,
 }
 
 /// Path parameter for the (unsigned, key-validated) download route

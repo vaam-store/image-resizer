@@ -271,6 +271,7 @@ mod tests {
             grayscale: None,
             enlarge: false,
             quality: None,
+            background: None,
         }
     }
 

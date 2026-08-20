@@ -21,6 +21,10 @@ pub struct ProcessingOptions {
     pub grayscale: Option<bool>,
     pub enlarge: Option<bool>,
     pub quality: Option<u8>,
+    /// `bg`'s parsed `[R, G, B]` triple (#34) - see
+    /// [`crate::models::params::ResizeQuery::background`] for how it's
+    /// consumed.
+    pub background: Option<[u8; 3]>,
 }
 
 /// A processing-option path segment always contains a `:` (`rs:fill:300:300`,
@@ -74,6 +78,12 @@ impl ProcessingOptions {
                 "el" => {
                     let [value] = require_args::<1>(&args, segment)?;
                     opts.enlarge = Some(parse_bool(value, segment)?);
+                }
+                // bg:{R}:{G}:{B} or bg:{hex} (imgproxy's `background`/`bg`
+                // option, #34/#60). See `parse_background` for the accepted
+                // argument shapes.
+                "bg" => {
+                    opts.background = Some(parse_background(&args, segment)?);
                 }
                 other => return Err(UrlParseError::UnknownOption(other.to_string())),
             }
@@ -147,6 +157,74 @@ fn parse_bool(raw: &str, segment: &str) -> Result<bool, UrlParseError> {
             option: segment.to_string(),
             reason: format!("{other:?} is not a valid boolean (expected true/false/1/0)"),
         }),
+    }
+}
+
+/// Parses `bg`'s argument list into an `[R, G, B]` triple. imgproxy accepts
+/// two shapes for this option
+/// (<https://docs.imgproxy.net/usage/processing#background>):
+/// - `bg:{R}:{G}:{B}` - three separate 0-255 channel values (3 args here).
+/// - `bg:{hex_color}` - a single hex-coded colour (1 arg here). Accepts
+///   3-digit (`fff`) or 6-digit (`ffffff`) hex, case-insensitively, with no
+///   leading `#` - a literal `#` would need percent-encoding to survive as
+///   a path segment, so this mirrors how imgproxy's own examples write hex
+///   colours in URLs.
+///
+/// Any other argument count is rejected the same way `require_args` rejects
+/// a wrong count for the fixed-arity options above.
+fn parse_background(args: &[&str], segment: &str) -> Result<[u8; 3], UrlParseError> {
+    match args {
+        [r, g, b] => Ok([
+            parse_bounded(r, segment, 0, 255)?,
+            parse_bounded(g, segment, 0, 255)?,
+            parse_bounded(b, segment, 0, 255)?,
+        ]),
+        [hex] => parse_hex_color(hex, segment),
+        _ => Err(UrlParseError::InvalidOptionValue {
+            option: segment.to_string(),
+            reason: "expected either 3 arguments (R:G:B) or 1 argument (hex colour)".to_string(),
+        }),
+    }
+}
+
+/// Parses a 3-digit or 6-digit hex colour (no leading `#`) into `[R, G, B]`.
+fn parse_hex_color(hex: &str, segment: &str) -> Result<[u8; 3], UrlParseError> {
+    let invalid = || UrlParseError::InvalidOptionValue {
+        option: segment.to_string(),
+        reason: format!("{hex:?} is not a valid hex colour (expected 3 or 6 hex digits)"),
+    };
+
+    // Guard against non-ASCII input before any byte-index slicing below -
+    // `hex.len()` is a byte length, and slicing on a non-char boundary would
+    // panic rather than fall through to the length check.
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+
+    let expand = |c: char| -> Result<u8, UrlParseError> {
+        let digit = c.to_digit(16).ok_or_else(invalid)? as u8;
+        Ok(digit * 16 + digit)
+    };
+
+    match hex.len() {
+        3 => {
+            let mut chars = hex.chars();
+            let r = expand(chars.next().ok_or_else(invalid)?)?;
+            let g = expand(chars.next().ok_or_else(invalid)?)?;
+            let b = expand(chars.next().ok_or_else(invalid)?)?;
+            Ok([r, g, b])
+        }
+        6 => {
+            let channel = |slice: &str| -> Result<u8, UrlParseError> {
+                u8::from_str_radix(slice, 16).map_err(|_| invalid())
+            };
+            Ok([
+                channel(&hex[0..2])?,
+                channel(&hex[2..4])?,
+                channel(&hex[4..6])?,
+            ])
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -246,9 +324,15 @@ mod tests {
 
     #[test]
     fn combines_multiple_options() {
-        let opts =
-            ProcessingOptions::parse(&["rs:fill:300:300", "q:80", "bl:5", "g:true", "el:1"])
-                .unwrap();
+        let opts = ProcessingOptions::parse(&[
+            "rs:fill:300:300",
+            "q:80",
+            "bl:5",
+            "g:true",
+            "el:1",
+            "bg:255:0:0",
+        ])
+        .unwrap();
         assert_eq!(opts.width, Some(300));
         assert_eq!(opts.height, Some(300));
         assert_eq!(opts.resize_type, ResizeType::Fill);
@@ -256,6 +340,66 @@ mod tests {
         assert_eq!(opts.blur_sigma, Some(5.0));
         assert_eq!(opts.grayscale, Some(true));
         assert_eq!(opts.enlarge, Some(true));
+        assert_eq!(opts.background, Some([255, 0, 0]));
+    }
+
+    #[test]
+    fn parses_background_as_rgb_triple() {
+        let opts = ProcessingOptions::parse(&["bg:255:128:0"]).unwrap();
+        assert_eq!(opts.background, Some([255, 128, 0]));
+    }
+
+    #[test]
+    fn parses_background_as_six_digit_hex() {
+        let opts = ProcessingOptions::parse(&["bg:ff8000"]).unwrap();
+        assert_eq!(opts.background, Some([255, 128, 0]));
+    }
+
+    #[test]
+    fn parses_background_as_six_digit_hex_uppercase() {
+        let opts = ProcessingOptions::parse(&["bg:FF8000"]).unwrap();
+        assert_eq!(opts.background, Some([255, 128, 0]));
+    }
+
+    #[test]
+    fn parses_background_as_three_digit_hex_shorthand() {
+        // `f80` expands digit-doubled to `ff8800`, imgproxy/CSS shorthand
+        // convention.
+        let opts = ProcessingOptions::parse(&["bg:f80"]).unwrap();
+        assert_eq!(opts.background, Some([255, 136, 0]));
+    }
+
+    #[test]
+    fn background_defaults_to_none_when_absent() {
+        let opts = ProcessingOptions::parse(&[]).unwrap();
+        assert_eq!(opts.background, None);
+    }
+
+    #[test]
+    fn background_rgb_out_of_range_is_rejected() {
+        assert!(ProcessingOptions::parse(&["bg:256:0:0"]).is_err());
+    }
+
+    #[test]
+    fn background_invalid_hex_is_rejected() {
+        assert!(ProcessingOptions::parse(&["bg:zzzzzz"]).is_err());
+        assert!(ProcessingOptions::parse(&["bg:ff"]).is_err());
+        assert!(ProcessingOptions::parse(&["bg:1234567"]).is_err());
+    }
+
+    #[test]
+    fn background_wrong_argument_count_is_rejected() {
+        assert!(ProcessingOptions::parse(&["bg:1:2"]).is_err());
+        assert!(ProcessingOptions::parse(&["bg:1:2:3:4"]).is_err());
+        assert!(ProcessingOptions::parse(&["bg"]).is_err());
+    }
+
+    #[test]
+    fn background_rejects_non_ascii_without_panicking() {
+        // A multi-byte UTF-8 character here must not panic on byte-index
+        // slicing inside `parse_hex_color` - it should just be rejected.
+        assert!(ProcessingOptions::parse(&["bg:é"]).is_err());
+        assert!(ProcessingOptions::parse(&["bg:ééé"]).is_err());
     }
 
     #[test]
