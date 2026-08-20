@@ -302,6 +302,45 @@ older runs of this harness had; numbers from before #57 landed were
 produced under the loopback-vs-bridge split described above and are not
 directly comparable on that dimension.
 
+## Which metric to trust
+
+Each `results/*.json` report (`driver/k6-script.js`'s `handleSummary`)
+exports two views of latency and throughput, and they are **not**
+interchangeable:
+
+| Metric | What it measures | Comparable across engines? |
+|---|---|---|
+| `http_req_duration` | latency of a single HTTP request | **No** |
+| `throughput_rps` (from `http_reqs.rate`) | HTTP requests/sec | **No** |
+| `iteration_duration` | wall-clock for one complete delivered image, redirect hops included | **Yes** |
+| `images_per_second` (from `iterations.rate`) | delivered images/sec | **Yes** |
+| `http_reqs_per_iteration` | HTTP requests issued per delivered image | the tell, see below |
+
+The reason: `emgr` and `emgr_s3` answer a resize request with a `301`
+redirect to wherever the derivative is stored, and k6 follows it, so
+delivering **one** image costs emgr two HTTP requests (`http_reqs_per_iteration`
+reads `2.00` for both emgr flavours). `imgproxy` streams the transformed
+bytes back on the original request, so it costs `1.00`. `http_req_duration`
+and the `throughput_rps` derived from `http_reqs.rate` are per-*request*
+metrics, so they silently compare "the average of a near-instant 301 and a
+real transform" (emgr) against "a real transform" (imgproxy) — that mixture
+drags emgr's reported median down and roughly doubles emgr's apparent
+`throughput_rps`, in a way that has nothing to do with which engine
+processes images faster. This produced a real, previously-reported error:
+emgr's cold-cache p50 read as "at parity" with imgproxy (22.87 vs 20.66 ms,
+per-request) when the true per-delivered-image figure is 75.81 vs 20.76 ms
+— 3.65x slower, not parity. See `.bench-baseline/BASELINE.md`'s 2026-08-21
+section for the full before/after comparison on real data.
+
+**Always read `iteration_duration` and `images_per_second` when comparing
+engines.** `http_req_duration` and `throughput_rps` are kept in the report
+for continuity with earlier runs and for tracking a single engine's own
+trend over time (where the per-engine request-count ratio is constant), not
+for cross-engine comparison. Check `http_reqs_per_iteration` first whenever
+you're unsure which metrics in a given report are safe to compare — `1.00`
+means per-request and per-image are the same thing for that engine, `2.00`
+means they are not.
+
 ## Scenarios
 
 Run via `driver/run.sh`, which sweeps `ENGINES x SCENARIOS x CONCURRENCIES`.
@@ -445,9 +484,12 @@ convention):
 
 ## Status of this harness as delivered
 
-**`imgproxy` and `emgr` (local_fs) are validated end-to-end with real
-numbers below. `emgr_s3` is blocked by a pre-existing bug outside this
-harness's scope -- see "Known blocker" below.**
+**All three engines -- `imgproxy`, `emgr` (local_fs), and `emgr_s3` -- are
+validated end-to-end with real numbers below.** `emgr_s3` was blocked for a
+time by a pre-existing bug outside this harness's scope; that bug is now
+fixed -- see "Resolved: `emgr_s3` GLIBC_2.38 startup crash" below for the
+root cause and the fix, and `.bench-baseline/BASELINE.md`'s 2026-08-21
+section for the s3 numbers this unblocked.
 
 ### Validated: imgproxy vs. emgr (local_fs), cold cache, concurrency 2
 
@@ -481,52 +523,55 @@ this is *not yet* the number that isolates image-processing speed from
 storage-serving cost. That isolation is exactly what the `emgr_s3` leg
 below was meant to provide.
 
-### Known blocker: `emgr_s3` cannot start -- `s3_deploy` build is broken independent of this harness
+### Resolved: `emgr_s3` GLIBC_2.38 startup crash
 
-`compose.yaml`, `driver/run.sh` and `driver/k6-script.js` are fully wired
-for the three-way comparison (`docker compose config` validates cleanly,
-`origin`/`minio`/`minio_init`/`imgproxy`/`emgr` all reach `healthy` and the
-bucket is created and made public correctly). `emgr_s3` builds successfully
-but its container **crashes on startup**:
+`compose.yaml`, `driver/run.sh` and `driver/k6-script.js` were fully wired
+for the three-way comparison from the start (`docker compose config`
+validates cleanly, `origin`/`minio`/`minio_init`/`imgproxy`/`emgr` all
+reached `healthy` and the bucket was created and made public correctly),
+but for a time `emgr_s3` built successfully and then **crashed on
+startup**:
 
 ```
 /app/emgr: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by /app/emgr)
 ```
 
-This is a **pre-existing bug in the repo root `Dockerfile`**, not something
-introduced by this harness, and not something this harness's `bench-imgproxy/`
-scope can fix (the fix belongs in `Dockerfile`, which was explicitly out of
-scope for this work). Root cause, confirmed by diffing the two binaries
-with `objdump -T`:
+This was a **pre-existing bug in the repo root `Dockerfile`**, not
+something introduced by this harness, and not something this harness's
+`bench-imgproxy/` scope could fix on its own (the fix belonged in
+`Dockerfile`). Root cause, confirmed by diffing the two binaries with
+`objdump -T`:
 
-- The `builder` stage (`FROM rust@sha256:...`) is Debian 13 "trixie"
+- The `builder` stage (`FROM rust@sha256:...`) was Debian 13 "trixie"
   (glibc 2.41). `base_deploy` (`FROM gcr.io/distroless/cc-debian12@sha256:...`)
   is Debian 12 "bookworm" (glibc ~2.36) -- a **major Debian version
   mismatch between the compile stage and the runtime stage**.
-- Only the `s3`-feature binary references `GLIBC_2.38` symbols
+- Only the `s3`-feature binary referenced `GLIBC_2.38` symbols
   (`__isoc23_sscanf`, `__isoc23_strtol` -- ISO C23 `sscanf`/`strtol`
   variants that Debian 13's newer glibc headers alias to by default). The
-  `local_fs`-feature binary (`emgr`, confirmed working above) references no
-  symbol newer than `GLIBC_2.34`. This points at the `s3` feature's native
-  C dependency chain (almost certainly `aws-lc-sys`, the only C code the
-  `s3` feature compiles) picking up the builder's newer glibc headers at
-  compile time, in a way `local_fs`'s pure-Rust dependency tree never does.
+  `local_fs`-feature binary (`emgr`) referenced no symbol newer than
+  `GLIBC_2.34`. This pointed at the `s3` feature's native C dependency
+  chain (almost certainly `aws-lc-sys`, the only C code the `s3` feature
+  compiles) picking up the builder's newer glibc headers at compile time,
+  in a way `local_fs`'s pure-Rust dependency tree never does.
 - `base_deploy`'s glibc (Debian 12) predates `GLIBC_2.38` entirely, so the
-  binary fails to even start, regardless of runtime configuration -- this
-  is not fixable from `compose.yaml` (no env var, build arg, or Cargo
-  feature flag changes which glibc headers the builder's C toolchain links
-  against).
-- The fix belongs in `Dockerfile`: either bump `base_deploy` to a
-  Debian-13-based distroless image (e.g. `gcr.io/distroless/cc-debian13`,
-  once available) so it matches the builder stage, or pin the `builder`
-  stage to a Debian-12-based Rust image so it matches `base_deploy`. Either
-  change needs to preserve identical `local_fs` behavior, since that build
-  is already working.
+  binary failed to even start, regardless of runtime configuration -- not
+  fixable from `compose.yaml` (no env var, build arg, or Cargo feature flag
+  changes which glibc headers the builder's C toolchain links against).
 
-Once that lands, `emgr_s3` needs no changes on this harness's side to run
--- `compose.yaml`, `driver/run.sh`'s healthcheck loop (`emgr:18081`,
-`emgr_s3:18087`), and `driver/k6-script.js`'s `urlBuilders.emgr_s3` are
-already in place and were validated up to exactly this point (build
-succeeds, `origin`/`minio`/`minio_init` all become healthy with `emgr_s3`
-correctly waiting on all three via `depends_on`, and the only failure is
-the container's own entrypoint refusing to start).
+**The fix:** the `builder` stage in `Dockerfile` was pinned to a
+Debian-12-based ("bookworm") Rust image, so it now matches `base_deploy`'s
+Debian 12 distroless runtime instead of drifting ahead of it on Debian 13.
+That removes the version mismatch at its source -- both stages now link
+against and ship the same glibc generation -- while leaving `local_fs`
+behavior unchanged (it never depended on the newer glibc symbols in the
+first place).
+
+`emgr_s3` now builds and runs correctly with no changes needed on this
+harness's side -- `compose.yaml`, `driver/run.sh`'s healthcheck loop
+(`emgr:18081`, `emgr_s3:18087`), and `driver/k6-script.js`'s
+`urlBuilders.emgr_s3` were already in place and are now validated
+end-to-end: `emgr_s3` builds, starts, becomes healthy, and served every
+request in the measurement runs recorded in `.bench-baseline/BASELINE.md`'s
+2026-08-21 section (both cold and warm cache, zero non-2xx/timeout/
+connection errors).

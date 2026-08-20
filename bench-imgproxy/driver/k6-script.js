@@ -272,7 +272,32 @@ export function handleSummary(data) {
         ? data.metrics.outcome_conn_error.values.count
         : 0,
       iterations: data.metrics.iterations ? data.metrics.iterations.values.count : 0,
+      // NOTE: `http_reqs.rate` counts every HTTP request, and the engines do
+      // NOT issue the same number of them per delivered image. emgr answers
+      // with a 301 to storage and k6 follows it, so one delivered image costs
+      // emgr ~2 requests; imgproxy streams the bytes from the same request, so
+      // it costs 1. Comparing this number between engines therefore flatters
+      // emgr by roughly 2x. Use `images_per_second` below for the throughput
+      // comparison; this stays for continuity with earlier runs and for
+      // per-engine trend tracking, where the request-count ratio is constant.
       throughput_rps: data.metrics.http_reqs ? data.metrics.http_reqs.values.rate : null,
+      http_reqs_per_iteration:
+        data.metrics.http_reqs && data.metrics.iterations && data.metrics.iterations.values.count
+          ? data.metrics.http_reqs.values.count / data.metrics.iterations.values.count
+          : null,
+      // The honest cross-engine throughput number: completed image deliveries
+      // per second, independent of how many HTTP round trips each engine takes
+      // to deliver one.
+      images_per_second: data.metrics.iterations ? data.metrics.iterations.values.rate : null,
+      // The honest cross-engine latency number: wall-clock for one complete
+      // image delivery, redirect hops included. `http_req_duration` is
+      // per-request, so for emgr it blends near-instant 301s (min ~0.1ms) with
+      // real transforms into one bimodal distribution - which drags its median
+      // down and makes a p50 "at parity" with imgproxy an artefact of the
+      // mixture rather than a statement about processing speed.
+      iteration_duration: data.metrics.iteration_duration
+        ? data.metrics.iteration_duration.values
+        : null,
     },
   };
 

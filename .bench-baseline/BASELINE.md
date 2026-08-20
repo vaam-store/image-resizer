@@ -125,3 +125,132 @@ photo (NASA `nasa-4928x3279.png`) and the `alpha_fringe_rgba` fixture:
 385/385 tests pass (`cargo test --features local_fs`, unchanged count).
 `cargo check --features local_fs --bins --tests --benches` and
 `cargo check --features s3` both 0 errors.
+
+## Post-wave-2 baseline — `main` @ `41aee92` (2026-08-21)
+
+**Provenance:** merged `main` at commit `41aee92`, which includes wave 2
+(#49 AVIF, #50 animation, #51 gravity, #52 geometry/watermarks/presets) on
+top of everything in the "Current baseline" section above, plus #63 stage 2
+(DCT-scaled JPEG decode via mozjpeg). Command:
+`cargo bench --features local_fs -- --sample-size 20 --measurement-time 2 --warm-up-time 1`.
+Profile: criterion default (release). Machine: darwin/arm64. All figures are
+medians.
+
+| Bench | Median | Note |
+|---|---:|---|
+| cache_key/generate_key | 1.70 µs | was 954 ns at #63 stage 1 — wave 2 roughly doubled the number of fields hashed into the cache key (gravity/geometry/watermark/preset params) |
+| decode/jpeg 1920x1080 | 9.01 ms | |
+| decode/png 1920x1080 | 14.36 ms | |
+| decode/webp 1920x1080 | 25.32 ms | |
+| encode/jpeg | 3.07 ms | |
+| encode/png | 1.70 ms | |
+| encode/webp | 23.79 ms | see "encode/webp trap" below — this is NOT a 10x regression |
+| resize_fir/downscale lanczos3 | 3.47 ms | |
+| resize_fir/downscale triangle | 1.17 ms | |
+| pipeline photo_like → thumbnail_jpg | 6.32 ms | was 10.78 ms at #63 stage 1 — the 41% gain is #63 stage 2's DCT-scaled decode |
+| pipeline flat → resize_png | 8.58 ms | |
+| pipeline alpha → resize_webp | 5.41 ms | |
+| pipeline photo_4k → large_downscale_thumbnail_jpg | 19.61 ms | new bench, added by #63 stage 2 |
+
+### `encode/webp` trap: a third instance of the same pattern this file already warns about twice
+
+`encode/webp` reads 23.79 ms here against 2.25 ms in the oldest table at the
+top of this file, and 2.94 ms in the `pipeline alpha -> resize webp` line
+from the same era. Read naively that looks like a ~10x regression. **It is
+not.** The old number was produced by the `image` crate's lossless-only
+WebP encoder — cheap, because lossless WebP on synthetic/noise-heavy input
+does comparatively little work. #32/#60 replaced that path with real lossy
+libwebp via `ImageService::encode_webp` (the `webp` crate, same underlying
+encoder imgproxy uses); `benches/encode.rs` calls `ImageService::encode_webp`
+directly, so this bench has been measuring the lossy encoder since #32/#60
+landed, not the encoder that produced the 2.25 ms/2.94 ms numbers. It does
+far more work (real rate-distortion search) for a much smaller output file.
+This is the same class of trap as the `decode/jpeg` `zune-jpeg` version-bump
+note and the `pipeline alpha -> resize webp` note already on this file — an
+apparent regression that is actually a different, more capable code path
+being measured, not a performance loss in the same code.
+
+### Wave 2 cost on the hot path: unmeasurable
+
+Wave 2 (#49/#50/#51/#52 — AVIF, animation, gravity, geometry/watermarks/
+presets) added nothing measurable to the request path that doesn't opt into
+those features. The end-to-end harness's cold-cache per-request numbers
+(see `bench-imgproxy/README.md`'s validated section) before wave 2 —
+21.25 / 107.06 / 297.56 ms p50/p90/p99 — and after wave 2 — 22.87 / 104.63 /
+296.49 ms, same metric, same harness — are identical within noise. This is
+expected: every wave-2 feature is opt-in per request (a request that doesn't
+ask for AVIF, animation, gravity, geometry ops, a watermark, or a preset
+does not pay for parsing or applying one), and `cache_key/generate_key`'s
+own move from 954 ns to 1.70 µs is itself negligible against a
+multi-millisecond pipeline.
+
+### End-to-end (imgproxy vs. emgr, three engines): see `bench-imgproxy/README.md`
+
+The criterion numbers above are single-operation micro-benchmarks within
+the Rust binary. The full end-to-end comparison against imgproxy — request
+routing, source fetch, storage round trip, and (for emgr) the redirect hop
+— lives in `bench-imgproxy/README.md`'s "Validated" section, captured on
+this same commit (`41aee92`). Two things changed there since the last time
+this file was updated, both from fixing a measurement bug rather than from
+any code change:
+
+1. **The metric being reported was wrong, not just the numbers.**
+   `http_req_duration` (per-HTTP-request) and the `throughput_rps` derived
+   from it are not comparable across engines that issue a different number
+   of HTTP requests per delivered image — emgr answers with a 301 redirect
+   to storage that k6 follows, so one delivered image costs emgr ~2.00 HTTP
+   requests (`http_reqs_per_iteration`) against imgproxy's 1.00. Blending
+   emgr's near-instant redirects (~0.13 ms) with its real transforms into
+   one per-request distribution drags the reported median down, making
+   emgr's cold-cache p50 look "at parity" with imgproxy (22.87 vs 20.66 ms)
+   when it was not. The corrected, comparable metric is `iteration_duration`
+   (true wall-clock per delivered image, redirect hops included) and
+   `images_per_second` — see `bench-imgproxy/driver/k6-script.js`'s
+   `handleSummary` for both the metric definitions and the in-code comment
+   explaining the trap.
+2. **The true gap is substantially larger than what was previously
+   reported.** Cold cache, per delivered image, medians of 3 runs, 2 VUs,
+   30s, 36 fixture combos, every run verified `outcome_non2xx = 0` /
+   `outcome_timeout = 0` / `outcome_conn_error = 0`:
+
+   | engine | p50 ms | p90 ms | p99 ms | images/s | req/image |
+   |---|---:|---:|---:|---:|---:|
+   | imgproxy | 20.76 | 65.60 | 136.04 | 62.85 | 1.00 |
+   | emgr local_fs | 75.81 | 154.02 | 306.04 | 21.72 | 2.00 |
+   | emgr s3 | 73.81 | 160.67 | 313.81 | 21.97 | 2.00 |
+
+   emgr local_fs vs. imgproxy: p50 3.65x slower, p90 2.35x, p99 2.25x,
+   throughput 2.89x lower. emgr s3: p50 3.56x, p90 2.45x, p99 2.31x,
+   throughput 2.86x lower. For contrast, the old (misleading, per-request)
+   view of the same runs: imgproxy p50 20.66 / p90 65.51 / p99 135.87; emgr
+   p50 22.87 / p90 104.63 / p99 296.49; emgr_s3 p50 21.83 / p90 106.72 / p99
+   301.98 — the number that previously read as "near parity" (22.87 vs
+   20.66) was an artifact of the redirect-blended distribution, not a real
+   result.
+
+   emgr's 75.81 ms cold p50 is also not 75.81 ms of image processing — it is
+   process → write to storage → 301 → client re-fetches from storage. Part
+   of that figure is the two-round-trip delivery architecture itself, which
+   is the same architecture that makes emgr's warm-cache path so cheap (see
+   below and `bench-imgproxy/README.md`'s "Three engines, one asymmetry").
+
+   Warm cache, per delivered image, same run set:
+
+   | engine | p50 ms | p90 ms | p99 ms | images/s |
+   |---|---:|---:|---:|---:|
+   | imgproxy | 21.08 | 65.46 | 132.92 | 62.91 |
+   | emgr local_fs | 0.40 | 0.53 | 0.92 | 4688.13 |
+   | emgr s3 | 0.62 | 0.88 | 1.62 | 2872.05 |
+
+   Warm delivers real image bytes (verified: emgr average response 117,642 B
+   vs imgproxy 118,858 B, median 16,128 vs 9,405, max ~1.2 MB both — not
+   empty redirects, not 304s), but **this is not a processing-speed
+   comparison and must not be read as one.** imgproxy has no result cache
+   and reprocesses every request; emgr short-circuits a repeat request to a
+   301 at its storage backend before ever touching the image pipeline. In
+   production, imgproxy normally sits behind a CDN that would absorb repeat
+   requests, so the honest framing of the warm numbers is "emgr's built-in
+   result cache vs. imgproxy's reliance on an external one" — a genuine and
+   important architectural advantage for emgr, but not evidence that emgr
+   processes images faster. **The cold numbers above are the processing
+   comparison, and emgr loses those 3.65x (local_fs) / 3.56x (s3).**
