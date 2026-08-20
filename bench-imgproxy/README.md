@@ -1,13 +1,19 @@
-# emgr vs. imgproxy: head-to-head benchmark harness
+# imgproxy vs. emgr (local_fs) vs. emgr (S3): three-way benchmark harness
 
-A docker-compose harness that runs `emgr` and `imgproxy` side by side, against the
-same local image corpus, and drives both with the same load generator so their
-raw processing performance can be compared directly.
+A docker-compose harness that runs **three** engines side by side --
+`imgproxy`, `emgr` on the local-filesystem storage backend, and `emgr` on an
+S3-compatible (MinIO) storage backend -- against the same local image
+corpus, driven by the same load generator, so their raw processing
+performance *and* their storage-backend architecture can be compared
+directly.
 
 **Read the "What this does and does not prove" section before trusting any
 number this produces.** Several of the differences it measures are real
-architectural differences between the two engines, not bugs in the harness --
-they're called out explicitly below instead of being averaged away.
+architectural differences between the engines, not bugs in the harness --
+they're called out explicitly below instead of being averaged away. In
+particular, read "Three engines, one asymmetry" before drawing any
+conclusion from the local_fs-vs-S3 comparison specifically -- that
+comparison is the actual point of the three-way split, not an afterthought.
 
 ## Quick start
 
@@ -22,9 +28,10 @@ pip install pillow numpy
 python3 fixtures/generate.py
 deactivate
 
-# 2. Run the full harness: builds emgr, pulls the pinned imgproxy/nginx/k6
-#    images, brings the stack up, waits for both engines to be healthy, and
-#    runs the default (short) scenario sweep.
+# 2. Run the full harness: builds emgr (both flavours), pulls the pinned
+#    imgproxy/nginx/minio/k6 images, brings the stack up, waits for every
+#    engine to be healthy, and runs the default (short) scenario sweep
+#    across all three engines.
 ./driver/run.sh
 
 # 3. Look at the results.
@@ -38,15 +45,15 @@ Widen the sweep for a real measurement pass (the default is intentionally
 short, to validate the harness quickly):
 
 ```bash
-ENGINES="imgproxy emgr" SCENARIOS="cold warm" CONCURRENCIES="1 10 50 100" \
-  DURATION=30s ./driver/run.sh
+ENGINES="imgproxy emgr emgr_s3" SCENARIOS="cold warm" \
+  CONCURRENCIES="1 10 50 100" DURATION=30s ./driver/run.sh
 ```
 
 ## What's in this directory
 
 | Path | What it is |
 |---|---|
-| `compose.yaml` | The stack: `origin` (nginx, serves the fixture corpus), `emgr` (built from the repo's own `Dockerfile`), `imgproxy` (pinned `darthsim/imgproxy:v4.0.13`), `driver` (pinned `grafana/k6:2.2.0`, run on demand) |
+| `compose.yaml` | The stack: `origin` (nginx, serves the fixture corpus), `emgr` (local_fs backend, built from the repo's own `Dockerfile`, `fs_deploy` target), `emgr_s3` (S3/MinIO backend, same `Dockerfile`, `s3_deploy` target), `minio` + `minio_init` (S3-compatible object store `emgr_s3` writes to, plus a one-shot bucket-creation/public-ACL container), `imgproxy` (pinned `darthsim/imgproxy:v4.0.13`), `driver` (pinned `grafana/k6:2.2.0`, run on demand) |
 | `origin/nginx.conf` | Static file server for the corpus, gzip off, no caching headers, ignores query strings |
 | `fixtures/generate.py` | Deterministic fixture corpus generator (see below) |
 | `fixtures/corpus/` | The generated images nginx serves |
@@ -95,82 +102,146 @@ relying on it.
 
 ## The URL API this targets, and why
 
-`emgr`'s URL API is being rewritten **right now**, in parallel with this
-work, to imgproxy-compatible signed paths
-(`adr/0002-url-api-shape.md` at the repo root, issue #53). This harness
-targets emgr's **current, pre-rewrite query-parameter API**:
+emgr's signed-URL rewrite (`adr/0002-url-api-shape.md` at the repo root,
+issue #53/#27) has landed. Both `emgr` and `emgr_s3` speak the same
+imgproxy-style signed-path grammar -- the storage backend changes where the
+redirect *points*, never the request URL shape:
 
 ```
-GET /api/images/resize?url=<source>&width=<w>&height=<h>&format=<fmt>
--> 301 Location: <CDN_BASE_URL>/api/images/files/<key>
+GET /{signature}/{processing_options}/{base64url source}.{extension}
+-> 301 Location: <CDN_BASE_URL>/<key>
 ```
 
-(`openapi.yaml` has since been deleted along with the OpenAPI codegen, #53.)
+`{signature}` is the literal `unsigned` in this harness
+(`ALLOW_UNSIGNED_REQUESTS=true` set on both emgr services in
+`compose.yaml` -- emgr fails closed at startup without either a signing key
+or that flag, so this opt-out is mandatory, not incidental), mirroring
+imgproxy's own `insecure` signature segment. `{processing_options}` is
+`rs:fit:{w}:{h}/el:0` (fit within WxH, preserve aspect ratio, forbid
+upscaling). `{base64url source}` is the unpadded base64url encoding of the
+full source image URL, chosen over emgr's `plain/` source form because the
+source URL contains slashes and a base64url segment never does. Both
+builders live in `driver/k6-script.js`'s `urlBuilders` map (`emgr` and
+`emgr_s3`, byte-identical bodies -- see that file's comment on why they
+still need separate entries despite the identical grammar: each closes
+over a different `ENGINE_BASE_URL`).
 
-The URL shape lives entirely in `driver/k6-script.js`'s `urlBuilders` map,
-keyed by engine name -- **not hardcoded into the scenario/scoring logic** --
-specifically so it survives the rewrite. When the imgproxy-compatible path
-API lands, add a new builder (e.g. `urlBuilders.emgr_signed`) rather than
-editing the existing one, so both the legacy and new shapes stay runnable
-side by side during the transition, and re-run the harness to see whether
-the URL-shape change itself affects performance (it shouldn't, materially,
-but that's exactly the kind of assumption this harness exists to check
-rather than assume).
+(`openapi.yaml` has since been deleted along with the OpenAPI codegen,
+#53.)
 
 ## Fairness controls -- what was actually done, and why it matters
 
 This is the point of the exercise: a benchmark that flatters one side isn't
 useful to anyone. Concretely:
 
-1. **Identical CPU and memory limits.** Both `emgr` and `imgproxy` get
-   `cpus: "2"`, `memory: 1g` (the `engine_limits` YAML anchor in
-   `compose.yaml`, applied to both services from one place so they can't
-   drift independently). This is the single most important control here --
-   an unequal limit invalidates everything downstream of it.
+1. **Identical CPU and memory limits.** `emgr`, `emgr_s3` and `imgproxy`
+   *all three* get `cpus: "2"`, `memory: 1g` (the `engine_limits` YAML
+   anchor in `compose.yaml`, applied to all three services from one place
+   so they can't drift independently). This is the single most important
+   control here -- an unequal limit invalidates everything downstream of it.
+   `minio` deliberately does **not** get this treatment -- see item 7 below.
 
 2. **Identical, explicit concurrency knobs**, not left to each engine's own
-   auto-detection: `emgr`'s `MAX_CONCURRENT_PROCESSING=2` /
+   auto-detection: `emgr`'s and `emgr_s3`'s `MAX_CONCURRENT_PROCESSING=2` /
    `TOKIO_WORKER_THREADS=2` / `CPU_THREAD_POOL_SIZE=2` match `imgproxy`'s
-   `IMGPROXY_WORKERS=2` / `GOMAXPROCS=2`. emgr's own concurrency sizing
-   (`src/config/performance.rs`'s `effective_cpu_count()`) is documented as
-   cgroup-aware (#44), but this harness doesn't rely on trusting that
-   detection to have picked up the `cpus: "2"` limit correctly on every
-   host -- it pins the numbers explicitly on both sides instead.
+   `IMGPROXY_WORKERS=2` / `GOMAXPROCS=2`, and match each other exactly.
+   emgr's own concurrency sizing (`src/config/performance.rs`'s
+   `effective_cpu_count()`) is documented as cgroup-aware (#44), but this
+   harness doesn't rely on trusting that detection to have picked up the
+   `cpus: "2"` limit correctly on every host -- it pins the numbers
+   explicitly on all three sides instead.
 
    One asymmetry is left in deliberately: `MAX_CONCURRENT_DOWNLOADS=8` for
-   emgr has no imgproxy equivalent (imgproxy has one combined worker count,
-   not separate download/processing pools). Since the origin is local and
-   the download leg is I/O-bound, not CPU-bound, this was set generously
-   high specifically so it can never become *emgr's* bottleneck -- i.e. in
-   the direction that would make emgr look artificially worse, not better.
+   both emgr flavours has no imgproxy equivalent (imgproxy has one combined
+   worker count, not separate download/processing pools). Since the origin
+   is local and the download leg is I/O-bound, not CPU-bound, this was set
+   generously high specifically so it can never become *emgr's* bottleneck
+   -- i.e. in the direction that would make emgr look artificially worse,
+   not better.
 
-3. **Same local origin for both.** Neither proxy is measured against the
-   public internet; both fetch from the same `origin` nginx container
+3. **Same local origin for all three.** No engine is measured against the
+   public internet; all three fetch from the same `origin` nginx container
    serving the same on-disk files, gzip off, no compression variance.
 
-4. **Signature checking disabled on both** -- imgproxy via unset
+4. **Signature checking disabled on all three** -- imgproxy via unset
    `IMGPROXY_KEY`/`IMGPROXY_SALT` (its documented "insecure mode": the
-   signature segment of the URL, `insecure`, is accepted unchecked). emgr
-   now has HMAC-signed URLs (#27), so this IS a deliberate choice on both
-   sides: set `ALLOW_UNSIGNED_REQUESTS=true` and use the `unsigned` signature
-   segment. emgr fails closed at startup if neither a signing key nor that
-   flag is set, so the harness must opt out explicitly -- it cannot forget to.
-   Both engines therefore skip signature verification, which keeps the
-   comparison about image processing rather than HMAC throughput.
+   signature segment of the URL, `insecure`, is accepted unchecked). Both
+   emgr services have HMAC-signed URLs (#27), so this IS a deliberate choice
+   on every side: set `ALLOW_UNSIGNED_REQUESTS=true` and use the `unsigned`
+   signature segment. emgr fails closed at startup if neither a signing key
+   nor that flag is set, so the harness must opt out explicitly -- it
+   cannot forget to. All three engines therefore skip signature
+   verification, which keeps the comparison about image processing rather
+   than HMAC throughput.
 
-5. **Same resize semantics.** The driver always requests `rt:fit` from
-   imgproxy (fit within WxH, preserve aspect ratio) because that's the only
-   mode emgr's current API exposes -- emgr has no crop/fill mode to compare
-   against, so the driver never asks imgproxy to do more work than emgr is
-   even capable of being asked to do.
+5. **Same resize semantics.** The driver always requests `rt:fill` from
+   imgproxy (crop to exactly WxH) because emgr **ignores the requested
+   resize type and always crops to fill** regardless of what `rs:` mode is
+   asked for (#59) -- `rt:fill` matches what emgr actually does on both
+   flavours, so imgproxy isn't asked to do 33% more work (a `fit` request
+   on a 16:9 source returns fewer pixels than a `fill` request at the same
+   WxH) for a differently-composed image. Revert to `rt:fit` once #59 makes
+   emgr honour the requested type.
 
-6. **No upscaling requested of either engine.** emgr currently refuses to
+6. **No upscaling requested of any engine.** emgr currently refuses to
    upscale outright (`src/models/params.rs`'s `enlarge` field has no query
-   parameter to opt in yet -- see the `#[ghost(false)]` comment there). The
-   driver (`driver/k6-script.js`) filters the fixture x size matrix so no
-   combination would require either engine to upscale, rather than letting
-   imgproxy silently do more work than emgr is capable of on some fraction
-   of requests.
+   parameter to opt in yet). The driver (`driver/k6-script.js`) filters the
+   fixture x size matrix so no combination would require any engine to
+   upscale, rather than letting imgproxy silently do more work than emgr is
+   capable of on some fraction of requests.
+
+7. **The MinIO asymmetry -- deliberately NOT equalized.** `minio` gets
+   generous, un-equalized resource limits (`cpus: "2"`, `memory: 1g` in its
+   own block, not shared via `&engine_limits`) because it exists purely to
+   serve `emgr_s3` and has no equivalent helper process on the other two
+   engines: `imgproxy` and `emgr` (local_fs) are each a single container
+   doing all their own work, with nothing analogous to hand storage-serving
+   duty off to. Giving `emgr_s3` a companion process whose CPU/memory
+   consumption is never charged against `emgr_s3`'s own `engine_limits` is
+   a real, structural advantage specific to that one configuration -- not
+   a harness bug, but not nothing either. Keep this in mind when
+   `emgr_s3` outperforms `emgr` (local_fs): part of that gap is real
+   architecture (see "Three engines, one asymmetry" below) and part of it
+   is this uncounted helper process. The two are not separated out by this
+   harness.
+
+## Three engines, one asymmetry: what local_fs vs. S3 actually measures
+
+This is the reason `emgr_s3` and `minio` exist in this harness at all, not
+just an incidental third data point.
+
+`emgr` (local_fs) stores each derivative on a docker volume and points
+`CDN_BASE_URL` **back at itself**: `http://origin:3000/api/images/files`
+(see `compose.yaml`'s `emgr` service). When the client follows the 301
+redirect a successful resize response produces, it lands back on the exact
+same emgr process that just computed the derivative -- so emgr pays the
+cost of **producing** the derivative *and* the cost of **serving** its
+bytes back out over HTTP, all within the container this harness is
+measuring.
+
+`emgr_s3` stores each derivative in MinIO and points `CDN_BASE_URL` **at
+MinIO**: `http://minio:9000/emgr-bench` (see `compose.yaml`'s `emgr_s3`
+service -- the bucket is made public by `minio_init` specifically so this
+redirect resolves with no signing). When the client follows the redirect,
+it lands on `minio`, a completely different container -- `emgr_s3` never
+touches the response bytes once `PutObject` has completed. It pays the
+cost of producing the derivative and a small S3 write, but none of the
+cost of serving it back out.
+
+That's a real architectural difference in a production deployment (S3 lets
+you offload response-serving to infrastructure that scales independently
+of your image-processing fleet, typically fronted by a real CDN in
+production, which this harness does not add -- see the "Warm cache"
+section's reasoning for why a CDN layer is deliberately out of scope
+here). But it is invisible in a plain two-way emgr-vs-imgproxy comparison,
+where "emgr" only ever means "emgr, paying both costs" -- and it plausibly
+favours S3, especially at higher concurrency where the local_fs flavour is
+contending with itself for the same worker pool that's still trying to
+process new incoming requests. Whether it does, and by how much, is
+exactly what running `ENGINES="emgr emgr_s3"` at a matched concurrency
+level and comparing is for. See item 7 in "Fairness controls" above for
+the one confound this three-way split does *not* isolate: `minio`'s own
+resource cost, which is uncounted against `emgr_s3`'s budget.
 
 ## The `network_mode: "service:origin"` wiring -- read this before trusting the "cold cache" numbers
 
@@ -186,23 +257,43 @@ container at all. The guard's only sanctioned escape hatch is
 tester already uses (`src/bin/benchmark.rs`, `ALLOW_LOOPBACK_SOURCE_ADDRESSES`
 usage, binding its test server to `127.0.0.1`).
 
-To get emgr onto that loopback path, `emgr` is started with
-`network_mode: "service:origin"` in `compose.yaml`: it shares the `origin`
-container's network namespace entirely, rather than getting its own. From
-emgr's own perspective it then reaches nginx at `127.0.0.1:80` (loopback,
-allowed via the flag above), and emgr's own port 3000 becomes reachable
-externally at `origin:3000` (there is no separate `emgr:3000` DNS name --
-the container has no network identity of its own to publish one for).
-`imgproxy` has no such restriction and reaches `origin` normally, as a
-regular peer on the `bench` bridge network, by service name.
+To get emgr onto that loopback path, both `emgr` and `emgr_s3` are started
+with `network_mode: "service:origin"` in `compose.yaml`: each shares the
+`origin` container's network namespace entirely, rather than getting its
+own. From either emgr's own perspective it then reaches nginx at
+`127.0.0.1:80` (loopback, allowed via the flag above); `emgr`'s port 3000
+and `emgr_s3`'s port 3001 both become reachable externally at
+`origin:3000` / `origin:3001` (there is no separate `emgr:3000` or
+`emgr_s3:3001` DNS name -- neither container has a network identity of its
+own to publish one for). `imgproxy` has no such restriction and reaches
+`origin` normally, as a regular peer on the `bench` bridge network, by
+service name.
 
-**Consequence:** emgr's requests to the origin traverse a shared loopback
-interface; imgproxy's traverse a normal container-to-container bridge hop.
-Both are "local, no internet" and both are sub-millisecond compared to
+**MinIO does NOT need this treatment, and this was verified rather than
+assumed.** The SSRF guard sits in front of exactly one code path: the
+*source image fetch* (`src/services/image/handler.rs`, which calls into
+`source_guard::validate_scheme`/`is_allowed_source`/
+`resolve_validated_addr` before ever issuing a `reqwest` request). The
+storage layer is a completely separate code path --
+`src/services/storage/s3_handler.rs`'s `MinIOStorage` talks to MinIO
+exclusively through the `aws-sdk-s3` client, which never calls into
+`source_guard` at all. So `emgr_s3` reaches `minio` as an ordinary peer on
+the `bench` bridge network, by service name (`http://minio:9000`), exactly
+like `imgproxy` reaches `origin` -- no loopback trick, no
+`ALLOW_LOOPBACK_SOURCE_ADDRESSES` involvement, because that flag only ever
+widens the source-fetch guard, and the guard was never in this leg's way
+to begin with.
+
+**Consequence:** both emgr flavours' requests to the origin traverse a
+shared loopback interface; imgproxy's traverse a normal
+container-to-container bridge hop; `emgr_s3`'s requests to MinIO **also**
+traverse a normal bridge hop, same as imgproxy's to origin. All of these
+are "local, no internet" and all are sub-millisecond compared to
 decode/resize/encode cost at any of this corpus's resolutions, so this is
 very unlikely to be a meaningful confound -- but it is not a bit-for-bit
-identical network path, and you should know that before reading the last
-fraction of a millisecond into any latency comparison.
+identical network path across all three engines, and you should know that
+before reading the last fraction of a millisecond into any latency
+comparison.
 
 ## Scenarios
 
@@ -227,14 +318,18 @@ to trust most.
 ### Warm cache
 
 Every request is bit-for-bit identical (fixed `variant=fixed`). **This is
-deliberately not an apples-to-apples comparison between the two engines,**
+deliberately not an apples-to-apples comparison across the three engines,**
 and is reported as its own scenario specifically so it isn't mistaken for
 one:
 
-- `emgr` stores each derivative and 301-redirects to it. On a cache hit it
-  can skip decode/resize/encode entirely and serve straight from storage.
-  The driver follows the redirect (k6's default behavior), so the reported
-  latency covers the full round trip a real client would experience.
+- `emgr` and `emgr_s3` both store each derivative and 301-redirect to it.
+  On a cache hit either can skip decode/resize/encode entirely -- but
+  `emgr` redirects the client back to itself (see "Three engines, one
+  asymmetry" above), while `emgr_s3` redirects to `minio`. The driver
+  follows the redirect (k6's default behavior), so the reported latency
+  covers the full round trip a real client would experience, and that
+  round trip's *destination* differs between the two emgr flavours even
+  though both call it a cache hit.
 - `imgproxy` has **no built-in result cache**. Every single request is
   fully reprocessed from scratch, warm or not -- imgproxy's documented
   deployment pattern is to put a CDN or reverse-proxy cache in front of it,
@@ -243,10 +338,13 @@ one:
   but not this one).
 
 So "warm cache" numbers show each engine's real, distinct production
-architecture -- redirect-to-already-cached-object vs. reprocess-every-time
--- not two implementations of the same operation. Expect emgr to look
-dramatically better here **by design**, not because its image processing is
-faster.
+architecture -- redirect-to-self vs. redirect-to-object-store vs.
+reprocess-every-time -- not three implementations of the same operation.
+Expect both emgr flavours to look dramatically better than imgproxy here
+**by design**, not because their image processing is faster; and expect
+`emgr_s3` to look better than `emgr` (local_fs) for the same
+"who serves the response bytes" reason covered in "Three engines, one
+asymmetry."
 
 ### Concurrency sweep
 
@@ -328,39 +426,100 @@ convention):
 
 - `darthsim/imgproxy:v4.0.13` (digest-pinned in `compose.yaml`)
 - `nginx:1.27-alpine` (digest-pinned)
+- `minio/minio:RELEASE.2024-11-07T00-52-20Z` (digest-pinned)
+- `minio/mc:RELEASE.2024-11-05T11-29-45Z` (digest-pinned, one-shot bucket
+  creation/public-ACL only)
 - `grafana/k6:2.2.0` (digest-pinned)
 - `busybox:1.36` (digest-pinned, one-shot volume permissions fixup only)
-- `emgr`: built from the repo root's own `Dockerfile`, `fs_deploy` target
-  (no OTel instrumentation, so neither engine pays a tracing tax the other
-  doesn't)
+- `emgr`/`emgr_s3`: both built from the repo root's own `Dockerfile`,
+  `fs_deploy`/`s3_deploy` targets respectively (neither has OTel
+  instrumentation, so none of the three engines pays a tracing tax the
+  others don't)
 
 ## Status of this harness as delivered
 
-**Validated against imgproxy + origin only.** `emgr`'s own build currently
-was blocked at the time this harness was written: the signed-URL rewrite
-(#53/#27) was mid-flight and `cargo build` failed. **That has since landed.**
-emgr builds and the harness targets the signed-path grammar
-`/{signature}/{options}/{source}.{ext}` via the templated `urlBuilders` map
-in `driver/k6-script.js`. Set `ALLOW_UNSIGNED_REQUESTS=true` and use the
-`unsigned` signature segment, mirroring imgproxy's `insecure` mode.
+**`imgproxy` and `emgr` (local_fs) are validated end-to-end with real
+numbers below. `emgr_s3` is blocked by a pre-existing bug outside this
+harness's scope -- see "Known blocker" below.**
 
-What *was* validated end-to-end in this environment:
+### Validated: imgproxy vs. emgr (local_fs), cold cache, concurrency 2
 
-- `origin` (nginx) builds, starts, passes its healthcheck, and serves the
-  corpus correctly (verified via direct `curl`).
-- `imgproxy` builds, starts, passes its healthcheck (`imgproxy health`),
-  and correctly resizes/reformats real requests through the exact URL
-  shape the driver generates (verified via direct `curl` against a
-  `w:300/h:300/rt:fit/f:jpg` request, and via a full `k6` run).
-- The `k6` driver runs the full scenario logic against `imgproxy`
-  end-to-end: 424 requests at VUs=5/8s with **zero non-2xx, timeout, or
-  connection errors**, real p50/p90/p99/p99.9 latency, and per-combination
-  response-size tracking, written to both stdout and
-  `results/imgproxy-cold-vus5.json`.
-- `docker compose config` validates the full stack (including the `emgr`
-  service definition) with no YAML/schema errors.
+Real `k6` run, `SCENARIO=cold`, `VUS=2`, `DURATION=20s`, both against the
+same `origin` corpus, both with zero non-2xx/timeout/connection errors
+(`results/imgproxy-cold-vus2.json`, `results/emgr-cold-vus2.json`):
 
-What was **not** validated in this environment, and should be your first
-step once `emgr` builds again: run `./driver/run.sh` end-to-end with both
-engines and sanity-check the emgr side manually (`curl` a single
-`/api/images/resize` request) before trusting a full sweep.
+| Metric | imgproxy | emgr (local_fs) |
+|---|---:|---:|
+| Requests (2xx) | 1001 | 337 |
+| Non-2xx / timeout / conn error | 0 / 0 / 0 | 0 / 0 / 0 |
+| Throughput | 50.01 req/s | 33.59 req/s |
+| p50 (med) | 24.75 ms | 24.03 ms |
+| p90 | 83.14 ms | 181.76 ms |
+| p99 | 176.34 ms | 284.60 ms |
+| p99.9 | 187.74 ms | 554.05 ms |
+| max | 199.44 ms | 560.26 ms |
+| avg response size | 152,091 B | 232,918 B |
+
+At this (deliberately low, `MAX_CONCURRENT_PROCESSING=2`) concurrency
+level, imgproxy sustains roughly 1.5x emgr's throughput and has a visibly
+tighter tail (p99.9/p50 ratio ~7.6x for imgproxy vs. ~23x for emgr). Two
+confounds worth naming before reading more into this than that: (1) emgr's
+average response is ~53% larger than imgproxy's for the same request mix
+-- see "Output size at comparable quality" above, the two are not
+guaranteed to be encoding at matched quality, so part of emgr's tail cost
+may be encoding larger payloads, not being slower per byte; (2) this is
+`local_fs` emgr specifically, which (per "Three engines, one asymmetry"
+above) pays for serving its own response bytes on top of producing them --
+this is *not yet* the number that isolates image-processing speed from
+storage-serving cost. That isolation is exactly what the `emgr_s3` leg
+below was meant to provide.
+
+### Known blocker: `emgr_s3` cannot start -- `s3_deploy` build is broken independent of this harness
+
+`compose.yaml`, `driver/run.sh` and `driver/k6-script.js` are fully wired
+for the three-way comparison (`docker compose config` validates cleanly,
+`origin`/`minio`/`minio_init`/`imgproxy`/`emgr` all reach `healthy` and the
+bucket is created and made public correctly). `emgr_s3` builds successfully
+but its container **crashes on startup**:
+
+```
+/app/emgr: /lib/aarch64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found (required by /app/emgr)
+```
+
+This is a **pre-existing bug in the repo root `Dockerfile`**, not something
+introduced by this harness, and not something this harness's `bench-imgproxy/`
+scope can fix (the fix belongs in `Dockerfile`, which was explicitly out of
+scope for this work). Root cause, confirmed by diffing the two binaries
+with `objdump -T`:
+
+- The `builder` stage (`FROM rust@sha256:...`) is Debian 13 "trixie"
+  (glibc 2.41). `base_deploy` (`FROM gcr.io/distroless/cc-debian12@sha256:...`)
+  is Debian 12 "bookworm" (glibc ~2.36) -- a **major Debian version
+  mismatch between the compile stage and the runtime stage**.
+- Only the `s3`-feature binary references `GLIBC_2.38` symbols
+  (`__isoc23_sscanf`, `__isoc23_strtol` -- ISO C23 `sscanf`/`strtol`
+  variants that Debian 13's newer glibc headers alias to by default). The
+  `local_fs`-feature binary (`emgr`, confirmed working above) references no
+  symbol newer than `GLIBC_2.34`. This points at the `s3` feature's native
+  C dependency chain (almost certainly `aws-lc-sys`, the only C code the
+  `s3` feature compiles) picking up the builder's newer glibc headers at
+  compile time, in a way `local_fs`'s pure-Rust dependency tree never does.
+- `base_deploy`'s glibc (Debian 12) predates `GLIBC_2.38` entirely, so the
+  binary fails to even start, regardless of runtime configuration -- this
+  is not fixable from `compose.yaml` (no env var, build arg, or Cargo
+  feature flag changes which glibc headers the builder's C toolchain links
+  against).
+- The fix belongs in `Dockerfile`: either bump `base_deploy` to a
+  Debian-13-based distroless image (e.g. `gcr.io/distroless/cc-debian13`,
+  once available) so it matches the builder stage, or pin the `builder`
+  stage to a Debian-12-based Rust image so it matches `base_deploy`. Either
+  change needs to preserve identical `local_fs` behavior, since that build
+  is already working.
+
+Once that lands, `emgr_s3` needs no changes on this harness's side to run
+-- `compose.yaml`, `driver/run.sh`'s healthcheck loop (`emgr:18081`,
+`emgr_s3:18087`), and `driver/k6-script.js`'s `urlBuilders.emgr_s3` are
+already in place and were validated up to exactly this point (build
+succeeds, `origin`/`minio`/`minio_init` all become healthy with `emgr_s3`
+correctly waiting on all three via `depends_on`, and the only failure is
+the container's own entrypoint refusing to start).

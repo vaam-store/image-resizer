@@ -15,7 +15,7 @@ import encoding from 'k6/encoding';
 // Configuration (all via env vars, set by ../driver/run.sh per scenario)
 // ---------------------------------------------------------------------
 
-const ENGINE = __ENV.ENGINE || 'emgr'; // 'emgr' | 'imgproxy'
+const ENGINE = __ENV.ENGINE || 'emgr'; // 'emgr' | 'emgr_s3' | 'imgproxy'
 const SCENARIO = __ENV.SCENARIO || 'cold'; // 'cold' | 'warm'
 const ENGINE_BASE_URL = __ENV.ENGINE_BASE_URL || 'http://origin:3000';
 // Where the *proxy itself* fetches source images from -- NOT necessarily
@@ -109,6 +109,19 @@ const urlBuilders = {
   // default, so res.timings.duration covers the full round trip (resize
   // plus the storage fetch), which is how a real client experiences it.
   emgr(sourceUrl, w, h, format) {
+    const options = `rs:fit:${w}:${h}/el:0`;
+    return `${ENGINE_BASE_URL}/unsigned/${options}/${base64UrlEncode(sourceUrl)}.${format}`;
+  },
+
+  // emgr on the S3/MinIO storage backend -- identical URL grammar to plain
+  // `emgr` above (the URL API doesn't change with the storage backend,
+  // only what CDN_BASE_URL the 301 Location header points at -- see
+  // ../compose.yaml's `emgr_s3` service and its "THE POINT OF THE
+  // THREE-WAY SPLIT" header comment). ENGINE_BASE_URL/ORIGIN_SOURCE_BASE_URL
+  // still differ per engine via ../driver/run.sh's engine_base_url()/
+  // origin_source_base_url(), so this can't just be an alias assignment to
+  // `emgr` -- it needs its own entry even though the body is the same.
+  emgr_s3(sourceUrl, w, h, format) {
     const options = `rs:fit:${w}:${h}/el:0`;
     return `${ENGINE_BASE_URL}/unsigned/${options}/${base64UrlEncode(sourceUrl)}.${format}`;
   },
