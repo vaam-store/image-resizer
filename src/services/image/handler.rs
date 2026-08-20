@@ -1,5 +1,8 @@
 use crate::config::performance::PerformanceConfig;
-use crate::models::params::{ResizeQuery, ResizeType};
+use crate::models::params::{
+    Crop, CropDimension, Gravity, Padding, ResizeQuery, ResizeType, TrimOptions,
+    WatermarkPosition, WatermarkQuery,
+};
 use crate::services::image::source_guard;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -8,7 +11,10 @@ use fast_image_resize as fir;
 use futures::StreamExt;
 use image::imageops::FilterType;
 use image::metadata::Orientation;
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat};
+use image::{
+    AnimationDecoder, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat,
+    Rgb, RgbImage, Rgba, RgbaImage,
+};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
 use std::io::Cursor;
@@ -44,6 +50,22 @@ pub const DEFAULT_WEBP_QUALITY: f32 = 82.0;
 /// against this exact default and requested no change to it either.
 pub const DEFAULT_JPEG_QUALITY: u8 = 75;
 
+/// Default AVIF encode quality (1-100, `ravif`'s own scale via
+/// `image::codecs::avif::AvifEncoder`), used when `ResizeQuery::quality`
+/// (the `q:{0-100}` processing option) isn't set. `80` matches both
+/// `AvifEncoder::new`'s own default and `cavif`'s (the reference AVIF CLI
+/// `ravif` is built from) - see
+/// `image-0.25.10/src/codecs/avif/encoder.rs:59-60`. Measured against real
+/// photographs in `adr/0004-avif-measurement.md`.
+pub const DEFAULT_AVIF_QUALITY: u8 = 80;
+
+/// AVIF encode speed (1-10, slower = smaller/better, `ravif`'s scale),
+/// again matching `AvifEncoder::new`/`cavif`'s own default. Not exposed as
+/// a request-level knob (imgproxy has no equivalent option either) - see
+/// `adr/0004-avif-measurement.md` for the encode-time cost this trades
+/// against output size at this setting.
+pub const DEFAULT_AVIF_SPEED: u8 = 4;
+
 /// Default background colour (#34) used both to flatten alpha before
 /// encoding to a format with no alpha channel, and as the fill colour for
 /// fully-transparent pixels when the output format keeps alpha (#60), when
@@ -56,6 +78,19 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 75;
 /// should still produce a sane image instead of the undefined-RGB fringing
 /// #34 exists to fix.
 pub const DEFAULT_BACKGROUND: [u8; 3] = [255, 255, 255];
+
+/// The two width/height boxes `ImageService::effective_resize_box` (#51)
+/// computes from a request's `width`/`height`/`zoom`/`dpr`/`min-width`/
+/// `min-height`/`rotate` options: `resize_box` (fed into the actual resize
+/// dispatch, enlarge-capped and min-floored) and `extend_box` (the
+/// separate, *not* enlarge-capped target `extend` pads toward). See
+/// `effective_resize_box`'s doc comment for why these two boxes are
+/// deliberately not the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectiveSizing {
+    resize_box: (Option<u32>, Option<u32>),
+    extend_box: Option<(u32, u32)>,
+}
 
 #[derive(Clone, Builder)]
 pub struct ImageService {
@@ -338,6 +373,19 @@ impl ImageService {
         image_bytes: &Bytes,
         params: &ResizeQuery,
     ) -> Result<(Vec<u8>, String)> {
+        // Watermark fetch (#52), done *before* acquiring the CPU-bound
+        // `processing_semaphore` permit below - this is network I/O, not
+        // CPU work, so it must not hold a processing slot idle while it
+        // waits on the network. Reuses `download_image` - and therefore
+        // `fetch_validated`'s full SSRF guard (#21/#57) - unconditionally,
+        // whether the URL came from the request's own `wmu:` option or this
+        // deployment's configured `WATERMARK_URL` default: a watermark URL
+        // is just as much an attacker-reachable fetch target as the main
+        // source URL when it's caller-supplied, and treating the
+        // operator-configured default through the same guarded path is
+        // simpler than maintaining two fetch code paths for one option.
+        let watermark_bytes = self.download_watermark_if_needed(params).await?;
+
         let permit = match Arc::clone(&self.processing_semaphore).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -349,7 +397,7 @@ impl ImageService {
         };
 
         // Cheap: an `Arc`-backed refcount bump, not a copy of the image
-        // bytes (#31).
+        // bytes (#31). Same for `watermark_bytes` (also `Bytes`).
         let image_bytes = image_bytes.clone();
         let params = params.clone();
         let config = self.config.clone();
@@ -369,11 +417,49 @@ impl ImageService {
                 return;
             }
 
-            let result = Self::process_image_blocking_with_limits(&image_bytes, &params, &config);
+            let result = Self::process_image_blocking_with_limits_and_watermark(
+                &image_bytes,
+                &params,
+                &config,
+                watermark_bytes.as_deref(),
+            );
             let _ = tx.send(result);
         });
 
         rx.await.context("Image processing task was cancelled")?
+    }
+
+    /// Resolves and fetches the watermark image for `params`, if `params`
+    /// requests one (#52). `None` when `params.watermark` is `None` -
+    /// watermarking is off, nothing to fetch.
+    ///
+    /// URL resolution order: the request's own `wmu:` (`WatermarkQuery::url`)
+    /// takes priority over this deployment's configured `WATERMARK_URL`
+    /// default. `wm:` with neither is a clear error rather than silently
+    /// skipping the watermark - a caller (or operator) who asked for one
+    /// should be told it couldn't be honoured, not served a response that
+    /// silently doesn't match what they asked for.
+    async fn download_watermark_if_needed(&self, params: &ResizeQuery) -> Result<Option<Bytes>> {
+        let Some(watermark) = &params.watermark else {
+            return Ok(None);
+        };
+
+        let url = watermark
+            .url
+            .clone()
+            .or_else(|| self.config.watermark_url.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "watermark requested (wm:) but no watermark image is available - set \
+                     WATERMARK_URL or pass wmu:{{base64url}} in the request"
+                )
+            })?;
+
+        let bytes = self
+            .download_image(&url)
+            .await
+            .context("Failed to download watermark image")?;
+        Ok(Some(bytes))
     }
 
     /// CPU-intensive image processing with optimizations
@@ -397,6 +483,18 @@ impl ImageService {
         Self::process_image_blocking_with_limits(image_bytes, params, &PerformanceConfig::default())
     }
 
+    /// [`Self::process_image_blocking_with_limits_and_watermark`] with no
+    /// watermark bytes - kept as its own function (rather than inlining
+    /// `None` at every call site) so the ~20 existing tests and benches
+    /// calling this 3-argument form are unaffected by #52.
+    fn process_image_blocking_with_limits(
+        image_bytes: &[u8],
+        params: &ResizeQuery,
+        config: &PerformanceConfig,
+    ) -> Result<(Vec<u8>, String)> {
+        Self::process_image_blocking_with_limits_and_watermark(image_bytes, params, config, None)
+    }
+
     /// Decode/resize/encode a single image, enforcing the resolution
     /// limits from #26:
     /// - the decoded *source* resolution (in megapixels) is checked
@@ -408,15 +506,70 @@ impl ImageService {
     /// - the `image` crate's decode `Limits` are configured explicitly
     ///   (width/height/alloc) instead of inheriting its accidental 512MiB
     ///   `max_alloc` default, as defense in depth behind the header check.
-    fn process_image_blocking_with_limits(
+    ///
+    /// #49: also the entry point for the animated-GIF/WebP path. When the
+    /// requested output format can itself carry animation (`Gif`/`Webp`)
+    /// *and* the detected source format can too, this dispatches to
+    /// [`Self::decode_animation_source`]/[`Self::encode_animation`] instead
+    /// of the single-`DynamicImage` pipeline below. Every other combination
+    /// - including an animated source requested as a non-animatable format
+    /// like `.jpg` - is unaffected and keeps the pre-#49 behaviour of
+    /// decoding (and encoding) only the first frame.
+    ///
+    /// `watermark_bytes` (#52) is `Some(..)` exactly when `params.watermark`
+    /// is also `Some(..)` (the caller - `process_image` - only fetches it in
+    /// that case); compositing happens after grayscale/blur but *before*
+    /// the #34/#60 alpha-flatten/normalise stage below, so a watermark's
+    /// own alpha contributes to what gets flattened/normalised instead of
+    /// slipping past it.
+    fn process_image_blocking_with_limits_and_watermark(
         image_bytes: &[u8],
         params: &ResizeQuery,
         config: &PerformanceConfig,
+        watermark_bytes: Option<&[u8]>,
     ) -> Result<(Vec<u8>, String)> {
         Self::check_output_dimensions(params, config)?;
 
         // Use faster image decoding with format hints
         let format = Self::detect_format_from_bytes(image_bytes);
+
+        let wants_animatable_output = matches!(
+            params.format,
+            crate::models::params::ImageFormat::Gif | crate::models::params::ImageFormat::Webp
+        );
+
+        if wants_animatable_output {
+            if let Some(source_format) = format {
+                if let Some((frames, src_width, src_height)) =
+                    Self::decode_animation_source(image_bytes, source_format, config)?
+                {
+                    if frames.len() > 1 {
+                        return Self::encode_animation(frames, src_width, src_height, params);
+                    }
+
+                    // Exactly one frame decoded (the source wasn't
+                    // actually animated, e.g. a static single-frame GIF
+                    // requested as `.gif`) - reuse the frame already
+                    // decoded above directly as the `DynamicImage` for the
+                    // ordinary single-image pipeline below instead of
+                    // decoding the source a second time.
+                    let frame = frames
+                        .into_iter()
+                        .next()
+                        .expect("checked frames.len() == 1 above");
+                    let img = DynamicImage::ImageRgba8(frame.into_buffer());
+                    return Self::encode_single_image(
+                        img,
+                        src_width,
+                        src_height,
+                        params,
+                        None,
+                        config,
+                        watermark_bytes,
+                    );
+                }
+            }
+        }
 
         // Peek the header-only dimensions *before* touching the full
         // decode path, so a decompression-bomb-style source (tiny on disk,
@@ -440,25 +593,77 @@ impl ImageService {
             img.apply_orientation(orientation);
         }
 
+        // #51: `trim` is always the *first* geometry operation - imgproxy's
+        // own pipeline runs it before `scaleOnLoad`/`crop`/`scale`, ahead of
+        // anything else that reads dimensions. Every dimension read below
+        // (the explicit `c:` crop, `src_width`/`src_height`, the enlarge
+        // guard, zoom/dpr/min-width/min-height, the resize itself) must
+        // therefore see the *post-trim* image, not the original decode.
+        let img = match &params.trim {
+            Some(trim) => Self::apply_trim(&img, trim),
+            None => img,
+        };
+
+        // Explicit `c:` crop (#50) - applied *after* trim but *before* any
+        // resize math, matching imgproxy's own "trim, then crop before
+        // resize" ordering (<https://docs.imgproxy.net/usage/processing#crop>,
+        // see the `trim` comment just above). Every dimension computed
+        // below (the upscale guard, `resize_dimensions`, the `auto`
+        // orientation comparison) is therefore computed against the
+        // trimmed-then-cropped image, not the original decoded one -
+        // exactly as if the source had been that size all along.
+        let img = match &params.crop {
+            Some(crop) => Self::apply_crop(&img, crop),
+            None => img,
+        };
+
         let (src_width, src_height) = img.dimensions();
 
-        // Upscale guard (#36): refuses to enlarge past the source
-        // resolution unless `params.enlarge` opts in, mirroring imgproxy's
-        // `enlarge` option (default off). Capping each requested dimension
-        // to the source's, rather than rejecting the request outright,
-        // keeps every resize branch below unchanged - it just never sees a
-        // target dimension larger than the source, so none of them can
-        // upscale. This also closes a cheap CPU amplification vector: the
-        // committed benchmark baseline (.bench-baseline/BASELINE.md) puts
-        // resize/upscale/lanczos3 at 143ms vs 17.4ms for the equivalent
-        // downscale (~8x), for what would otherwise be a single request
-        // naming an arbitrary output size against a tiny source.
-        let effective_width = params
-            .width
-            .map(|w| if params.enlarge { w } else { w.min(src_width) });
-        let effective_height = params
-            .height
-            .map(|h| if params.enlarge { h } else { h.min(src_height) });
+        Self::encode_single_image(
+            img,
+            src_width,
+            src_height,
+            params,
+            icc_profile,
+            config,
+            watermark_bytes,
+        )
+    }
+
+    /// Resizes, filters and encodes a single already-decoded image to
+    /// `params.format`. Split out of `process_image_blocking_with_limits`
+    /// (#49) so it can be shared by that function's ordinary single-image
+    /// path and its animated-source-but-turned-out-not-actually-animated
+    /// fallback, which already has a `DynamicImage` in hand (the source's
+    /// only frame) and would otherwise have to decode the source a second
+    /// time to reach this same logic.
+    ///
+    /// `icc_profile` (#33) is threaded through explicitly rather than
+    /// re-read here, since by the time this function runs the original
+    /// `ImageDecoder` has already been consumed by `DynamicImage::from_decoder`.
+    /// The animated-but-actually-single-frame fallback has no ICC profile to
+    /// forward - `decode_animation_source` doesn't extract one from the
+    /// GIF/WebP animation decoders - so it passes `None`.
+    fn encode_single_image(
+        img: DynamicImage,
+        src_width: u32,
+        src_height: u32,
+        params: &ResizeQuery,
+        icc_profile: Option<Vec<u8>>,
+        config: &PerformanceConfig,
+        watermark_bytes: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, String)> {
+        // #51: folds the #36 enlarge guard together with `zoom`, `dpr`,
+        // `min-width`/`min-height` and the `rotate` axis swap into the box
+        // actually fed to the resize dispatch below (`resize_box`), plus
+        // the separate, not-enlarge-capped box `extend` needs
+        // (`extend_box`) - see `Self::effective_resize_box`'s doc comment
+        // for the full ordering rationale (it supersedes the plain "cap
+        // each requested dimension to the source's" #36 guard this used to
+        // be, folding that exact same rule in as one step of a larger
+        // calculation).
+        let sizing = Self::effective_resize_box(params, src_width, src_height);
+        let (effective_width, effective_height) = sizing.resize_box;
 
         // Use faster resize algorithms for different scenarios
         let filter = match (effective_width, effective_height) {
@@ -468,87 +673,95 @@ impl ImageService {
             _ => FilterType::Lanczos3,
         };
 
-        // Resize image with optimized logic. `effective_width`/
-        // `effective_height` are already capped to the source resolution
-        // per axis unless `enlarge` is set (above), and every branch below
-        // - `resize` (fit), `resize_to_fill` (fill/auto-as-fill),
-        // `resize_exact` (force) - only ever shrinks each axis to at most
-        // its capped target, so none of them can upscale past the source:
-        // the #36 guard holds for every resize type, not just fill.
-        // #63 stage 1: the actual resampling is now done by
-        // `fast_image_resize` (SIMD, pure Rust) via the `Self::fir_*`
-        // helpers below instead of `DynamicImage::resize`/
-        // `resize_to_fill`/`resize_exact` directly - resize was the
-        // single most expensive stage in the committed benchmark baseline
-        // (17.39ms lanczos3 downscale vs 6.78ms JPEG decode), not decode.
-        // Every `fir_*` helper reproduces the exact target-dimension math
-        // its `image`-crate counterpart uses internally (see their doc
-        // comments), so only the resampling kernel changes here - the
-        // fit/fill/force/auto branching below, and the #36 enlarge-guard
-        // reasoning it documents, are unchanged.
-        let img = match (effective_width, effective_height) {
-            (Some(w), None) => Self::fir_resize(&img, w, u32::MAX, filter)?,
-            (None, Some(h)) => Self::fir_resize(&img, u32::MAX, h, filter)?,
-            (Some(w), Some(h)) => match params.resize_type {
-                // Fit inside the box, preserving aspect ratio - neither
-                // output dimension exceeds `w`/`h`. This is also what a
-                // lone width or height already did above, so `Fit` (the
-                // default, see `ResizeType`) keeps that existing behaviour
-                // consistent once both dimensions are given (#59).
-                ResizeType::Fit => Self::fir_resize(&img, w, h, filter)?,
-                // Cover the box, preserving aspect ratio, then crop the
-                // overflow. `resize_to_fill` already crops to exactly
-                // `w x h` internally (verified against image-0.25.10's
-                // `DynamicImage::resize_to_fill`,
-                // `image-0.25.10/src/images/dynimage.rs:943-962`, which
-                // calls `.crop(...)` on the scaled image before
-                // returning), so no separate manual crop step is needed
-                // here (#36).
-                ResizeType::Fill => Self::fir_resize_to_fill(&img, w, h, filter)?,
-                // Stretch to exactly `w x h`, ignoring aspect ratio.
-                ResizeType::Force => Self::fir_resize_exact(&img, w, h, filter)?,
-                // imgproxy's documented `auto` rule
-                // (https://docs.imgproxy.net/usage/processing#resizing-type):
-                // "if both source and resulting dimensions have the same
-                // orientation (portrait or landscape), imgproxy will use
-                // `fill`. Otherwise, it will use `fit`." A box is treated
-                // as landscape-or-square when width >= height and portrait
-                // otherwise, applied identically to the source and the
-                // requested box so the comparison is consistent.
-                ResizeType::Auto => {
-                    let src_landscape = src_width >= src_height;
-                    let dst_landscape = w >= h;
-                    if src_landscape == dst_landscape {
-                        Self::fir_resize_to_fill(&img, w, h, filter)?
-                    } else {
-                        Self::fir_resize(&img, w, h, filter)?
-                    }
-                }
-            },
-            (None, None) => img,
+        let img = Self::resize_and_filter(
+            &img,
+            effective_width,
+            effective_height,
+            filter,
+            params,
+            src_width,
+            src_height,
+        )?;
+
+        // #51: `extend` then `padding`, matching imgproxy's own pipeline
+        // order (`mainPipeline`: `applyFilters`, then `extend` /
+        // `extendAspectRatio`, then `padding`). Both enlarge the canvas via
+        // a `background` fill - resolved once here so `extend` and
+        // `padding` composite onto the identical colour #34/#60's
+        // alpha-flatten/normalise step below would otherwise have used.
+        let background = params.background.unwrap_or(DEFAULT_BACKGROUND);
+
+        let img = match sizing.extend_box {
+            // Mirrors imgproxy's own precondition: `extend` only pads
+            // toward a *complete* target canvas, i.e. both axes of the
+            // (zoom/dpr-scaled, not enlarge-capped) requested box must be
+            // known - see `Self::effective_resize_box`'s doc comment for
+            // why `extend_box` is deliberately *not* the same, enlarge-
+            // capped box the resize step above used.
+            Some((target_w, target_h)) if params.extend => {
+                Self::apply_extend(img, target_w, target_h, background)
+            }
+            _ => img,
         };
 
-        // Apply filters efficiently
-        let img = if let Some(true) = params.grayscale {
-            img.grayscale()
-        } else {
-            img
+        let img = match &params.padding {
+            Some(padding) => Self::apply_padding(img, padding, background),
+            None => img,
         };
 
-        let img = if let Some(sigma) = params.blur_sigma {
-            if sigma > 0.0 { img.blur(sigma) } else { img }
-        } else {
-            img
+        // #51 safety net: `padding`/`extend` can grow the canvas past what
+        // the #26 output-dimension cap (already checked pre-decode against
+        // the *requested* size) allows, since padding is pure pixel
+        // addition, not part of the zoom/dpr-scaled request that check
+        // covers. Re-check the actual, final dimensions here rather than
+        // letting an unbounded `pd:` value slip past #26 entirely.
+        let (final_width, final_height) = img.dimensions();
+        if final_width > config.max_output_width || final_height > config.max_output_height {
+            anyhow::bail!(
+                "Requested output dimensions too large after extend/padding: {final_width}x{final_height} exceeds maximum {}x{}",
+                config.max_output_width,
+                config.max_output_height
+            );
+        }
+
+        // Watermark compositing (#52). Deliberately placed here - after
+        // every pixel-content transform above (resize/grayscale/blur), but
+        // *before* the #34/#60 alpha-flatten/normalise stage below. Doing
+        // this any later would let the watermark's own alpha slip past
+        // that stage untouched (e.g. a semi-transparent watermark edge
+        // encoded to JPEG would keep undefined/fringing RGB under partial
+        // alpha instead of being properly flattened); doing it any earlier
+        // (e.g. before resize) would resize the watermark along with the
+        // base image instead of at its own requested size/scale.
+        let img = match (watermark_bytes, &params.watermark) {
+            (Some(watermark_bytes), Some(watermark)) => {
+                Self::apply_watermark(img, watermark_bytes, watermark)?
+            }
+            _ => img,
         };
 
         // Optimize encoding based on format
         // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is
-        // now hand-written in `src/models/params.rs`. Mechanical path
-        // change only - same three variants, no logic here changed.
+        // now hand-written in `src/models/params.rs`. #49 adds `Avif` and
+        // `Gif` alongside the original three variants.
         let (output_format, content_type) = match params.format {
             crate::models::params::ImageFormat::Jpg => (ImageFormat::Jpeg, "image/jpeg"),
             crate::models::params::ImageFormat::Png => (ImageFormat::Png, "image/png"),
             crate::models::params::ImageFormat::Webp => (ImageFormat::WebP, "image/webp"),
+            crate::models::params::ImageFormat::Avif => (ImageFormat::Avif, "image/avif"),
+            crate::models::params::ImageFormat::Gif => (ImageFormat::Gif, "image/gif"),
+            // `crate::modules::negotiation::resolve` always resolves `Auto`
+            // to a concrete format before a `ResizeQuery` is ever built
+            // (`crate::modules::api::resize::handle`) - reaching this arm
+            // is a bug in that call site, not a real request. Surfaced as
+            // an error rather than a panic: this stage decodes/encodes
+            // attacker-supplied bytes, and a panic here would take the
+            // whole worker down (see `[profile.perf]`'s `panic = "unwind"`
+            // note in `Cargo.toml`) for what is, from the caller's
+            // perspective, an ordinary 500.
+            crate::models::params::ImageFormat::Auto => {
+                anyhow::bail!("internal error: unresolved Auto format reached the image encoder")
+            }
         };
 
         // Alpha handling (#34/#60). Gated on `img.has_alpha()` so a source
@@ -567,17 +780,17 @@ impl ImageService {
                 // under alpha=0) show up as visible fringing instead of a
                 // clean edge against the configured background.
                 ImageFormat::Jpeg => Self::flatten_onto_background(&img, background),
-                // PNG/WebP keep their alpha channel, so this is not a
-                // flatten - but a fully-transparent pixel's RGB is
+                // PNG/WebP/AVIF/GIF keep their alpha channel, so this is
+                // not a flatten - but a fully-transparent pixel's RGB is
                 // invisible by definition, and the source frequently
                 // carries undefined/noisy values there that cost real
                 // encoded bytes for a region nobody can see (#60).
                 // Normalising just those pixels to a constant lets
-                // DEFLATE/VP8L collapse the region instead. Only exactly
-                // `alpha == 0` pixels are touched - partial transparency is
-                // visibly blended with whatever is behind it, so rewriting
-                // its RGB would be a real (lossy) visual change, not the
-                // lossless one this is meant to be.
+                // DEFLATE/VP8L/AV1/LZW collapse the region instead. Only
+                // exactly `alpha == 0` pixels are touched - partial
+                // transparency is visibly blended with whatever is behind
+                // it, so rewriting its RGB would be a real (lossy) visual
+                // change, not the lossless one this is meant to be.
                 _ => DynamicImage::ImageRgba8(Self::normalize_transparent_pixels(
                     img.to_rgba8(),
                     background,
@@ -606,7 +819,13 @@ impl ImageService {
         // `write_to` builds internally, it's also the only way to reach
         // `ImageEncoder::set_icc_profile` (#33), so the same encoder value
         // now carries both the requested quality and the forwarded colour
-        // profile.
+        // profile. AVIF (#49) similarly goes through an explicit
+        // `AvifEncoder::new_with_speed_quality` rather than `write_to`'s
+        // default (`AvifEncoder::new`, which hardcodes quality 80/speed 4 -
+        // the same defaults this crate uses, but naming them explicitly
+        // lets `params.quality` (the `q:` processing option) override it,
+        // measured in `adr/0004-avif-measurement.md`). GIF is unaffected
+        // and keeps going through `write_to` exactly as before.
         //
         // PNG has no quality knob in `params` to honour - `CompressionType`
         // is a fixed lossless setting, not a continuous 0-100 scale, and
@@ -615,16 +834,16 @@ impl ImageService {
         // ignored here.
         //
         // #33: `icc_profile`, if the source carried one, is forwarded to
-        // whichever of these two encoders is used - both support embedding
-        // it (`image-0.25.10/src/codecs/{png,jpeg/encoder}.rs`). WebP is
-        // the one format this can't cover: the `webp` crate (0.3.1, this
+        // the PNG/JPEG encoders - both support embedding it
+        // (`image-0.25.10/src/codecs/{png,jpeg/encoder}.rs`). WebP and AVIF
+        // are the formats this can't cover: the `webp` crate (0.3.1, this
         // service's only route to *lossy* WebP encoding - see the doc
-        // comment above) has no ICC-profile API at all, so a source colour
-        // profile is still dropped on that path. Fixing that would mean
-        // either switching WebP encoding to a crate with profile support or
-        // patching raw ICC chunks into libwebp's container format by hand -
-        // real work, not a small addition, so it's left as follow-up rather
-        // than half-done here.
+        // comment above) and `image`'s `AvifEncoder` have no ICC-profile API
+        // at all, so a source colour profile is still dropped on those
+        // paths. Fixing that would mean either switching encoders or
+        // patching raw ICC chunks into the container format by hand - real
+        // work, not a small addition, so it's left as follow-up rather than
+        // half-done here.
         let output_bytes = match output_format {
             ImageFormat::WebP => {
                 let lossless = params.webp_lossless.unwrap_or(false);
@@ -687,16 +906,425 @@ impl ImageService {
 
                 buf.into_inner()
             }
-            // `output_format` is only ever constructed from `params.format`
-            // (`crate::models::params::ImageFormat`, three variants: `Jpg`,
-            // `Png`, `Webp`) a few lines above, so every value the `match`
-            // above doesn't already handle is unreachable in practice - kept
-            // as a hard error rather than a silent generic `write_to` fallback
-            // so a future fourth format doesn't quietly skip quality handling.
-            other => anyhow::bail!("unsupported output format {other:?}"),
+            ImageFormat::Avif => {
+                let quality = params.quality.unwrap_or(DEFAULT_AVIF_QUALITY);
+                let estimated_size = Self::estimate_output_size(&img, &output_format);
+                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+
+                let encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(
+                    &mut buf,
+                    DEFAULT_AVIF_SPEED,
+                    quality,
+                );
+                img.write_with_encoder(encoder)
+                    .context(format!("Failed to encode image to {:?}", output_format))?;
+
+                buf.into_inner()
+            }
+            // GIF (#49) is the only remaining supported format and has no
+            // quality/ICC handling of its own - it keeps going through
+            // `write_to` exactly as every format did before #35/#33/#49
+            // carved out explicit encoders for the others. Any value the
+            // match above doesn't already handle also lands here, but
+            // `output_format` is only ever constructed from
+            // `crate::models::params::ImageFormat` a few lines above, whose
+            // variants are all covered by this match once `Auto` has been
+            // resolved to a concrete format upstream, so this arm is GIF in
+            // practice.
+            _ => {
+                // Pre-allocate buffer based on estimated size - only
+                // meaningful for the `write_to` path below; the WebP path
+                // above gets its output buffer from libwebp itself.
+                let estimated_size = Self::estimate_output_size(&img, &output_format);
+                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+
+                img.write_to(&mut buf, output_format)
+                    .context(format!("Failed to encode image to {:?}", output_format))?;
+
+                buf.into_inner()
+            }
         };
 
         Ok((output_bytes, content_type.to_string()))
+    }
+
+    /// The resize-type dispatch (#59) plus the `grayscale`/`blur_sigma`
+    /// filters, shared by [`Self::encode_single_image`] above and
+    /// [`Self::encode_animation`] below (#49) - every frame of an animated
+    /// source is resized and filtered one at a time through this exact same
+    /// function, so an animated request behaves identically, frame by
+    /// frame, to the single-image path for the same parameters.
+    fn resize_and_filter(
+        img: &DynamicImage,
+        effective_width: Option<u32>,
+        effective_height: Option<u32>,
+        filter: FilterType,
+        params: &ResizeQuery,
+        src_width: u32,
+        src_height: u32,
+    ) -> Result<DynamicImage> {
+        // Resize image with optimized logic. `effective_width`/
+        // `effective_height` are already capped to the source resolution
+        // per axis unless `enlarge` is set (by the caller), and every
+        // branch below - `resize` (fit), `resize_to_fill` (fill/auto-as-
+        // fill), `resize_exact` (force) - only ever shrinks each axis to at
+        // most its capped target, so none of them can upscale past the
+        // source: the #36 guard holds for every resize type, not just
+        // fill. #63 stage 1: the actual resampling is done by
+        // `fast_image_resize` (SIMD, pure Rust) via the `Self::fir_*`
+        // helpers below instead of `DynamicImage::resize`/
+        // `resize_to_fill`/`resize_exact` directly - resize was the
+        // single most expensive stage in the committed benchmark baseline
+        // (17.39ms lanczos3 downscale vs 6.78ms JPEG decode), not decode.
+        // Every `fir_*` helper reproduces the exact target-dimension math
+        // its `image`-crate counterpart uses internally (see their doc
+        // comments), so only the resampling kernel changes here - the
+        // fit/fill/force/auto branching below, and the #36 enlarge-guard
+        // reasoning it documents, are unchanged.
+        let img = match (effective_width, effective_height) {
+            (Some(w), None) => Self::fir_resize(img, w, u32::MAX, filter)?,
+            (None, Some(h)) => Self::fir_resize(img, u32::MAX, h, filter)?,
+            (Some(w), Some(h)) => match params.resize_type {
+                // Fit inside the box, preserving aspect ratio - neither
+                // output dimension exceeds `w`/`h`. This is also what a
+                // lone width or height already did above, so `Fit` (the
+                // default, see `ResizeType`) keeps that existing behaviour
+                // consistent once both dimensions are given (#59).
+                ResizeType::Fit => Self::fir_resize(img, w, h, filter)?,
+                // Cover the box, preserving aspect ratio, then crop the
+                // overflow. `fir_resize_to_fill` crops to exactly `w x h`
+                // itself (originally always centred, matching
+                // `image-0.25.10`'s `DynamicImage::resize_to_fill` -
+                // `image-0.25.10/src/images/dynimage.rs:943-962` - so no
+                // separate manual crop step was needed, #36) - #50 replaced
+                // that hardcoded centre with `params.gravity`, so which part
+                // of the overflow survives is now caller-controlled instead
+                // of always the middle.
+                ResizeType::Fill => Self::fir_resize_to_fill(img, w, h, filter, params.gravity)?,
+                // Stretch to exactly `w x h`, ignoring aspect ratio.
+                ResizeType::Force => Self::fir_resize_exact(img, w, h, filter)?,
+                // imgproxy's documented `auto` rule
+                // (https://docs.imgproxy.net/usage/processing#resizing-type):
+                // "if both source and resulting dimensions have the same
+                // orientation (portrait or landscape), imgproxy will use
+                // `fill`. Otherwise, it will use `fit`." A box is treated
+                // as landscape-or-square when width >= height and portrait
+                // otherwise, applied identically to the source and the
+                // requested box so the comparison is consistent.
+                ResizeType::Auto => {
+                    let src_landscape = src_width >= src_height;
+                    let dst_landscape = w >= h;
+                    if src_landscape == dst_landscape {
+                        Self::fir_resize_to_fill(img, w, h, filter, params.gravity)?
+                    } else {
+                        Self::fir_resize(img, w, h, filter)?
+                    }
+                }
+            },
+            (None, None) => img.clone(),
+        };
+
+        // #51: `rotate`/`flip` come right after resize, matching imgproxy's
+        // own pipeline (`processing/processing.go`'s `mainPipeline`: `scale`
+        // then `rotateAndFlip`, ahead of `applyFilters` i.e. grayscale/blur
+        // below) - applied here, inside the function shared with
+        // `Self::encode_animation`, so an animated source is rotated/
+        // flipped frame-by-frame exactly like the single-image path.
+        // `rotate`'s effect on the resize *box* itself (the width/height
+        // swap for 90/270) already happened inside
+        // `Self::effective_resize_box` before this function was called -
+        // this is just the actual pixel rotation of the now-resized image.
+        let img = Self::apply_rotate(img, params.rotate);
+        let img = Self::apply_flip(img, params.flip_horizontal, params.flip_vertical);
+
+        // Apply filters efficiently
+        let img = if let Some(true) = params.grayscale {
+            img.grayscale()
+        } else {
+            img
+        };
+
+        let img = if let Some(sigma) = params.blur_sigma {
+            if sigma > 0.0 { img.blur(sigma) } else { img }
+        } else {
+            img
+        };
+
+        Ok(img)
+    }
+
+    /// Decodes every frame of an animated GIF/WebP source (#49), enforcing
+    /// both the existing #26 resolution guard (checked against the
+    /// decoder's header-only dimensions, before any frame is decoded) and a
+    /// new frame-*count* guard (`config.max_animation_frames`) #26's
+    /// resolution check doesn't cover - a many-tiny-frames animation can be
+    /// individually well within the resolution cap per frame while still
+    /// being a real memory/CPU amplification via frame count alone.
+    ///
+    /// Returns `Ok(None)` when there is nothing useful to do here: either
+    /// `source_format` is neither `Gif` nor `WebP` (only those two can
+    /// carry animation in this crate), or the source is a `WebP` that isn't
+    /// actually animated - in the latter case the ordinary single-image
+    /// path decodes it instead. That's a deliberate choice, not just an
+    /// optimisation to skip: `WebPDecoder`'s `AnimationDecoder::into_frames`
+    /// upgrades every frame to RGBA unconditionally, even when the source
+    /// has no alpha channel at all (`image-0.25.10/src/codecs/webp/decoder.rs`),
+    /// whereas the ordinary single-image decode path preserves the source's
+    /// real colour type (`Rgb8` for an alpha-less WebP). This doesn't
+    /// currently change the *encoded* bytes for WebP output specifically -
+    /// `Self::encode_webp` already always upconverts to RGBA before handing
+    /// pixels to libwebp, regardless of which path decoded them - but it
+    /// does avoid the frame iterator's extra decode-path overhead and a
+    /// pointless `normalize_transparent_pixels` pass over an image with no
+    /// real transparency, for what is expected to be the common case (a
+    /// static WebP resized to another static WebP). GIF has no equivalent
+    /// concern either way - `GifDecoder`'s single-image
+    /// `ImageDecoder::color_type()` is unconditionally `Rgba8` too, so
+    /// there is nothing to preserve by skipping the frame-iterator path for
+    /// a single-frame GIF, and this crate takes it anyway (see the caller)
+    /// to avoid decoding the source twice.
+    ///
+    /// Otherwise returns the decoded frames plus the shared canvas
+    /// dimensions every frame is composited to - both `GifDecoder` and
+    /// `WebPDecoder`'s `AnimationDecoder::into_frames()` already composite
+    /// each frame to the *full* canvas size internally (disposal methods
+    /// resolved, GIF's own partial-frame-rectangle handling included), so
+    /// every `image::Frame` returned here is a same-size, ready-to-resize
+    /// RGBA image - no manual compositing needed by the caller.
+    fn decode_animation_source(
+        image_bytes: &[u8],
+        source_format: ImageFormat,
+        config: &PerformanceConfig,
+    ) -> Result<Option<(Vec<image::Frame>, u32, u32)>> {
+        match source_format {
+            ImageFormat::Gif => {
+                let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(image_bytes))
+                    .context("Failed to read GIF header")?;
+                decoder
+                    .set_limits(Self::build_decode_limits(config.max_src_resolution_mp))
+                    .context("GIF source exceeds configured decode limits")?;
+                let (src_width, src_height) = decoder.dimensions();
+                Self::check_source_resolution(src_width, src_height, config.max_src_resolution_mp)?;
+                let frames = Self::collect_frames_capped(
+                    decoder.into_frames(),
+                    config.max_animation_frames,
+                )?;
+                Ok(Some((frames, src_width, src_height)))
+            }
+            ImageFormat::WebP => {
+                let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(image_bytes))
+                    .context("Failed to read WebP header")?;
+                if !decoder.has_animation() {
+                    return Ok(None);
+                }
+                decoder
+                    .set_limits(Self::build_decode_limits(config.max_src_resolution_mp))
+                    .context("WebP source exceeds configured decode limits")?;
+                let (src_width, src_height) = decoder.dimensions();
+                Self::check_source_resolution(src_width, src_height, config.max_src_resolution_mp)?;
+                let frames = Self::collect_frames_capped(
+                    decoder.into_frames(),
+                    config.max_animation_frames,
+                )?;
+                Ok(Some((frames, src_width, src_height)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Reads at most `max_frames` frames from `frames`, failing closed the
+    /// moment a `max_frames + 1`th frame is seen instead of collecting
+    /// every frame first and checking the count afterwards - a
+    /// frame-count-bomb source (millions of tiny frames) must not be
+    /// allowed to actually allocate that many decoded frames before being
+    /// rejected.
+    fn collect_frames_capped(
+        frames: image::Frames<'_>,
+        max_frames: usize,
+    ) -> Result<Vec<image::Frame>> {
+        let mut out = Vec::new();
+        for (index, frame) in frames.enumerate() {
+            if index >= max_frames {
+                anyhow::bail!("animated source exceeds the maximum of {max_frames} frames");
+            }
+            out.push(frame.context("Failed to decode animation frame")?);
+        }
+        Ok(out)
+    }
+
+    /// Resizes/filters and encodes every frame of a genuinely multi-frame
+    /// animated source (#49), preserving each frame's original delay.
+    /// `frames.len() > 1` is the caller's (`process_image_blocking_with_limits`)
+    /// responsibility to have already checked - a single-frame source takes
+    /// the ordinary [`Self::encode_single_image`] path instead, which also
+    /// handles every other output format this crate supports, not just
+    /// `Gif`/`Webp`.
+    fn encode_animation(
+        frames: Vec<image::Frame>,
+        src_width: u32,
+        src_height: u32,
+        params: &ResizeQuery,
+    ) -> Result<(Vec<u8>, String)> {
+        // Same upscale guard (#36) and thumbnail-vs-quality filter choice
+        // as `encode_single_image`, computed once against the shared
+        // canvas size every frame decodes to (see
+        // `decode_animation_source`'s doc comment) rather than per frame -
+        // every frame in one animation shares a single source resolution
+        // by construction.
+        let effective_width = params
+            .width
+            .map(|w| if params.enlarge { w } else { w.min(src_width) });
+        let effective_height = params
+            .height
+            .map(|h| if params.enlarge { h } else { h.min(src_height) });
+        let filter = match (effective_width, effective_height) {
+            (Some(w), Some(h)) if w <= 300 && h <= 300 => FilterType::Triangle,
+            _ => FilterType::Lanczos3,
+        };
+
+        let background = params.background.unwrap_or(DEFAULT_BACKGROUND);
+
+        let mut output_frames = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let delay = frame.delay();
+            let img = DynamicImage::ImageRgba8(frame.into_buffer());
+            let img = Self::resize_and_filter(
+                &img,
+                effective_width,
+                effective_height,
+                filter,
+                params,
+                src_width,
+                src_height,
+            )?;
+            // Every animation frame keeps its alpha channel end to end
+            // (GIF/WebP frames decode as RGBA here unconditionally - see
+            // `decode_animation_source`) - only the #60
+            // fully-transparent-pixel normalisation applies, never the
+            // JPEG flatten branch `encode_single_image` also has, since
+            // neither animated output format is JPEG.
+            let rgba = Self::normalize_transparent_pixels(img.to_rgba8(), background);
+            output_frames.push(image::Frame::from_parts(rgba, 0, 0, delay));
+        }
+
+        match params.format {
+            crate::models::params::ImageFormat::Gif => Self::encode_animated_gif(output_frames),
+            crate::models::params::ImageFormat::Webp => {
+                Self::encode_animated_webp(output_frames, params)
+            }
+            // `process_image_blocking_with_limits` only ever calls this
+            // function when `params.format` is `Gif` or `Webp` (see its
+            // `wants_animatable_output` check) - reaching any other arm
+            // would be a bug there, surfaced as an error rather than a
+            // panic for the same reason `encode_single_image`'s `Auto` arm
+            // is.
+            _ => anyhow::bail!(
+                "internal error: encode_animation reached with a non-animatable format"
+            ),
+        }
+    }
+
+    /// Encodes `frames` as an animated GIF via
+    /// `image::codecs::gif::GifEncoder` (pure Rust, already part of this
+    /// crate's `image` dependency's default features - see `ImageFormat`'s
+    /// doc comment in `src/models/params.rs`). Each frame is independently
+    /// palette-quantized by the underlying `gif` crate
+    /// (`Frame::from_rgba_speed`, invoked internally by
+    /// `GifEncoder::encode_frame`) - GIF has no truecolor mode at all, so
+    /// per-frame quantization loss is inherent to the format, not something
+    /// this crate's encoder choice introduces.
+    fn encode_animated_gif(frames: Vec<image::Frame>) -> Result<(Vec<u8>, String)> {
+        let mut buf = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut buf);
+            encoder
+                .set_repeat(image::codecs::gif::Repeat::Infinite)
+                .context("Failed to set GIF repeat behaviour")?;
+            encoder
+                .encode_frames(frames)
+                .context("Failed to encode animated GIF")?;
+        }
+        Ok((buf, "image/gif".to_string()))
+    }
+
+    /// Encodes `frames` as an animated WebP via the `webp` crate's
+    /// `AnimEncoder` (real libwebp, `WebPAnimEncoder` FFI - already a
+    /// dependency for this crate's static lossy-WebP path,
+    /// [`Self::encode_webp`]).
+    ///
+    /// Verified rather than assumed: #49 explicitly calls out not to take
+    /// "the `webp` crate has no animation encoding API" on faith, and it
+    /// turns out that premise is wrong. `webp 0.3.1`'s
+    /// `animation_encoder.rs` exposes `AnimEncoder`/`AnimFrame`
+    /// unconditionally (no extra cargo feature beyond the crate's own
+    /// `default = ["img"]`, already enabled here), wrapping libwebp's own
+    /// `WebPAnimEncoderXxx` C functions directly - real animated WebP
+    /// output *is* possible through the dependency this crate already has,
+    /// no new one needed. What is *not* possible is animated WebP through
+    /// `image`'s own bundled encoder (`image-webp 0.2.4`'s
+    /// `WebPEncoder::encode` only ever writes a single `VP8L` chunk, no
+    /// `ANIM`/`ANMF` support) - that half of the original assumption does
+    /// hold, which is why this goes through the `webp` crate instead, not
+    /// `image::codecs::webp::WebPEncoder`.
+    fn encode_animated_webp(
+        frames: Vec<image::Frame>,
+        params: &ResizeQuery,
+    ) -> Result<(Vec<u8>, String)> {
+        if frames.is_empty() {
+            anyhow::bail!("cannot encode an animated WebP with zero frames");
+        }
+
+        // Rebuilds each frame's cumulative *end* timestamp (milliseconds)
+        // from its individual delay - `AnimFrame::from_rgba`'s `timestamp`
+        // argument is a point on libwebp's animation timeline, not a
+        // per-frame duration the way `image::Frame::delay` is.
+        let mut timestamp_ms: i64 = 0;
+        let mut timestamps = Vec::with_capacity(frames.len());
+        let mut buffers = Vec::with_capacity(frames.len());
+        for frame in frames {
+            let (numer, denom) = frame.delay().numer_denom_ms();
+            let delay_ms = if denom == 0 {
+                0
+            } else {
+                i64::from(numer) / i64::from(denom)
+            };
+            timestamp_ms = timestamp_ms.saturating_add(delay_ms);
+            timestamps.push(i32::try_from(timestamp_ms).unwrap_or(i32::MAX));
+            buffers.push(frame.into_buffer());
+        }
+
+        let (width, height) = buffers[0].dimensions();
+
+        let mut webp_config = webp::WebPConfig::new()
+            .map_err(|_| anyhow::anyhow!("failed to initialize libwebp animation encoder config"))?;
+        // Same default quality as the static lossy-WebP path
+        // (`Self::encode_webp`'s `DEFAULT_WEBP_QUALITY` call site) unless
+        // overridden by `params.quality` - this crate doesn't currently
+        // wire `quality` into the *static* WebP path either (a separate,
+        // pre-existing gap noted in `DEFAULT_WEBP_QUALITY`'s own doc
+        // comment), so keeping the animated path consistent with that
+        // rather than silently diverging.
+        let quality = params.quality.map(f32::from).unwrap_or(DEFAULT_WEBP_QUALITY);
+        webp_config.quality = quality;
+        webp_config.alpha_quality = quality as i32;
+
+        let mut encoder = webp::AnimEncoder::new(width, height, &webp_config);
+        encoder.set_loop_count(0); // loop forever, matching `Repeat::Infinite` in the GIF path above
+
+        for (buffer, timestamp) in buffers.iter().zip(timestamps) {
+            encoder.add_frame(webp::AnimFrame::from_rgba(
+                buffer.as_raw(),
+                buffer.width(),
+                buffer.height(),
+                timestamp,
+            ));
+        }
+
+        let memory = encoder
+            .try_encode()
+            .map_err(|e| anyhow::anyhow!("Failed to encode animated WebP: {e:?}"))?;
+
+        Ok((memory.to_vec(), "image/webp".to_string()))
     }
 
     /// Reproduces `image` crate's own aspect-ratio scaling formula exactly
@@ -709,7 +1337,13 @@ impl ImageService {
     /// `min(wratio, hratio)`); `fill=true` is the "cover the box" ratio
     /// used as the intermediate step before `resize_to_fill`'s crop
     /// (`max(wratio, hratio)`).
-    fn resize_dimensions(width: u32, height: u32, nwidth: u32, nheight: u32, fill: bool) -> (u32, u32) {
+    fn resize_dimensions(
+        width: u32,
+        height: u32,
+        nwidth: u32,
+        nheight: u32,
+        fill: bool,
+    ) -> (u32, u32) {
         let wratio = f64::from(nwidth) / f64::from(width);
         let hratio = f64::from(nheight) / f64::from(height);
 
@@ -730,10 +1364,7 @@ impl ImageService {
             )
         } else if nh > u64::from(u32::MAX) {
             let ratio = f64::from(u32::MAX) / f64::from(height);
-            (
-                (f64::from(width) * ratio).round().max(1.0) as u32,
-                u32::MAX,
-            )
+            ((f64::from(width) * ratio).round().max(1.0) as u32, u32::MAX)
         } else {
             (nw as u32, nh as u32)
         }
@@ -833,31 +1464,120 @@ impl ImageService {
     }
 
     /// `fast_image_resize`-backed equivalent of
-    /// `DynamicImage::resize_to_fill` (cover `nwidth x nheight`,
-    /// preserving aspect ratio, then centre-crop the overflow) - reuses
-    /// `image`'s own `DynamicImage::crop` for the crop step (untouched by
-    /// this change) and reproduces `resize_to_fill`'s exact crop-offset
-    /// arithmetic (image-0.25.10 `src/images/dynimage.rs:943-962`) so the
-    /// output is pixel-region-identical to before, just resampled by
-    /// `fast_image_resize` (#63 stage 1).
+    /// `DynamicImage::resize_to_fill` (cover `nwidth x nheight`, preserving
+    /// aspect ratio, then crop the overflow) - originally always
+    /// centre-cropped (image-0.25.10 `src/images/dynimage.rs:943-962`,
+    /// #63 stage 1 ported that exact arithmetic byte-for-byte). #50 replaces
+    /// the hardcoded centre with `gravity`-anchored cropping via
+    /// `Self::gravity_anchor`: `Gravity::Center` reproduces the exact same
+    /// offsets `resize_to_fill` always used (see `gravity_anchor`'s doc
+    /// comment for why), so this is a strict generalisation, not a
+    /// behaviour change for the pre-#50 default.
     fn fir_resize_to_fill(
         img: &DynamicImage,
         nwidth: u32,
         nheight: u32,
         filter: FilterType,
+        gravity: Gravity,
     ) -> Result<DynamicImage> {
         let (width2, height2) =
             Self::resize_dimensions(img.width(), img.height(), nwidth, nheight, true);
-        let mut intermediate = Self::fir_resize_exact(img, width2, height2, filter)?;
+        let intermediate = Self::fir_resize_exact(img, width2, height2, filter)?;
         let (iwidth, iheight) = intermediate.dimensions();
-        let ratio = u64::from(iwidth) * u64::from(nheight);
-        let nratio = u64::from(nwidth) * u64::from(iheight);
+        let (x, y) = Self::gravity_anchor(gravity, iwidth, iheight, nwidth, nheight);
+        Ok(intermediate.crop_imm(x, y, nwidth, nheight))
+    }
 
-        Ok(if nratio > ratio {
-            intermediate.crop(0, (iheight - nheight) / 2, nwidth, nheight)
-        } else {
-            intermediate.crop((iwidth - nwidth) / 2, 0, nwidth, nheight)
-        })
+    /// Resolves `gravity` into a top-left `(x, y)` pixel offset for a
+    /// `box_w x box_h` crop region inside a `container_w x container_h`
+    /// container (#50) - shared by `fir_resize_to_fill`'s cover-crop and
+    /// `apply_crop`'s explicit `c:` crop, since both are "anchor a smaller
+    /// box inside a larger one" problems with identical gravity semantics.
+    ///
+    /// The directional/corner/`Center` variants place the box against the
+    /// named edge/corner of the container, with `Center` splitting the
+    /// leftover space evenly on both axes via floor division - this
+    /// reproduces `resize_to_fill`'s original always-centred arithmetic
+    /// (`(container - box) / 2` on each axis, integer/floor division)
+    /// exactly, byte-for-byte, for the pre-#50 default gravity.
+    ///
+    /// `FocusPoint { x, y }` is different in kind: `x`/`y` (each in
+    /// `[0, 1]`, clamped defensively even though the URL parser already
+    /// range-checks them) name a point *within the container* - `(0, 0)` is
+    /// the top-left corner, `(1, 1)` the bottom-right - and the box is
+    /// centred on that point, then clamped so it never crosses a container
+    /// edge. Because `Fill`'s cover-resize scales both axes by the same
+    /// factor, a focus point expressed as a fraction of the *source* image
+    /// lands on the same fractional position in the resized intermediate,
+    /// so callers can pass the same `Gravity::FocusPoint` straight through
+    /// from a `ResizeQuery` without re-deriving it per container.
+    ///
+    /// `box_w`/`box_h` are clamped to the container's own size first, so a
+    /// pathological call with a box larger than its container can't
+    /// underflow the `container - box` subtraction.
+    fn gravity_anchor(
+        gravity: Gravity,
+        container_w: u32,
+        container_h: u32,
+        box_w: u32,
+        box_h: u32,
+    ) -> (u32, u32) {
+        let box_w = box_w.min(container_w);
+        let box_h = box_h.min(container_h);
+        let max_x = f64::from(container_w - box_w);
+        let max_y = f64::from(container_h - box_h);
+
+        let (x, y) = match gravity {
+            Gravity::Center => (max_x / 2.0, max_y / 2.0),
+            Gravity::North => (max_x / 2.0, 0.0),
+            Gravity::South => (max_x / 2.0, max_y),
+            Gravity::West => (0.0, max_y / 2.0),
+            Gravity::East => (max_x, max_y / 2.0),
+            Gravity::NorthWest => (0.0, 0.0),
+            Gravity::NorthEast => (max_x, 0.0),
+            Gravity::SouthWest => (0.0, max_y),
+            Gravity::SouthEast => (max_x, max_y),
+            Gravity::FocusPoint { x, y } => {
+                let center_x = f64::from(container_w) * x.clamp(0.0, 1.0);
+                let center_y = f64::from(container_h) * y.clamp(0.0, 1.0);
+                (
+                    (center_x - f64::from(box_w) / 2.0).clamp(0.0, max_x),
+                    (center_y - f64::from(box_h) / 2.0).clamp(0.0, max_y),
+                )
+            }
+        };
+
+        (x.floor() as u32, y.floor() as u32)
+    }
+
+    /// Applies an explicit `c:` crop (#50) to the decoded source image,
+    /// before any resize math runs - see the call site's comment and
+    /// [`crate::models::params::Crop`]'s doc comment for the ordering
+    /// rationale. Resolves `crop.width`/`crop.height` against the source's
+    /// actual dimensions (`Full`/`Absolute`/`Relative`, see
+    /// [`CropDimension`]), clamps the resolved box to at least 1px and at
+    /// most the source's own size per axis (a `Relative` fraction is
+    /// already `<= 1` by construction, but an `Absolute` value from the URL
+    /// is caller-controlled and could exceed the source), then anchors it
+    /// with `Self::gravity_anchor`.
+    fn apply_crop(img: &DynamicImage, crop: &Crop) -> DynamicImage {
+        let (src_width, src_height) = img.dimensions();
+
+        let resolve = |dim: CropDimension, source: u32| -> u32 {
+            let resolved = match dim {
+                CropDimension::Full => source,
+                CropDimension::Absolute(v) => v,
+                CropDimension::Relative(fraction) => (f64::from(source) * fraction).round() as u32,
+            };
+            resolved.clamp(1, source.max(1))
+        };
+
+        let crop_width = resolve(crop.width, src_width);
+        let crop_height = resolve(crop.height, src_height);
+        let (x, y) =
+            Self::gravity_anchor(crop.gravity, src_width, src_height, crop_width, crop_height);
+
+        img.crop_imm(x, y, crop_width, crop_height)
     }
 
     /// Composites `img` onto an opaque `background` colour, producing a
@@ -926,6 +1646,295 @@ impl ImageService {
         rgba
     }
 
+    /// Composites a watermark onto `base` (#52): decodes `watermark_bytes`,
+    /// applies `wm`'s size/scale, rotation and shadow, then alpha-blends it
+    /// over `base` at the resolved position with `wm.opacity` honoured.
+    ///
+    /// Order within this function mirrors imgproxy's own documented
+    /// pipeline: resize/scale the watermark first, *then* rotate it (a
+    /// rotated image's own bounding box is what gets positioned), draw the
+    /// shadow (if any) at the same position as the final watermark, then
+    /// composite the watermark itself on top.
+    fn apply_watermark(
+        base: DynamicImage,
+        watermark_bytes: &[u8],
+        wm: &WatermarkQuery,
+    ) -> Result<DynamicImage> {
+        let watermark_img =
+            image::load_from_memory(watermark_bytes).context("Failed to decode watermark image")?;
+
+        let (base_width, base_height) = base.dimensions();
+
+        // Size/scale (`wms:`/`wm:`'s scale slot). imgproxy always resizes
+        // watermarks with `fit` semantics (preserving the watermark's own
+        // aspect ratio, enlarging when needed) - never a stretch - so every
+        // branch below goes through `Self::fir_resize` (fit), never
+        // `fir_resize_exact`.
+        let watermark_img = if let Some((w, h)) = wm.size.filter(|(w, h)| *w > 0 || *h > 0) {
+            let (target_w, target_h) = match (w, h) {
+                (0, h) => (u32::MAX, h),
+                (w, 0) => (w, u32::MAX),
+                (w, h) => (w, h),
+            };
+            Self::fir_resize(&watermark_img, target_w, target_h, FilterType::Lanczos3)?
+        } else if wm.scale > 0.0 {
+            let target_w = ((base_width as f64) * f64::from(wm.scale)).round().max(1.0) as u32;
+            let target_h = ((base_height as f64) * f64::from(wm.scale)).round().max(1.0) as u32;
+            Self::fir_resize(&watermark_img, target_w, target_h, FilterType::Lanczos3)?
+        } else {
+            watermark_img
+        };
+
+        let mut watermark_rgba = watermark_img.to_rgba8();
+
+        // Rotation (`wmr:`, clockwise degrees).
+        if wm.rotate != 0.0 {
+            watermark_rgba = Self::rotate_rgba(&watermark_rgba, wm.rotate);
+        }
+
+        let (watermark_width, watermark_height) = watermark_rgba.dimensions();
+        let (x, y) = Self::watermark_position(
+            wm.position,
+            wm.x_offset,
+            wm.y_offset,
+            base_width,
+            base_height,
+            watermark_width,
+            watermark_height,
+        );
+
+        let mut canvas = base.to_rgba8();
+        let opacity = wm.opacity.clamp(0.0, 1.0);
+
+        // Shadow (`wmsh:`), drawn first so the watermark composites on top
+        // of it, at the same position.
+        if let Some(sigma) = wm.shadow.filter(|s| *s > 0.0) {
+            let shadow = Self::build_shadow_layer(&watermark_rgba, sigma);
+            Self::composite_over(&mut canvas, &shadow, x, y, 1.0);
+        }
+
+        Self::composite_over(&mut canvas, &watermark_rgba, x, y, opacity);
+
+        Ok(DynamicImage::ImageRgba8(canvas))
+    }
+
+    /// Resolves the top-left `(x, y)` pixel coordinate (relative to the
+    /// base image's own origin, may be negative or extend past the base
+    /// image's far edge - `composite_over` clips) at which a
+    /// `watermark_width x watermark_height` watermark should be drawn,
+    /// given `position`'s anchor and the `x_offset`/`y_offset` modifiers
+    /// (#52).
+    ///
+    /// Offset convention (imgproxy's own): a magnitude `>= 1.0` is treated
+    /// as an absolute pixel count; anything smaller is a fraction of the
+    /// corresponding base image dimension. Positive `x_offset` moves the
+    /// watermark right, positive `y_offset` moves it down, regardless of
+    /// which anchor `position` is - i.e. offsets always nudge in the same
+    /// screen-space direction rather than "further from the anchor".
+    fn watermark_position(
+        position: WatermarkPosition,
+        x_offset: f32,
+        y_offset: f32,
+        base_width: u32,
+        base_height: u32,
+        watermark_width: u32,
+        watermark_height: u32,
+    ) -> (i64, i64) {
+        let resolve_offset = |offset: f32, dimension: u32| -> i64 {
+            if offset.abs() >= 1.0 {
+                offset.round() as i64
+            } else {
+                (f64::from(offset) * f64::from(dimension)).round() as i64
+            }
+        };
+
+        let dx = resolve_offset(x_offset, base_width);
+        let dy = resolve_offset(y_offset, base_height);
+
+        let bw = i64::from(base_width);
+        let bh = i64::from(base_height);
+        let ww = i64::from(watermark_width);
+        let wh = i64::from(watermark_height);
+
+        let (base_x, base_y) = match position {
+            WatermarkPosition::Center => ((bw - ww) / 2, (bh - wh) / 2),
+            WatermarkPosition::North => ((bw - ww) / 2, 0),
+            WatermarkPosition::South => ((bw - ww) / 2, bh - wh),
+            WatermarkPosition::East => (bw - ww, (bh - wh) / 2),
+            WatermarkPosition::West => (0, (bh - wh) / 2),
+            WatermarkPosition::NorthEast => (bw - ww, 0),
+            WatermarkPosition::NorthWest => (0, 0),
+            WatermarkPosition::SouthEast => (bw - ww, bh - wh),
+            WatermarkPosition::SouthWest => (0, bh - wh),
+        };
+
+        (base_x + dx, base_y + dy)
+    }
+
+    /// Alpha-composites `overlay` onto `canvas` at top-left `(x, y)`
+    /// (`canvas`'s coordinate space; may be negative or extend past its far
+    /// edge - pixels outside `canvas`'s bounds are silently clipped),
+    /// scaling `overlay`'s own per-pixel alpha by `opacity` first.
+    ///
+    /// Standard Porter-Duff "source over", in straight (non-premultiplied)
+    /// alpha: `out_a = src_a + dst_a * (1 - src_a)`,
+    /// `out_rgb = (src_rgb * src_a + dst_rgb * dst_a * (1 - src_a)) / out_a`.
+    /// Used for both the watermark itself (`opacity` = `wm.opacity`,
+    /// clamped to `[0, 1]`) and its shadow layer (`opacity = 1.0`, since
+    /// the shadow's own alpha - already scaled by the blur - is the only
+    /// opacity control it needs).
+    fn composite_over(
+        canvas: &mut image::RgbaImage,
+        overlay: &image::RgbaImage,
+        x: i64,
+        y: i64,
+        opacity: f32,
+    ) {
+        if opacity <= 0.0 {
+            return;
+        }
+
+        let (canvas_width, canvas_height) = canvas.dimensions();
+        let (overlay_width, overlay_height) = overlay.dimensions();
+
+        for overlay_y in 0..overlay_height {
+            let canvas_y = y + i64::from(overlay_y);
+            if canvas_y < 0 || canvas_y >= i64::from(canvas_height) {
+                continue;
+            }
+            for overlay_x in 0..overlay_width {
+                let canvas_x = x + i64::from(overlay_x);
+                if canvas_x < 0 || canvas_x >= i64::from(canvas_width) {
+                    continue;
+                }
+
+                let src = overlay.get_pixel(overlay_x, overlay_y).0;
+                let src_a = (f32::from(src[3]) / 255.0) * opacity;
+                if src_a <= 0.0 {
+                    continue;
+                }
+
+                let dst = canvas.get_pixel_mut(canvas_x as u32, canvas_y as u32);
+                let dst_a = f32::from(dst[3]) / 255.0;
+                let out_a = src_a + dst_a * (1.0 - src_a);
+
+                if out_a <= 0.0 {
+                    *dst = image::Rgba([0, 0, 0, 0]);
+                    continue;
+                }
+
+                let blend = |s: u8, d: u8| -> u8 {
+                    (((f32::from(s) * src_a) + (f32::from(d) * dst_a * (1.0 - src_a))) / out_a)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                };
+
+                *dst = image::Rgba([
+                    blend(src[0], dst[0]),
+                    blend(src[1], dst[1]),
+                    blend(src[2], dst[2]),
+                    (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+                ]);
+            }
+        }
+    }
+
+    /// Rotates `img` clockwise by `degrees` around its own centre (#52,
+    /// `wmr:`), expanding the canvas to the rotated bounding box and
+    /// filling every pixel the rotated source doesn't cover with fully
+    /// transparent (`alpha = 0`). Nearest-neighbour sampling (nothing in
+    /// this crate's existing resize/rotate code averages source pixels for
+    /// anything other than downscaling, and a watermark is typically small
+    /// enough that this is not a visible quality gap).
+    ///
+    /// Pixel *centres* (not corners) are used as the sampling coordinate
+    /// space throughout, so a destination pixel maps back to the source
+    /// pixel that actually covers its centre point rather than being off
+    /// by half a pixel at every angle.
+    fn rotate_rgba(img: &image::RgbaImage, degrees: f32) -> image::RgbaImage {
+        let (width, height) = img.dimensions();
+        if width == 0 || height == 0 {
+            return img.clone();
+        }
+
+        let normalized_degrees = f64::from(degrees).rem_euclid(360.0);
+        if normalized_degrees == 0.0 {
+            return img.clone();
+        }
+
+        let theta = normalized_degrees.to_radians();
+        let (sin_t, cos_t) = theta.sin_cos();
+
+        let (fw, fh) = (f64::from(width), f64::from(height));
+        let (cx, cy) = (fw / 2.0, fh / 2.0);
+
+        // Bounding box of the rotated source, via its four corners -
+        // forward rotation `R(theta) = [[cos, -sin], [sin, cos]]`.
+        let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)];
+        let mut min_x = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut min_y = f64::MAX;
+        let mut max_y = f64::MIN;
+        for (px, py) in corners {
+            let (dx, dy) = (px - cx, py - cy);
+            let rx = dx * cos_t - dy * sin_t;
+            let ry = dx * sin_t + dy * cos_t;
+            min_x = min_x.min(rx);
+            max_x = max_x.max(rx);
+            min_y = min_y.min(ry);
+            max_y = max_y.max(ry);
+        }
+
+        // A tiny epsilon before `ceil` absorbs floating-point noise at
+        // exact multiples of 90 degrees (`sin`/`cos` of a value near a
+        // multiple of pi are not exactly 0/1 in f64), where the true
+        // bounding-box width/height is an exact integer but the computed
+        // value lands a few ULPs above it (e.g. `5.0000000000000009`) -
+        // without this, `ceil` would round that up to 6 instead of 5.
+        const EPSILON: f64 = 1e-9;
+        let new_width = (max_x - min_x - EPSILON).ceil().max(1.0) as u32;
+        let new_height = (max_y - min_y - EPSILON).ceil().max(1.0) as u32;
+        let (new_cx, new_cy) = (f64::from(new_width) / 2.0, f64::from(new_height) / 2.0);
+
+        let mut out = image::RgbaImage::new(new_width, new_height);
+        // Every pixel starts fully transparent (`RgbaImage::new` zero-fills),
+        // so a destination pixel whose inverse-mapped source coordinate
+        // falls outside `img`'s bounds is simply left untouched below.
+        for out_y in 0..new_height {
+            for out_x in 0..new_width {
+                // Inverse rotation (dest -> src), `R(-theta) = R(theta)^T`:
+                // `src = R(theta)^T * (dst - new_centre) + centre`.
+                let dx = (f64::from(out_x) + 0.5) - new_cx;
+                let dy = (f64::from(out_y) + 0.5) - new_cy;
+                let src_x = dx * cos_t + dy * sin_t + cx;
+                let src_y = -dx * sin_t + dy * cos_t + cy;
+
+                let src_ix = src_x.floor();
+                let src_iy = src_y.floor();
+                if src_ix >= 0.0 && src_iy >= 0.0 && src_ix < fw && src_iy < fh {
+                    let pixel = img.get_pixel(src_ix as u32, src_iy as u32);
+                    out.put_pixel(out_x, out_y, *pixel);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Builds a soft drop-shadow layer (#52, `wmsh:`) the same size as
+    /// `watermark`: a black silhouette of `watermark`'s own alpha channel,
+    /// Gaussian-blurred by `sigma`. Composited at the same position as
+    /// `watermark` itself (by the caller), so the blur naturally spreads a
+    /// soft dark halo just past the watermark's own opaque edges.
+    fn build_shadow_layer(watermark: &image::RgbaImage, sigma: f32) -> image::RgbaImage {
+        let (width, height) = watermark.dimensions();
+        let mut silhouette = image::RgbaImage::new(width, height);
+        for (src, dst) in watermark.pixels().zip(silhouette.pixels_mut()) {
+            *dst = image::Rgba([0, 0, 0, src.0[3]]);
+        }
+        DynamicImage::ImageRgba8(silhouette).blur(sigma).to_rgba8()
+    }
+
     /// Encodes `img` to WebP via the `webp` crate directly (libwebp
     /// bindings), rather than through `DynamicImage::write_to` - the
     /// `image` crate's own WebP encoder is lossless-only, which is exactly
@@ -963,26 +1972,401 @@ impl ImageService {
     /// Rejects a request whose requested output width/height exceed the
     /// configured maximum, independent of whatever the generated OpenAPI
     /// layer does or does not validate upstream (#26).
+    ///
+    /// #51: `zoom`, `dpr` and `min-width`/`min-height` can all inflate the
+    /// *effective* requested size past the plain `width`/`height` value, so
+    /// this now checks a conservative upper bound that folds them in too -
+    /// otherwise `dpr:100` would trivially bypass #26's whole point. This
+    /// runs before decode (no source dimensions are available yet), so it
+    /// deliberately ignores the #36 enlarge guard (which can only ever
+    /// *shrink* the effective request, never grow it) and instead checks
+    /// the largest size the request could possibly resolve to.
+    ///
+    /// No `rotate`-driven axis swap is needed here, unlike
+    /// `Self::effective_resize_box`: `params.width`/`height`/`min_width`/
+    /// `min_height` already describe the *final*, post-rotation image (see
+    /// that function's doc comment for the full reasoning imgproxy's own
+    /// `ExtractGeometry` establishes), and `max_output_width`/
+    /// `max_output_height` are configured in that same final-output sense
+    /// - so `width` is always compared against `max_output_width`
+    /// regardless of `rotate`, with no swap in between.
     fn check_output_dimensions(params: &ResizeQuery, config: &PerformanceConfig) -> Result<()> {
-        if let Some(width) = params.width {
-            if width > config.max_output_width {
-                anyhow::bail!(
-                    "Requested output dimensions too large: width {width} exceeds maximum {}",
-                    config.max_output_width
-                );
-            }
-        }
+        Self::check_axis_bound(
+            params.width,
+            params.min_width,
+            params.zoom_x,
+            params.dpr,
+            config.max_output_width,
+            "width",
+        )?;
+        Self::check_axis_bound(
+            params.height,
+            params.min_height,
+            params.zoom_y,
+            params.dpr,
+            config.max_output_height,
+            "height",
+        )?;
 
-        if let Some(height) = params.height {
-            if height > config.max_output_height {
-                anyhow::bail!(
-                    "Requested output dimensions too large: height {height} exceeds maximum {}",
-                    config.max_output_height
-                );
-            }
+        Ok(())
+    }
+
+    /// One axis of [`Self::check_output_dimensions`]'s conservative upper
+    /// bound: `max(explicit * max(zoom, 1) * max(dpr, 1), min)`. Only
+    /// `zoom`/`dpr` values greater than `1.0` can grow the request past
+    /// `max` (values `<= 1.0` only ever shrink it, since both are
+    /// validated as strictly positive at parse time), and `min-width`/
+    /// `min-height` are never themselves scaled by `zoom`/`dpr` (matching
+    /// `Self::effective_resize_box`), so `min` is compared against the
+    /// scaled `explicit` value directly rather than also being scaled.
+    fn check_axis_bound(
+        explicit: Option<u32>,
+        min: Option<u32>,
+        zoom: f32,
+        dpr: f32,
+        max: u32,
+        axis_name: &str,
+    ) -> Result<()> {
+        let multiplier = f64::from(zoom.max(1.0)) * f64::from(dpr.max(1.0));
+        let scaled_explicit = explicit.map(|v| (f64::from(v) * multiplier).ceil() as u64);
+
+        let bound = match (scaled_explicit, min) {
+            (Some(a), Some(b)) => a.max(u64::from(b)),
+            (Some(a), None) => a,
+            (None, Some(b)) => u64::from(b),
+            (None, None) => return Ok(()),
+        };
+
+        if bound > u64::from(max) {
+            anyhow::bail!(
+                "Requested output dimensions too large: {axis_name} {bound} exceeds maximum {max}"
+            );
         }
 
         Ok(())
+    }
+
+    /// `true` when a `rotate` angle (already normalised to `0..360` by the
+    /// URL parser) swaps width and height - i.e. 90 or 270 degrees. Shared
+    /// by `Self::check_output_dimensions` (pre-decode) and
+    /// `Self::effective_resize_box` (post-decode) so both apply the exact
+    /// same axis-swap rule.
+    fn rotate_swaps_axes(degrees: i32) -> bool {
+        (degrees.rem_euclid(360) / 90) % 2 == 1
+    }
+
+
+    /// Computes the boxes #51's sizing options (`zoom`, `dpr`, `min-width`/
+    /// `min-height`, `rotate`) feed into the resize step and `extend`,
+    /// folding in the #36 enlarge guard, in the order imgproxy itself
+    /// applies them (verified against `prepare.go`'s `ExtractGeometry`/
+    /// `calcScale`/`calcSizes` and `scale.go` in the `imgproxy/imgproxy` v4
+    /// source at the time of writing).
+    ///
+    /// ## The key insight: do the math in "final-orientation" space
+    ///
+    /// `params.width`/`height`/`min_width`/`min_height` all describe the
+    /// *final*, post-rotation image the caller wants back - that's the
+    /// whole point of naming them (a caller writes `w:800/h:600/rot:90`
+    /// expecting an 800x600 result, not an image that's 800x600 *before*
+    /// being rotated into 600x800). imgproxy's own `ExtractGeometry`
+    /// (`prepare.go`) reflects this directly: it swaps `SrcWidth`/
+    /// `SrcHeight` into final orientation once, right at the top
+    /// (`if (angle+baseAngle)%180 != 0 { width, height = height, width }`),
+    /// and *every* subsequent calculation - `calcScale`'s enlarge guard,
+    /// `calcSizes`'s `TargetWidth`/`TargetHeight` extend uses - runs
+    /// entirely in that final-orientation space using the raw,
+    /// **unswapped** `po.Width()`/`po.Height()`/`po.MinWidth()`/
+    /// `po.MinHeight()`. Only right at the end, inside the `scale()`
+    /// pipeline step itself (`if (c.Angle+c.PO.Rotate())%180==90 {
+    /// wscale, hscale = hscale, wscale }`), does imgproxy translate the
+    /// final-orientation result back into the actual pixel buffer's axes -
+    /// because that pixel buffer hasn't been rotated yet at the point
+    /// `scale()` runs (`rotateAndFlip` is the *next* pipeline step).
+    ///
+    /// This function mirrors that structure exactly:
+    /// 1. Swap `src_width`/`src_height` into final orientation *once*, up
+    ///    front (`final_src_w`/`final_src_h`) - this is the only swap that
+    ///    happens before the main calculation.
+    /// 2. Do zoom -> dpr -> enlarge-guard -> min-floor entirely in
+    ///    final-orientation space, using `params.width`/`height`/
+    ///    `min_width`/`min_height` completely unswapped (they already mean
+    ///    "final"), compared against `final_src_w`/`final_src_h`.
+    /// 3. `extend`'s target (`extend_box`) is read directly off this
+    ///    final-orientation result too, *before* the enlarge guard/min
+    ///    floor (steps within (2)) - no swap needed at all, since `extend`
+    ///    runs *after* `Self::apply_rotate` in the pipeline (see that
+    ///    function's call site), by which point the image is already in
+    ///    final orientation. This is what lets `extend` synthesize the
+    ///    originally-requested canvas size via background padding even
+    ///    when `enlarge=false` refused to upscale the actual resized
+    ///    pixels - `extend`'s whole purpose is "pad if the image ends up
+    ///    smaller than requested", precisely the `enlarge=false` +
+    ///    small-source case.
+    /// 4. Only the very last step - producing `resize_box`, the box handed
+    ///    to the actual pixel-buffer resize call below, which still runs
+    ///    *before* rotation - swaps the final-orientation result back into
+    ///    physical (pre-rotation) axes.
+    ///
+    /// Getting steps 1 and 4 backwards (swapping the *target* box against
+    /// an *unswapped* source, instead of swapping the *source* once up
+    /// front and the *result* once at the end) silently pairs the wrong
+    /// axes against each other in the enlarge guard/min-floor math - a bug
+    /// this function's implementation had during development, caught by
+    /// working through imgproxy's actual `ExtractGeometry` source rather
+    /// than guessing at the shape of the swap.
+    ///
+    /// `zoom`/`dpr` are also a deliberate narrowing of imgproxy: they only
+    /// multiply an axis that already has an explicit `width`/`height` set
+    /// (imgproxy can also scale the "natural" source size with no explicit
+    /// width/height at all, via its shared shrink-factor machinery) - #51's
+    /// brief specifically calls out the `dpr` + explicit-width responsive-
+    /// image pattern as the case that matters, not zoom-alone. The #36
+    /// enlarge guard is also a deliberate simplification: imgproxy's own
+    /// `dpr`/enlarge interaction (`prepare.go`'s `DprScale` dance) lets
+    /// `dpr` alone nudge slightly past what plain `enlarge=false` would
+    /// allow in some edge cases; this crate uses one uniform rule instead -
+    /// every option that can inflate the effective target size (`width`,
+    /// `height`, zoom- and dpr-scaled alike) is gated by the same flag,
+    /// except `min-width`/`min-height`, which - matching imgproxy's
+    /// `calcScale` exactly - are **not** gated by `enlarge` at all: they
+    /// can force upscaling past the source even with `enlarge=false`
+    /// (`prepare.go`: the min-width/min-height block runs unconditionally,
+    /// after the `!po.Enlarge()`-gated block).
+    fn effective_resize_box(params: &ResizeQuery, src_width: u32, src_height: u32) -> EffectiveSizing {
+        let sizing_active = params.width.is_some()
+            || params.height.is_some()
+            || params.min_width.is_some()
+            || params.min_height.is_some();
+
+        if !sizing_active {
+            return EffectiveSizing {
+                resize_box: (None, None),
+                extend_box: None,
+            };
+        }
+
+        let swap = Self::rotate_swaps_axes(params.rotate);
+
+        // Step 1: source dimensions, swapped into final orientation once.
+        let (final_src_w, final_src_h) = if swap {
+            (src_height, src_width)
+        } else {
+            (src_width, src_height)
+        };
+
+        // Step 2a: zoom then dpr - entirely in final-orientation space,
+        // `params.width`/`height` used directly (they already mean
+        // "final"), only on axes with an explicit width/height.
+        let scale_axis = |value: Option<u32>, zoom: f32| {
+            value.map(|v| {
+                (f64::from(v) * f64::from(zoom) * f64::from(params.dpr))
+                    .round()
+                    .max(1.0) as u32
+            })
+        };
+        let mut final_width = scale_axis(params.width, params.zoom_x);
+        let mut final_height = scale_axis(params.height, params.zoom_y);
+
+        // Step 3: `extend`'s target, captured here (final-orientation,
+        // pre-enlarge-guard, pre-min-floor) - no swap, see the doc comment.
+        let extend_box = match (final_width, final_height) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        };
+
+        // Step 2b: enlarge guard (#36), final-orientation space.
+        final_width = final_width.map(|w| if params.enlarge { w } else { w.min(final_src_w) });
+        final_height = final_height.map(|h| if params.enlarge { h } else { h.min(final_src_h) });
+
+        // Step 2c: min-width/min-height floor, final-orientation space,
+        // deliberately bypassing `enlarge` (see the doc comment above).
+        if let Some(mw) = params.min_width {
+            final_width = Some(final_width.unwrap_or(final_src_w).max(mw));
+        }
+        if let Some(mh) = params.min_height {
+            final_height = Some(final_height.unwrap_or(final_src_h).max(mh));
+        }
+
+        // Step 4: swap the final-orientation result back into physical
+        // (pre-rotation) axes for the actual pixel-buffer resize call.
+        let (resize_width, resize_height) = if swap {
+            (final_height, final_width)
+        } else {
+            (final_width, final_height)
+        };
+
+        EffectiveSizing {
+            resize_box: (resize_width, resize_height),
+            extend_box,
+        }
+    }
+
+    /// imgproxy's `trim`/`t` processing option (#51) - removes uniform-
+    /// colour borders. Always the first geometry operation applied (see
+    /// `ResizeQuery::trim`'s doc comment).
+    ///
+    /// The target colour is `trim.color` if given, otherwise the image's
+    /// own top-left corner pixel - a deliberately simpler stand-in for
+    /// imgproxy's own multi-corner "smart" background detection. A pixel
+    /// counts as "background" when its maximum per-channel (Chebyshev)
+    /// distance from that colour is within `trim.threshold` - simpler and
+    /// more predictable than imgproxy's own perceptual metric, and easy to
+    /// assert pixel-exactly in tests.
+    ///
+    /// Each edge is scanned independently inward until a non-background
+    /// row/column is found; `equal_hor`/`equal_ver` then clamp the two
+    /// opposing trim amounts to their minimum, so only a symmetric amount
+    /// is cut. Degenerate guard: if a threshold wide enough (or a fully
+    /// uniform image) would trim away the *entire* image on either axis,
+    /// this returns the image unchanged instead of producing a 0-pixel
+    /// dimension.
+    fn apply_trim(img: &DynamicImage, trim: &TrimOptions) -> DynamicImage {
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        if width == 0 || height == 0 {
+            return img.clone();
+        }
+
+        let target = trim.color.unwrap_or_else(|| {
+            let p = rgba.get_pixel(0, 0);
+            [p[0], p[1], p[2]]
+        });
+
+        let is_background = |x: u32, y: u32| -> bool {
+            let p = rgba.get_pixel(x, y);
+            let dr = (f32::from(p[0]) - f32::from(target[0])).abs();
+            let dg = (f32::from(p[1]) - f32::from(target[1])).abs();
+            let db = (f32::from(p[2]) - f32::from(target[2])).abs();
+            dr.max(dg).max(db) <= trim.threshold
+        };
+        let row_is_background = |y: u32| (0..width).all(|x| is_background(x, y));
+        let col_is_background = |x: u32| (0..height).all(|y| is_background(x, y));
+
+        let mut top = 0u32;
+        while top < height && row_is_background(top) {
+            top += 1;
+        }
+        let mut bottom = 0u32;
+        while bottom < height - top && row_is_background(height - 1 - bottom) {
+            bottom += 1;
+        }
+        let mut left = 0u32;
+        while left < width && col_is_background(left) {
+            left += 1;
+        }
+        let mut right = 0u32;
+        while right < width - left && col_is_background(width - 1 - right) {
+            right += 1;
+        }
+
+        if trim.equal_hor {
+            let m = left.min(right);
+            left = m;
+            right = m;
+        }
+        if trim.equal_ver {
+            let m = top.min(bottom);
+            top = m;
+            bottom = m;
+        }
+
+        if top + bottom >= height || left + right >= width {
+            return img.clone();
+        }
+
+        img.crop_imm(left, top, width - left - right, height - top - bottom)
+    }
+
+    /// imgproxy's `rotate`/`rot` processing option (#51). `degrees` is
+    /// always one of `0`/`90`/`180`/`270` by the time it reaches here - the
+    /// URL parser (`crate::modules::url::options::parse_rotate_angle`)
+    /// rejects anything else at parse time and normalises negative angles
+    /// into that range.
+    fn apply_rotate(img: DynamicImage, degrees: i32) -> DynamicImage {
+        match degrees.rem_euclid(360) {
+            90 => img.rotate90(),
+            180 => img.rotate180(),
+            270 => img.rotate270(),
+            _ => img,
+        }
+    }
+
+    /// imgproxy's `flip`/`fl` processing option (#51) - mirrors along
+    /// either or both axes. Order between the two mirrors doesn't matter
+    /// (they're independent, commuting operations).
+    fn apply_flip(img: DynamicImage, horizontal: bool, vertical: bool) -> DynamicImage {
+        let img = if horizontal { img.fliph() } else { img };
+        if vertical { img.flipv() } else { img }
+    }
+
+    /// Places `img` onto a new `new_w x new_h` canvas filled with
+    /// `background`, at offset `(off_x, off_y)` - the shared primitive
+    /// behind both `Self::apply_extend` and `Self::apply_padding` (#51).
+    /// New pixels are fully opaque (`alpha = 255` when the image carries an
+    /// alpha channel), so the pre-encode alpha stage (#34/#60) below - which
+    /// only ever touches `alpha == 0` pixels - leaves them untouched, the
+    /// same order imgproxy's own pipeline implies (`extend`/`padding` both
+    /// run ahead of `flatten` there too).
+    fn embed_on_background(
+        img: &DynamicImage,
+        new_w: u32,
+        new_h: u32,
+        off_x: u32,
+        off_y: u32,
+        background: [u8; 3],
+    ) -> DynamicImage {
+        if img.has_alpha() {
+            let mut canvas = RgbaImage::from_pixel(
+                new_w,
+                new_h,
+                Rgba([background[0], background[1], background[2], 255]),
+            );
+            image::imageops::overlay(&mut canvas, &img.to_rgba8(), i64::from(off_x), i64::from(off_y));
+            DynamicImage::ImageRgba8(canvas)
+        } else {
+            let mut canvas = RgbImage::from_pixel(new_w, new_h, Rgb(background));
+            image::imageops::overlay(&mut canvas, &img.to_rgb8(), i64::from(off_x), i64::from(off_y));
+            DynamicImage::ImageRgb8(canvas)
+        }
+    }
+
+    /// imgproxy's `extend`/`ex` processing option (#51) - pads the image up
+    /// to `target_w x target_h`, centring the original within the new
+    /// canvas, if (and only if) it's currently smaller than that box on
+    /// either axis. A no-op otherwise. `target_w`/`target_h` come from
+    /// `EffectiveSizing::extend_box` (`Self::effective_resize_box`), not
+    /// the enlarge-capped resize box, which is what lets this pad out to
+    /// the originally-requested size even when `enlarge=false` capped the
+    /// actual resize.
+    fn apply_extend(img: DynamicImage, target_w: u32, target_h: u32, background: [u8; 3]) -> DynamicImage {
+        let (w, h) = img.dimensions();
+        if w >= target_w && h >= target_h {
+            return img;
+        }
+
+        let new_w = w.max(target_w);
+        let new_h = h.max(target_h);
+        let off_x = (new_w - w) / 2;
+        let off_y = (new_h - h) / 2;
+
+        Self::embed_on_background(&img, new_w, new_h, off_x, off_y, background)
+    }
+
+    /// imgproxy's `padding`/`pd` processing option (#51) - always enlarges
+    /// the canvas by the given amount on each side, background-filled.
+    /// Unlike imgproxy, padding values here are *not* scaled by `dpr` - a
+    /// deliberate simplification (`pd:`+`dpr:` is a rare enough combination
+    /// that literal pixel counts are more predictable/debuggable than a
+    /// dpr-scaled equivalent). `u32::saturating_add` guards the new-canvas
+    /// arithmetic; the #26 post-padding dimension check at this function's
+    /// call site is what actually rejects an unreasonably large result.
+    fn apply_padding(img: DynamicImage, padding: &Padding, background: [u8; 3]) -> DynamicImage {
+        let (w, h) = img.dimensions();
+        let new_w = w.saturating_add(padding.left).saturating_add(padding.right);
+        let new_h = h.saturating_add(padding.top).saturating_add(padding.bottom);
+
+        Self::embed_on_background(&img, new_w, new_h, padding.left, padding.top, background)
     }
 
     /// Rejects a decoded *source* resolution above `max_src_resolution_mp`
@@ -1256,29 +2640,36 @@ impl ImageService {
     }
 
     /// Predicts the exact target dimensions the resize stage in
-    /// `process_image_blocking_with_limits` (its `effective_width`/
-    /// `effective_height` computation and the `Fit`/`Fill`/`Force`/`Auto`
-    /// match right after it) will compute for a decoded (and, if
+    /// `encode_single_image` (`Self::effective_resize_box`'s `resize_box`
+    /// output, and the `Fit`/`Fill`/`Force`/`Auto` match right after it in
+    /// `Self::resize_and_filter`) will compute for a decoded (and, if
     /// `params.autorotate` is set, already-rotated) image of
-    /// `src_width x src_height` - the #36 upscale guard and every resize-type
-    /// branch, reproduced verbatim from that call site, sharing the same
-    /// `resize_dimensions` aspect-ratio helper so the two can't drift on the
-    /// underlying arithmetic.
+    /// `src_width x src_height` - every resize-type branch is reproduced
+    /// verbatim from that call site, sharing the same `resize_dimensions`
+    /// aspect-ratio helper so the two can't drift on that part of the
+    /// arithmetic.
+    ///
+    /// `effective_width`/`effective_height` themselves come from
+    /// `Self::effective_resize_box` (#51) rather than a second, hand-rolled
+    /// copy of its `zoom`/`dpr`/enlarge-guard/`min-width`/`min-height`/
+    /// `rotate`-axis-swap math: an earlier version of this function only
+    /// applied the #36 enlarge guard to `params.width`/`params.height`
+    /// directly, silently ignoring `zoom`/`dpr` (which can make the real
+    /// target *larger* than `params.width`/`height` alone) and `min-width`/
+    /// `min-height` (which can force a floor past even that) - for a
+    /// request combining any of those with a JPEG source, that under-
+    /// estimated target could make `select_jpeg_dct_scale` below pick a
+    /// DCT scale that decodes *smaller* than the real resize step needs,
+    /// which is exactly the "never decode smaller than target" invariant
+    /// this function exists to uphold. Delegating to the one real
+    /// `effective_resize_box` implementation instead of a parallel copy
+    /// closes that gap structurally, not just for the cases caught so far.
     ///
     /// Exists so `decode_jpeg_scaled` (#63 stage 2) can pick a DCT scale
     /// *before* decoding, without duplicating the real resize call itself.
-    /// If this function and the real resize stage are ever changed
-    /// independently of each other, `decode_jpeg_scaled` could end up
-    /// picking a scale that decodes below what the real resize needs -
-    /// violating the "never decode smaller than target" requirement - so
-    /// keep them in sync.
     fn effective_resize_target(src_width: u32, src_height: u32, params: &ResizeQuery) -> (u32, u32) {
-        let effective_width = params
-            .width
-            .map(|w| if params.enlarge { w } else { w.min(src_width) });
-        let effective_height = params
-            .height
-            .map(|h| if params.enlarge { h } else { h.min(src_height) });
+        let sizing = Self::effective_resize_box(params, src_width, src_height);
+        let (effective_width, effective_height) = sizing.resize_box;
 
         match (effective_width, effective_height) {
             (Some(w), None) => Self::resize_dimensions(src_width, src_height, w, u32::MAX, false),
@@ -1435,6 +2826,15 @@ impl ImageService {
         match &bytes[0..4] {
             [0xFF, 0xD8, 0xFF, _] => Some(ImageFormat::Jpeg),
             [0x89, 0x50, 0x4E, 0x47] => Some(ImageFormat::Png),
+            // #49: `GIF87a`/`GIF89a` both start `GIF8` - checking only the
+            // first 4 bytes (rather than all 6) is enough to disambiguate
+            // from every other format hinted here, and is what lets
+            // `process_image_blocking_with_limits` recognise a GIF source
+            // as animatable in the first place (without this, every GIF
+            // request - animated or not - would silently take the
+            // guessed-format fallback path and never reach the animated
+            // encode branch at all).
+            [b'G', b'I', b'F', b'8'] => Some(ImageFormat::Gif),
             _ => {
                 // Check for WebP
                 if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
@@ -1505,15 +2905,7 @@ mod tests {
             height,
             resize_type,
             format: ApiImageFormat::Jpg,
-            blur_sigma: None,
-            grayscale: None,
-            enlarge: false,
-            quality: None,
-            jpeg_quality: None,
-            webp_quality: None,
-            webp_lossless: None,
-            background: None,
-            autorotate: true,
+            ..Default::default()
         }
     }
 
@@ -2635,15 +4027,8 @@ mod tests {
             height: None,
             resize_type: ResizeType::Fit,
             format,
-            blur_sigma: None,
-            grayscale: None,
-            enlarge: false,
-            quality: None,
-            jpeg_quality: None,
-            webp_quality: None,
-            webp_lossless: None,
             background,
-            autorotate: true,
+            ..Default::default()
         }
     }
 
@@ -2770,7 +4155,10 @@ mod tests {
         let [r, g, b] = decoded.get_pixel(0, 0).0;
         assert!(r < 40, "expected low red near a blue background, got {r}");
         assert!(g < 40, "expected low green near a blue background, got {g}");
-        assert!(b > 200, "expected high blue near a blue background, got {b}");
+        assert!(
+            b > 200,
+            "expected high blue near a blue background, got {b}"
+        );
     }
 
     /// #60: output-size regression guard for the exact adversarial shape
@@ -3163,5 +4551,1616 @@ mod tests {
             "a source with no EXIF orientation tag must produce identical output regardless \
              of autorotate"
         );
+    }
+
+    // ---- #49: AVIF output, animated GIF/WebP, content negotiation -------
+
+    /// Builds a tiny (4x4) `frame_count`-frame animated GIF, alternating
+    /// solid red/blue - not one of `benches/fixtures.rs`'s shared corpus
+    /// fixtures, since none of those are animated.
+    fn tiny_animated_gif(frame_count: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut buf);
+            for i in 0..frame_count {
+                let colour = if i % 2 == 0 {
+                    image::Rgba([255, 0, 0, 255])
+                } else {
+                    image::Rgba([0, 0, 255, 255])
+                };
+                let img = image::RgbaImage::from_pixel(4, 4, colour);
+                let frame =
+                    image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(100, 1));
+                encoder.encode_frame(frame).expect("encode gif frame");
+            }
+        }
+        buf
+    }
+
+    /// Builds a tiny (4x4) `frame_count`-frame animated WebP the same way,
+    /// via the `webp` crate's `AnimEncoder` - the exact same encoder
+    /// `ImageService::encode_animated_webp` uses in production.
+    fn tiny_animated_webp(frame_count: u32) -> Vec<u8> {
+        let webp_config = webp::WebPConfig::new().expect("init webp config");
+        let mut encoder = webp::AnimEncoder::new(4, 4, &webp_config);
+        let mut buffers: Vec<Vec<u8>> = Vec::new();
+        for i in 0..frame_count {
+            let colour: [u8; 4] = if i % 2 == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
+            let mut buf = Vec::with_capacity(4 * 4 * 4);
+            for _ in 0..16 {
+                buf.extend_from_slice(&colour);
+            }
+            buffers.push(buf);
+        }
+        for (i, buf) in buffers.iter().enumerate() {
+            encoder.add_frame(webp::AnimFrame::from_rgba(buf, 4, 4, (i as i32) * 100));
+        }
+        encoder.encode().to_vec()
+    }
+
+    /// #49: an animated GIF source requested as `.gif` must stay animated -
+    /// every frame resized and re-encoded, not just the first one.
+    #[test]
+    fn animated_gif_source_to_gif_output_preserves_multiple_frames() {
+        let bytes = tiny_animated_gif(3);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Gif,
+            ..query(None, None)
+        };
+
+        let (output, content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("animated GIF processing should succeed");
+
+        assert_eq!(content_type, "image/gif");
+
+        let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&output))
+            .expect("output should be a valid GIF");
+        let frames = decoder
+            .into_frames()
+            .collect_frames()
+            .expect("decode frames");
+        assert!(
+            frames.len() > 1,
+            "expected the animated source's multiple frames to survive round-tripping \
+             through .gif output, got {}",
+            frames.len()
+        );
+    }
+
+    /// #49: same as above, but for animated WebP staying animated through
+    /// `.webp` output - the case #49 explicitly asked to verify rather than
+    /// assume was possible at all (it is - see `encode_animated_webp`'s doc
+    /// comment).
+    #[test]
+    fn animated_webp_source_to_webp_output_preserves_multiple_frames() {
+        let bytes = tiny_animated_webp(3);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Webp,
+            ..query(None, None)
+        };
+
+        let (output, content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("animated WebP processing should succeed");
+
+        assert_eq!(content_type, "image/webp");
+
+        let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&output))
+            .expect("output should be a valid WebP");
+        assert!(decoder.has_animation(), "output should still be animated");
+        let frames = decoder
+            .into_frames()
+            .collect_frames()
+            .expect("decode frames");
+        assert!(
+            frames.len() > 1,
+            "expected the animated source's multiple frames to survive round-tripping \
+             through .webp output, got {}",
+            frames.len()
+        );
+    }
+
+    /// #49's own description of the pre-existing (and still correct for a
+    /// non-animatable output format) behaviour: an animated source
+    /// requested as a format that can't carry animation flattens to its
+    /// first frame instead of erroring.
+    #[test]
+    fn animated_gif_requested_as_jpg_flattens_to_first_frame() {
+        let bytes = tiny_animated_gif(3);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(None, None)
+        };
+
+        let (output, content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        assert_eq!(content_type, "image/jpeg");
+        let decoded = image::load_from_memory(&output).expect("output should decode as JPEG");
+        assert_eq!(decoded.dimensions(), (4, 4));
+    }
+
+    /// A many-tiny-frames animated source must be rejected once it exceeds
+    /// `config.max_animation_frames`, without decoding every frame first
+    /// (the cap itself is what's under test here, not the decode cost).
+    #[test]
+    fn animation_frame_count_over_limit_is_rejected() {
+        let bytes = tiny_animated_gif(5);
+        let config = PerformanceConfig {
+            max_animation_frames: 3,
+            ..PerformanceConfig::default()
+        };
+        let params = ResizeQuery {
+            format: ApiImageFormat::Gif,
+            ..query(None, None)
+        };
+
+        let err = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect_err("a 5-frame source over a 3-frame cap should be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("frame"),
+            "expected a frame-count-related error, got: {err}"
+        );
+    }
+
+    /// A source *within* the frame cap must still succeed (the cap is a
+    /// ceiling, not an off-by-one trap).
+    #[test]
+    fn animation_frame_count_within_limit_succeeds() {
+        let bytes = tiny_animated_gif(3);
+        let config = PerformanceConfig {
+            max_animation_frames: 3,
+            ..PerformanceConfig::default()
+        };
+        let params = ResizeQuery {
+            format: ApiImageFormat::Gif,
+            ..query(None, None)
+        };
+
+        assert!(ImageService::process_image_blocking_with_limits(&bytes, &params, &config).is_ok());
+    }
+
+    /// #49: AVIF output produces a real AVIF container (`....ftypavif...`
+    /// per the AVIF/ISOBMFF magic bytes `image::io::free_functions` itself
+    /// sniffs on) with the right `Content-Type` - `emgr` can't decode AVIF
+    /// back (`avif-native`/`dav1d` isn't enabled, see `ImageFormat`'s doc
+    /// comment in `src/models/params.rs`), so this checks the container
+    /// shape directly rather than round-tripping through a decode.
+    #[test]
+    fn avif_output_produces_a_valid_avif_container() {
+        let bytes = fixtures::photo_like();
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Avif,
+            ..query_with_type(Some(64), Some(64), ResizeType::Fill)
+        };
+
+        let (output, content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("AVIF processing should succeed");
+
+        assert_eq!(content_type, "image/avif");
+        assert!(
+            output.len() > 12,
+            "AVIF output should have a real ISOBMFF header"
+        );
+        assert_eq!(&output[4..8], b"ftyp", "expected an ISOBMFF ftyp box");
+        assert_eq!(&output[8..12], b"avif", "expected the avif major brand");
+    }
+
+    /// `params.quality` (the `q:` processing option) must actually change
+    /// AVIF output size - unlike the pre-existing WebP/JPEG paths, #49
+    /// wires it through to `AvifEncoder::new_with_speed_quality`.
+    #[test]
+    fn avif_quality_changes_output_size() {
+        let bytes = fixtures::photo_like();
+        let config = PerformanceConfig::default();
+        let params_at = |quality: u8| ResizeQuery {
+            format: ApiImageFormat::Avif,
+            quality: Some(quality),
+            ..query_with_type(Some(128), Some(128), ResizeType::Fill)
+        };
+
+        let (low, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params_at(20), &config)
+                .expect("low-quality AVIF should succeed");
+        let (high, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params_at(95), &config)
+                .expect("high-quality AVIF should succeed");
+
+        assert!(
+            low.len() < high.len(),
+            "expected quality 20 ({} bytes) to be smaller than quality 95 ({} bytes)",
+            low.len(),
+            high.len()
+        );
+    }
+
+    // ---- #50: explicit crop + gravity ----
+
+    /// Builds a `ResizeQuery` requesting no resize at all (`width`/`height`
+    /// both `None`, so `process_image_blocking_with_limits`'s
+    /// `(None, None) => img` arm returns the crop step's output untouched)
+    /// with the given `crop`, against `fixtures::gravity_marker()`. Keeping
+    /// resize out of the picture makes `apply_crop`'s output pixel-exact -
+    /// `DynamicImage::crop_imm` is a plain extraction, no resampling - so
+    /// assertions below can check for a marker's *exact* RGB rather than a
+    /// resampled approximation.
+    fn crop_only_query(crop: Crop) -> ResizeQuery {
+        ResizeQuery {
+            crop: Some(crop),
+            format: ApiImageFormat::Png,
+            ..query(None, None)
+        }
+    }
+
+    /// True if any pixel in `img` matches `color` exactly.
+    fn contains_exact_color(img: &image::RgbImage, color: image::Rgb<u8>) -> bool {
+        img.pixels().any(|p| *p == color)
+    }
+
+    /// True if any pixel in `img` matches `color` within `tol` per channel -
+    /// used for the `Fill`+gravity test below, where the marker actually
+    /// goes through `fast_image_resize` resampling (not just extraction),
+    /// so an exact-equality check would be too strict at a marker's own
+    /// edge pixels (interior pixels, away from the edge, still land on the
+    /// exact colour - see `fixtures::gravity_marker_rgb`'s doc comment -
+    /// but scanning the whole image doesn't distinguish edge from
+    /// interior).
+    fn contains_color_near(img: &image::RgbImage, color: image::Rgb<u8>, tol: u8) -> bool {
+        img.pixels().any(|p| {
+            p.0.iter()
+                .zip(color.0.iter())
+                .all(|(a, b)| a.abs_diff(*b) <= tol)
+        })
+    }
+
+    fn decode_rgb(output: &[u8]) -> image::RgbImage {
+        image::load_from_memory_with_format(output, ImageFormat::Png)
+            .expect("output should decode")
+            .to_rgb8()
+    }
+
+    /// #50: a half-size (`MARKER_W/2 x MARKER_H/2`), `Center`-gravity crop
+    /// of the marker fixture excludes every corner marker (each corner
+    /// square sits entirely outside the centred crop window) but keeps the
+    /// centre marker - proving the crop is where imgproxy's own default
+    /// (`ce:0:0`) says it should be, not accidentally reproducing some
+    /// other anchor.
+    #[test]
+    fn explicit_crop_center_gravity_keeps_only_the_centre_marker() {
+        let bytes = fixtures::gravity_marker();
+        let config = PerformanceConfig::default();
+        let crop = Crop {
+            width: CropDimension::Absolute(fixtures::MARKER_W / 2),
+            height: CropDimension::Absolute(fixtures::MARKER_H / 2),
+            gravity: Gravity::Center,
+        };
+        let params = crop_only_query(crop);
+
+        let (output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+        let decoded = decode_rgb(&output);
+
+        assert!(contains_exact_color(&decoded, fixtures::MARKER_CENTER));
+        for corner in [
+            fixtures::MARKER_NORTHWEST,
+            fixtures::MARKER_NORTHEAST,
+            fixtures::MARKER_SOUTHWEST,
+            fixtures::MARKER_SOUTHEAST,
+        ] {
+            assert!(
+                !contains_exact_color(&decoded, corner),
+                "centre-gravity crop should not contain corner marker {corner:?}"
+            );
+        }
+    }
+
+    /// #50: each corner gravity, with a half-size crop window, isolates
+    /// exactly the marker in that corner - the whole point of gravity
+    /// (imgproxy's `no`/`so`/`ea`/`we`/`noea`/`nowe`/`soea`/`sowe`,
+    /// <https://docs.imgproxy.net/usage/processing#gravity>). Distinct from
+    /// a dimensions-only assertion: a `NorthWest` crop and a `SouthEast`
+    /// crop of the same source produce identical output dimensions here,
+    /// and only differ in which marker survives.
+    #[test]
+    fn explicit_crop_corner_gravity_keeps_only_the_matching_corner_marker() {
+        let bytes = fixtures::gravity_marker();
+        let config = PerformanceConfig::default();
+
+        let cases = [
+            (Gravity::NorthWest, fixtures::MARKER_NORTHWEST),
+            (Gravity::NorthEast, fixtures::MARKER_NORTHEAST),
+            (Gravity::SouthWest, fixtures::MARKER_SOUTHWEST),
+            (Gravity::SouthEast, fixtures::MARKER_SOUTHEAST),
+        ];
+        let all_markers = [
+            fixtures::MARKER_NORTHWEST,
+            fixtures::MARKER_NORTHEAST,
+            fixtures::MARKER_SOUTHWEST,
+            fixtures::MARKER_SOUTHEAST,
+        ];
+
+        for (gravity, expected_marker) in cases {
+            let crop = Crop {
+                width: CropDimension::Absolute(fixtures::MARKER_W / 2),
+                height: CropDimension::Absolute(fixtures::MARKER_H / 2),
+                gravity,
+            };
+            let params = crop_only_query(crop);
+
+            let (output, _) =
+                ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                    .unwrap_or_else(|e| panic!("{gravity:?} processing should succeed: {e}"));
+            let decoded = decode_rgb(&output);
+
+            assert!(
+                contains_exact_color(&decoded, expected_marker),
+                "{gravity:?} crop should contain its own corner marker {expected_marker:?}"
+            );
+            for marker in all_markers {
+                if marker == expected_marker {
+                    continue;
+                }
+                assert!(
+                    !contains_exact_color(&decoded, marker),
+                    "{gravity:?} crop should not contain the other corner marker {marker:?}"
+                );
+            }
+        }
+    }
+
+    // ---- #52: watermarking ----
+
+    fn watermark_query() -> WatermarkQuery {
+        WatermarkQuery {
+            opacity: 1.0,
+            position: WatermarkPosition::Center,
+            x_offset: 0.0,
+            y_offset: 0.0,
+            scale: 0.0,
+            url: None,
+            size: None,
+            rotate: 0.0,
+            shadow: None,
+        }
+    }
+
+    /// Opaque `width x height` RGBA image filled with `color`.
+    fn solid_rgba(width: u32, height: u32, color: [u8; 4]) -> image::RgbaImage {
+        image::ImageBuffer::from_fn(width, height, |_, _| image::Rgba(color))
+    }
+
+    /// #52: every documented (non-tiling) position anchors the watermark at
+    /// the expected corner/edge/centre, with no offset applied.
+    #[test]
+    fn watermark_position_computes_every_anchor() {
+        // 100x100 base, 20x10 watermark - asymmetric watermark dimensions
+        // catch a position formula that accidentally swaps width/height.
+        let (bw, bh, ww, wh) = (100u32, 100u32, 20u32, 10u32);
+        let cases = [
+            (WatermarkPosition::Center, (40, 45)),
+            (WatermarkPosition::North, (40, 0)),
+            (WatermarkPosition::South, (40, 90)),
+            (WatermarkPosition::East, (80, 45)),
+            (WatermarkPosition::West, (0, 45)),
+            (WatermarkPosition::NorthEast, (80, 0)),
+            (WatermarkPosition::NorthWest, (0, 0)),
+            (WatermarkPosition::SouthEast, (80, 90)),
+            (WatermarkPosition::SouthWest, (0, 90)),
+        ];
+
+        for (position, expected) in cases {
+            let got = ImageService::watermark_position(position, 0.0, 0.0, bw, bh, ww, wh);
+            assert_eq!(got, expected, "position {position:?}");
+        }
+    }
+
+    /// #52: an offset with magnitude `>= 1.0` is absolute pixels; smaller
+    /// than that is a fraction of the corresponding base dimension.
+    #[test]
+    fn watermark_position_offset_absolute_and_relative() {
+        let (bw, bh, ww, wh) = (100u32, 100u32, 20u32, 20u32);
+
+        // Absolute: NorthWest anchor is (0, 0); +15/-15 pixels moves it there directly.
+        assert_eq!(
+            ImageService::watermark_position(WatermarkPosition::NorthWest, 15.0, 5.0, bw, bh, ww, wh),
+            (15, 5)
+        );
+
+        // Relative: 0.1 of a 100px base is 10px.
+        assert_eq!(
+            ImageService::watermark_position(WatermarkPosition::NorthWest, 0.1, 0.2, bw, bh, ww, wh),
+            (10, 20)
+        );
+
+        // Negative offsets move left/up.
+        assert_eq!(
+            ImageService::watermark_position(WatermarkPosition::SouthEast, -5.0, -5.0, bw, bh, ww, wh),
+            (75, 75)
+        );
+    }
+
+    /// #52 pixel-exact: an opaque overlay composited at `opacity = 1.0`
+    /// over an opaque canvas must exactly replace the covered pixels and
+    /// leave every other pixel untouched.
+    #[test]
+    fn composite_over_full_opacity_fully_replaces_covered_pixels() {
+        let mut canvas = solid_rgba(4, 4, [255, 0, 0, 255]); // red
+        let overlay = solid_rgba(2, 2, [0, 0, 255, 255]); // blue
+
+        ImageService::composite_over(&mut canvas, &overlay, 1, 1, 1.0);
+
+        for y in 0..4 {
+            for x in 0..4 {
+                let covered = (1..3).contains(&x) && (1..3).contains(&y);
+                let expected = if covered { [0, 0, 255, 255] } else { [255, 0, 0, 255] };
+                assert_eq!(
+                    canvas.get_pixel(x, y).0,
+                    expected,
+                    "pixel ({x},{y}), covered={covered}"
+                );
+            }
+        }
+    }
+
+    /// #52 pixel-exact opacity blend: with an opaque overlay over an opaque
+    /// background, `out = src*opacity + dst*(1-opacity)` and the result
+    /// stays fully opaque.
+    #[test]
+    fn composite_over_honors_opacity() {
+        let mut canvas = solid_rgba(1, 1, [0, 0, 0, 255]); // black
+        let overlay = solid_rgba(1, 1, [255, 255, 255, 255]); // white
+
+        ImageService::composite_over(&mut canvas, &overlay, 0, 0, 0.25);
+
+        // 255*0.25 + 0*0.75 = 63.75 -> rounds to 64.
+        assert_eq!(canvas.get_pixel(0, 0).0, [64, 64, 64, 255]);
+    }
+
+    /// #52: an overlay positioned partially (or fully) outside the canvas
+    /// must not panic, and only the in-bounds portion is drawn.
+    #[test]
+    fn composite_over_clips_out_of_bounds_overlay() {
+        let mut canvas = solid_rgba(4, 4, [0, 0, 0, 255]);
+        let overlay = solid_rgba(4, 4, [255, 255, 255, 255]);
+
+        // Positioned so only the bottom-right 2x2 of the overlay lands on
+        // the canvas.
+        ImageService::composite_over(&mut canvas, &overlay, -2, -2, 1.0);
+
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let covered = x < 2 && y < 2;
+                let expected = if covered { 255 } else { 0 };
+                assert_eq!(canvas.get_pixel(x, y).0, [expected, expected, expected, 255]);
+            }
+        }
+
+        // Entirely off-canvas must be a total no-op, not a panic.
+        let mut canvas2 = solid_rgba(4, 4, [1, 2, 3, 255]);
+        let before = canvas2.clone();
+        ImageService::composite_over(&mut canvas2, &overlay, 100, 100, 1.0);
+        assert_eq!(canvas2, before);
+    }
+
+    #[test]
+    fn rotate_rgba_zero_degrees_is_a_no_op() {
+        let img = solid_rgba(5, 3, [10, 20, 30, 255]);
+        let rotated = ImageService::rotate_rgba(&img, 0.0);
+        assert_eq!(rotated.dimensions(), (5, 3));
+        assert_eq!(rotated, img);
+    }
+
+    /// #52 pixel-exact: rotating 180 degrees around the centre of an
+    /// odd-sized image keeps the same dimensions and maps pixel `(x, y)` to
+    /// what was at `(w-1-x, h-1-y)` - odd dimensions keep every sampled
+    /// coordinate away from an exact pixel-grid boundary, so nearest-
+    /// neighbour sampling is exact here rather than merely close.
+    #[test]
+    fn rotate_rgba_180_degrees_maps_pixels_exactly() {
+        let mut img = image::RgbaImage::new(5, 5);
+        for y in 0..5 {
+            for x in 0..5 {
+                img.put_pixel(x, y, image::Rgba([x as u8, y as u8, 0, 255]));
+            }
+        }
+
+        let rotated = ImageService::rotate_rgba(&img, 180.0);
+        assert_eq!(rotated.dimensions(), (5, 5));
+
+        for y in 0..5u32 {
+            for x in 0..5u32 {
+                let expected = img.get_pixel(4 - x, 4 - y);
+                assert_eq!(
+                    rotated.get_pixel(x, y),
+                    expected,
+                    "pixel ({x},{y}) after 180 degree rotation"
+                );
+            }
+        }
+    }
+
+    /// #50: `North`/`South` keep the full width but anchor vertically -
+    /// both top corners survive `North`, both bottom corners survive
+    /// `South`, and vice versa is excluded. Uses a *full-width* crop
+    /// (`CropDimension::Full`) so the horizontal axis can't accidentally
+    /// exclude a corner and confound the vertical assertion - see
+    /// `CropDimension::Full`'s doc comment ("use the full source dimension
+    /// on this axis").
+    #[test]
+    fn explicit_crop_north_south_gravity_keeps_the_matching_edge_markers() {
+        let bytes = fixtures::gravity_marker();
+        let config = PerformanceConfig::default();
+
+        let north_crop = Crop {
+            width: CropDimension::Full,
+            height: CropDimension::Absolute(fixtures::MARKER_H / 2),
+            gravity: Gravity::North,
+        };
+        let (output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &crop_only_query(north_crop),
+            &config,
+        )
+        .expect("north crop should succeed");
+        let decoded = decode_rgb(&output);
+        assert!(contains_exact_color(&decoded, fixtures::MARKER_NORTHWEST));
+        assert!(contains_exact_color(&decoded, fixtures::MARKER_NORTHEAST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_SOUTHWEST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_SOUTHEAST));
+
+        let south_crop = Crop {
+            width: CropDimension::Full,
+            height: CropDimension::Absolute(fixtures::MARKER_H / 2),
+            gravity: Gravity::South,
+        };
+        let (output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &crop_only_query(south_crop),
+            &config,
+        )
+        .expect("south crop should succeed");
+        let decoded = decode_rgb(&output);
+        assert!(contains_exact_color(&decoded, fixtures::MARKER_SOUTHWEST));
+        assert!(contains_exact_color(&decoded, fixtures::MARKER_SOUTHEAST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_NORTHWEST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_NORTHEAST));
+    }
+
+    /// #50: a focus point placed right on top of the north-west marker's
+    /// centre clamps to the same crop window a `NorthWest` gravity would
+    /// produce (the box can't extend past the source's top-left corner),
+    /// proving `Gravity::FocusPoint`'s clamping behaves like the
+    /// corresponding corner at the boundary rather than partially reading
+    /// out of bounds or panicking.
+    #[test]
+    fn explicit_crop_focus_point_near_a_corner_behaves_like_that_corner() {
+        let bytes = fixtures::gravity_marker();
+        let config = PerformanceConfig::default();
+
+        // The north-west marker's centre, as a fraction of the source
+        // dimensions.
+        let fx = (fixtures::MARKER_SIZE as f64 / 2.0) / f64::from(fixtures::MARKER_W);
+        let fy = (fixtures::MARKER_SIZE as f64 / 2.0) / f64::from(fixtures::MARKER_H);
+
+        let crop = Crop {
+            width: CropDimension::Absolute(fixtures::MARKER_W / 2),
+            height: CropDimension::Absolute(fixtures::MARKER_H / 2),
+            gravity: Gravity::FocusPoint { x: fx, y: fy },
+        };
+        let (output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &crop_only_query(crop),
+            &config,
+        )
+        .expect("focus-point crop should succeed");
+        let decoded = decode_rgb(&output);
+
+        assert!(contains_exact_color(&decoded, fixtures::MARKER_NORTHWEST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_NORTHEAST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_SOUTHWEST));
+        assert!(!contains_exact_color(&decoded, fixtures::MARKER_SOUTHEAST));
+    }
+
+    /// #50: `CropDimension::Relative` (a `(0, 1)` fraction of the source
+    /// dimension) and `CropDimension::Full` (the whole axis) resolve to the
+    /// pixel sizes their doc comments claim - `Relative(0.5)` on a
+    /// `MARKER_W`-wide source is exactly the same crop width as
+    /// `Absolute(MARKER_W / 2)` used throughout the tests above, so the two
+    /// forms must produce byte-identical output for equivalent requests.
+    #[test]
+    fn crop_relative_and_full_dimensions_resolve_correctly() {
+        let bytes = fixtures::gravity_marker();
+        let config = PerformanceConfig::default();
+
+        let absolute = Crop {
+            width: CropDimension::Absolute(fixtures::MARKER_W / 2),
+            height: CropDimension::Absolute(fixtures::MARKER_H / 2),
+            gravity: Gravity::NorthWest,
+        };
+        let relative = Crop {
+            width: CropDimension::Relative(0.5),
+            height: CropDimension::Relative(0.5),
+            gravity: Gravity::NorthWest,
+        };
+
+        let (absolute_output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &crop_only_query(absolute),
+            &config,
+        )
+        .expect("absolute crop should succeed");
+        let (relative_output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &crop_only_query(relative),
+            &config,
+        )
+        .expect("relative crop should succeed");
+
+        assert_eq!(
+            absolute_output, relative_output,
+            "Absolute(W/2) and Relative(0.5) must resolve to the same crop"
+        );
+
+        let full = Crop {
+            width: CropDimension::Full,
+            height: CropDimension::Full,
+            gravity: Gravity::Center,
+        };
+        let (full_output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &crop_only_query(full),
+            &config,
+        )
+        .expect("full crop should succeed");
+        let decoded = decode_rgb(&full_output);
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (fixtures::MARKER_W, fixtures::MARKER_H),
+            "Full:Full crop should keep the entire source"
+        );
+        for marker in [
+            fixtures::MARKER_NORTHWEST,
+            fixtures::MARKER_NORTHEAST,
+            fixtures::MARKER_SOUTHWEST,
+            fixtures::MARKER_SOUTHEAST,
+            fixtures::MARKER_CENTER,
+        ] {
+            assert!(contains_exact_color(&decoded, marker));
+        }
+    }
+
+    /// #50: `gravity` also drives the `ResizeType::Fill` cover-crop, not
+    /// just explicit `c:` crop - this is the change to
+    /// `fir_resize_to_fill`/`ImageService`'s `ResizeType::Fill` arm
+    /// (`src/services/image/handler.rs`) that replaces the old hardcoded
+    /// centre crop. Downscales the marker fixture 2x into a square box,
+    /// which forces a real horizontal crop (400x200 cover-scaled to 200x100
+    /// for a 100x100 box), and checks that `West`/`East` gravity keep the
+    /// matching side's markers - unlike the crop-only tests above, this
+    /// goes through real `fast_image_resize` resampling, so marker presence
+    /// is checked with a small colour tolerance
+    /// (`contains_color_near`) rather than exact equality.
+    #[test]
+    fn fill_resize_honours_gravity_not_just_a_hardcoded_centre() {
+        let bytes = fixtures::gravity_marker();
+        let config = PerformanceConfig::default();
+
+        let west_params = ResizeQuery {
+            gravity: Gravity::West,
+            format: ApiImageFormat::Png,
+            ..query_with_type(Some(100), Some(100), ResizeType::Fill)
+        };
+        let (west_output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &west_params, &config)
+                .expect("west-gravity fill should succeed");
+        let west_decoded = decode_rgb(&west_output);
+        assert!(contains_color_near(
+            &west_decoded,
+            fixtures::MARKER_NORTHWEST,
+            20
+        ));
+        assert!(contains_color_near(
+            &west_decoded,
+            fixtures::MARKER_SOUTHWEST,
+            20
+        ));
+        assert!(!contains_color_near(
+            &west_decoded,
+            fixtures::MARKER_NORTHEAST,
+            20
+        ));
+        assert!(!contains_color_near(
+            &west_decoded,
+            fixtures::MARKER_SOUTHEAST,
+            20
+        ));
+
+        let east_params = ResizeQuery {
+            gravity: Gravity::East,
+            format: ApiImageFormat::Png,
+            ..query_with_type(Some(100), Some(100), ResizeType::Fill)
+        };
+        let (east_output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &east_params, &config)
+                .expect("east-gravity fill should succeed");
+        let east_decoded = decode_rgb(&east_output);
+        assert!(contains_color_near(
+            &east_decoded,
+            fixtures::MARKER_NORTHEAST,
+            20
+        ));
+        assert!(contains_color_near(
+            &east_decoded,
+            fixtures::MARKER_SOUTHEAST,
+            20
+        ));
+        assert!(!contains_color_near(
+            &east_decoded,
+            fixtures::MARKER_NORTHWEST,
+            20
+        ));
+        assert!(!contains_color_near(
+            &east_decoded,
+            fixtures::MARKER_SOUTHWEST,
+            20
+        ));
+
+        assert_ne!(
+            west_output, east_output,
+            "west and east gravity must produce different output bytes, not the same \
+             hardcoded centre crop"
+        );
+    }
+
+    /// #50: `Self::gravity_anchor`'s `Center` case must reproduce
+    /// `resize_to_fill`'s original always-centred arithmetic
+    /// (`(container - box) / 2` per axis, integer/floor division) exactly -
+    /// this is what makes replacing the hardcoded centre-crop with a
+    /// gravity-driven one a strict generalisation rather than a behaviour
+    /// change for the pre-#50 default.
+    #[test]
+    fn gravity_anchor_center_matches_original_floor_division_arithmetic() {
+        for (container_w, container_h, box_w, box_h) in [
+            (200u32, 100u32, 77u32, 33u32),
+            (201, 101, 50, 50),
+            (9, 9, 2, 2),
+        ] {
+            let (x, y) = ImageService::gravity_anchor(
+                Gravity::Center,
+                container_w,
+                container_h,
+                box_w,
+                box_h,
+            );
+            assert_eq!(
+                x,
+                (container_w - box_w) / 2,
+                "x for {container_w}x{container_h} box {box_w}x{box_h}"
+            );
+            assert_eq!(
+                y,
+                (container_h - box_h) / 2,
+                "y for {container_w}x{container_h} box {box_w}x{box_h}"
+            );
+        }
+    }
+
+    /// #52: a 90 degree rotation swaps width and height (a non-square
+    /// source proves the bounding-box math isn't accidentally squaring
+    /// everything).
+    #[test]
+    fn rotate_rgba_90_degrees_swaps_dimensions() {
+        let img = solid_rgba(6, 4, [1, 2, 3, 255]);
+        let rotated = ImageService::rotate_rgba(&img, 90.0);
+        assert_eq!(rotated.dimensions(), (4, 6));
+    }
+
+    /// #52: negative-angle input (counter-clockwise, imgproxy's own `wmr:`
+    /// domain doesn't forbid it) must not panic and must still produce a
+    /// sane, non-empty result via `rem_euclid` normalisation.
+    #[test]
+    fn rotate_rgba_negative_angle_does_not_panic() {
+        let img = solid_rgba(5, 5, [1, 2, 3, 255]);
+        let rotated = ImageService::rotate_rgba(&img, -90.0);
+        assert_eq!(rotated.dimensions(), (5, 5));
+    }
+
+    /// #52: the shadow layer is the same size as its source, opaque pixels
+    /// become an opaque-alpha black silhouette pre-blur, and blurring
+    /// spreads some non-zero alpha into what was fully transparent border -
+    /// the visible "halo" effect.
+    #[test]
+    fn build_shadow_layer_darkens_and_spreads_past_the_source_alpha() {
+        // A 1px opaque dot in the middle of an otherwise fully transparent
+        // 7x7 canvas.
+        let mut watermark = image::RgbaImage::new(7, 7);
+        watermark.put_pixel(3, 3, image::Rgba([200, 200, 200, 255]));
+
+        let shadow = ImageService::build_shadow_layer(&watermark, 1.5);
+        assert_eq!(shadow.dimensions(), (7, 7));
+
+        // The centre pixel's colour channels must be black (the shadow
+        // silhouette is colourless), whatever its post-blur alpha is.
+        let centre = shadow.get_pixel(3, 3).0;
+        assert_eq!([centre[0], centre[1], centre[2]], [0, 0, 0]);
+
+        // A neighbouring pixel that started at alpha=0 must have picked up
+        // some non-zero alpha from the blur spreading past the single
+        // source pixel - otherwise this is just an unblurred silhouette.
+        let neighbour_alpha = shadow.get_pixel(4, 3).0[3];
+        assert!(
+            neighbour_alpha > 0,
+            "expected the blur to spread some alpha into a neighbouring pixel, got {neighbour_alpha}"
+        );
+    }
+
+    /// #52 pixel-exact, full `apply_watermark` pipeline: a fully opaque
+    /// watermark at `opacity: 1.0` and no scale/rotate/shadow must exactly
+    /// replace the covered region with its own colour, at every documented
+    /// position.
+    #[test]
+    fn apply_watermark_composites_at_every_position() {
+        let base_color = [255, 0, 0, 255]; // red
+        let watermark_color = [0, 255, 0, 255]; // green
+        let (bw, bh, ww, wh) = (40u32, 40u32, 10u32, 10u32);
+
+        let watermark_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(ww, wh, watermark_color));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+
+        for position in [
+            WatermarkPosition::Center,
+            WatermarkPosition::North,
+            WatermarkPosition::South,
+            WatermarkPosition::East,
+            WatermarkPosition::West,
+            WatermarkPosition::NorthEast,
+            WatermarkPosition::NorthWest,
+            WatermarkPosition::SouthEast,
+            WatermarkPosition::SouthWest,
+        ] {
+            let base = DynamicImage::ImageRgba8(solid_rgba(bw, bh, base_color));
+            let wm = WatermarkQuery {
+                position,
+                ..watermark_query()
+            };
+
+            let composited = ImageService::apply_watermark(base, &watermark_bytes, &wm)
+                .unwrap_or_else(|e| panic!("{position:?}: {e}"));
+            let rgba = composited.to_rgba8();
+
+            let (x, y) = ImageService::watermark_position(position, 0.0, 0.0, bw, bh, ww, wh);
+            let (x, y) = (x as u32, y as u32);
+
+            // Inside the watermark's own footprint: exactly its colour.
+            assert_eq!(
+                rgba.get_pixel(x + ww / 2, y + wh / 2).0,
+                watermark_color,
+                "{position:?}: expected watermark colour at its own centre"
+            );
+            // A far corner never covered by any of these positions/sizes:
+            // still the untouched base colour.
+            assert_eq!(
+                rgba.get_pixel(bw / 2, bh / 2).0,
+                if (x..x + ww).contains(&(bw / 2)) && (y..y + wh).contains(&(bh / 2)) {
+                    watermark_color
+                } else {
+                    base_color
+                },
+                "{position:?}: base-image centre pixel"
+            );
+        }
+    }
+
+    /// #50: every directional/corner gravity anchors the box against the
+    /// named edge(s)/corner exactly - `0` on an axis means "flush against
+    /// the near edge", `container - box` means "flush against the far
+    /// edge".
+    #[test]
+    fn gravity_anchor_directional_variants_anchor_to_the_named_edge() {
+        let (w, h, bw, bh) = (300u32, 200u32, 100u32, 50u32);
+        let max_x = w - bw;
+        let max_y = h - bh;
+
+        let cases = [
+            (Gravity::North, (max_x / 2, 0)),
+            (Gravity::South, (max_x / 2, max_y)),
+            (Gravity::West, (0, max_y / 2)),
+            (Gravity::East, (max_x, max_y / 2)),
+            (Gravity::NorthWest, (0, 0)),
+            (Gravity::NorthEast, (max_x, 0)),
+            (Gravity::SouthWest, (0, max_y)),
+            (Gravity::SouthEast, (max_x, max_y)),
+        ];
+
+        for (gravity, expected) in cases {
+            let actual = ImageService::gravity_anchor(gravity, w, h, bw, bh);
+            assert_eq!(actual, expected, "{gravity:?}");
+        }
+    }
+
+    /// #50: `Gravity::FocusPoint` centres the box on the named point and
+    /// clamps so the box never crosses a container edge - `(0, 0)` and
+    /// `(1, 1)` (the extreme corners) clamp to the same anchor a corner
+    /// gravity would produce, and `(0.5, 0.5)` matches `Center` exactly.
+    #[test]
+    fn gravity_anchor_focus_point_centres_and_clamps() {
+        let (w, h, bw, bh) = (300u32, 200u32, 100u32, 50u32);
+        let max_x = w - bw;
+        let max_y = h - bh;
+
+        assert_eq!(
+            ImageService::gravity_anchor(Gravity::FocusPoint { x: 0.0, y: 0.0 }, w, h, bw, bh),
+            (0, 0),
+            "top-left focus point should clamp like NorthWest"
+        );
+        assert_eq!(
+            ImageService::gravity_anchor(Gravity::FocusPoint { x: 1.0, y: 1.0 }, w, h, bw, bh),
+            (max_x, max_y),
+            "bottom-right focus point should clamp like SouthEast"
+        );
+        assert_eq!(
+            ImageService::gravity_anchor(Gravity::FocusPoint { x: 0.5, y: 0.5 }, w, h, bw, bh),
+            (max_x / 2, max_y / 2),
+            "centre focus point should match Center gravity"
+        );
+    }
+    // =====================================================================
+    // #51: rotate, flip, trim, extend, padding, zoom, dpr, min-width/
+    // min-height. Golden-image tests below assert *dimensions and pixel
+    // positions*, not just status/success - a marker pixel is placed in
+    // each fixture and the tests assert exactly where it ends up, so an
+    // operation that returns the right size but scrambled content would
+    // still fail. PNG is used throughout (never JPEG) so every assertion
+    // is against byte-exact, lossless pixel data - no compression noise to
+    // account for.
+    // =====================================================================
+
+    /// A solid-colour `width x height` image with a single, distinctly-
+    /// coloured 1-pixel marker at `(marker_x, marker_y)` - used to prove not
+    /// just output *dimensions* but where specific content actually ends
+    /// up (a rotate/flip/trim/extend/padding that returns the right size
+    /// but the wrong content would still pass a dimensions-only test).
+    fn marker_image(width: u32, height: u32, marker_x: u32, marker_y: u32) -> RgbImage {
+        let mut img = RgbImage::from_pixel(width, height, Rgb([20, 20, 20]));
+        img.put_pixel(marker_x, marker_y, Rgb([255, 0, 0]));
+        img
+    }
+
+    /// Finds the single `[255, 0, 0]` marker pixel `marker_image` places,
+    /// panicking if it isn't present (e.g. lost to lossy encoding, which is
+    /// exactly why every #51 test below uses PNG, never JPEG).
+    fn find_marker(img: &RgbImage) -> (u32, u32) {
+        img.enumerate_pixels()
+            .find(|(_, _, p)| **p == Rgb([255, 0, 0]))
+            .map(|(x, y, _)| (x, y))
+            .expect("marker pixel should be present in the output")
+    }
+
+    fn encode_test_png(img: &RgbImage) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(img.clone())
+            .write_to(&mut buf, ImageFormat::Png)
+            .expect("test fixture should encode");
+        buf.into_inner()
+    }
+
+    fn geometry_query() -> ResizeQuery {
+        ResizeQuery {
+            url: "https://images.example.com/marker.png".to_string(),
+            format: ApiImageFormat::Png,
+            ..Default::default()
+        }
+    }
+
+    /// #51: `rotate:90` with no resize requested - proves the pixel
+    /// rotation itself (dimensions swap, content moves) independent of any
+    /// interaction with resize. The expected marker position is computed
+    /// by rotating the *same* source image directly via the `image` crate
+    /// (rather than hand-deriving `rotate90`'s pixel-mapping formula here),
+    /// so this test is really asserting that `ImageService` invokes the
+    /// rotation at the right point with the right angle - not re-testing
+    /// the `image` crate's own `rotate90` correctness.
+    #[test]
+    fn rotate_90_swaps_dimensions_and_moves_marker() {
+        let marker = marker_image(4, 8, 0, 0); // narrow/tall, marker top-left
+        let bytes = encode_test_png(&marker);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            rotate: 90,
+            ..geometry_query()
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgb8();
+
+        assert_eq!(decoded.dimensions(), (8, 4), "rotate90 should swap width/height");
+
+        let expected = image::imageops::rotate90(&marker);
+        assert_eq!(find_marker(&decoded), find_marker(&expected));
+    }
+
+    /// #51: `flip:1:1` (both axes) moves a corner marker to the opposite
+    /// corner, on a rectangular (non-square) image so a width/height mixup
+    /// would be caught too.
+    #[test]
+    fn flip_both_axes_moves_marker_to_opposite_corner() {
+        let marker = marker_image(6, 4, 0, 0); // marker at top-left
+        let bytes = encode_test_png(&marker);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            flip_horizontal: true,
+            flip_vertical: true,
+            ..geometry_query()
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgb8();
+
+        assert_eq!(decoded.dimensions(), (6, 4), "flip alone must not change dimensions");
+        assert_eq!(
+            find_marker(&decoded),
+            (5, 3),
+            "flipping both axes should move a top-left marker to the bottom-right corner"
+        );
+    }
+
+    /// #51: `trim` removes a uniform border and leaves the interior -
+    /// including a marker at its very first (top-left) pixel - exactly in
+    /// place relative to the new, smaller canvas. No resize is requested,
+    /// isolating trim's own behaviour.
+    #[test]
+    fn trim_removes_uniform_border_and_preserves_interior_marker_position() {
+        const BORDER: u32 = 4;
+        const INNER: u32 = 12;
+        const SIZE: u32 = INNER + BORDER * 2;
+        let border_colour = [200, 200, 200];
+
+        let mut img = RgbImage::from_pixel(SIZE, SIZE, Rgb(border_colour));
+        for y in BORDER..BORDER + INNER {
+            for x in BORDER..BORDER + INNER {
+                img.put_pixel(x, y, Rgb([10, 10, 10]));
+            }
+        }
+        img.put_pixel(BORDER, BORDER, Rgb([255, 0, 0])); // marker: interior's top-left corner
+
+        let bytes = encode_test_png(&img);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            trim: Some(TrimOptions {
+                threshold: 0.0,
+                color: Some(border_colour),
+                equal_hor: false,
+                equal_ver: false,
+            }),
+            ..geometry_query()
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgb8();
+
+        assert_eq!(
+            decoded.dimensions(),
+            (INNER, INNER),
+            "trim should remove exactly the uniform border"
+        );
+        assert_eq!(
+            find_marker(&decoded),
+            (0, 0),
+            "the interior's top-left pixel should land at the trimmed image's (0, 0)"
+        );
+    }
+
+    /// #51: `extend` pads a too-small image up to the requested canvas,
+    /// centring the original - even with `enlarge` left at its default
+    /// `false`, which alone would have refused to upscale the actual
+    /// pixels. This is the key interaction `Self::effective_resize_box`'s
+    /// `extend_box` exists for: `extend`'s target is read *before* the
+    /// enlarge guard caps the resize step.
+    #[test]
+    fn extend_pads_to_target_size_centred_even_with_enlarge_disabled() {
+        let marker = marker_image(4, 4, 0, 0);
+        let bytes = encode_test_png(&marker);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            width: Some(12),
+            height: Some(8),
+            extend: true,
+            ..geometry_query()
+        };
+        assert!(!params.enlarge, "test assumes enlarge defaults to false");
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgb8();
+
+        assert_eq!(
+            decoded.dimensions(),
+            (12, 8),
+            "extend should reach the full requested canvas despite enlarge=false"
+        );
+        // 4x4 source centred in a 12x8 canvas: offset ((12-4)/2, (8-4)/2) = (4, 2).
+        assert_eq!(find_marker(&decoded), (4, 2));
+        // The padded-in background should default to opaque white
+        // (`DEFAULT_BACKGROUND`), matching #34/#60's own default.
+        assert_eq!(*decoded.get_pixel(0, 0), Rgb(DEFAULT_BACKGROUND));
+    }
+
+    /// #51: `padding` always enlarges the canvas by exactly the requested
+    /// amount on each side (CSS `top:right:bottom:left` order), regardless
+    /// of `width`/`height`/`enlarge`.
+    #[test]
+    fn padding_grows_canvas_by_exact_amounts_on_each_side() {
+        let marker = marker_image(4, 4, 3, 3); // marker at bottom-right corner
+        let bytes = encode_test_png(&marker);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            padding: Some(Padding {
+                top: 2,
+                right: 3,
+                bottom: 4,
+                left: 5,
+            }),
+            ..geometry_query()
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgb8();
+
+        assert_eq!(
+            decoded.dimensions(),
+            (4 + 5 + 3, 4 + 2 + 4),
+            "canvas should grow by exactly left+right and top+bottom"
+        );
+        assert_eq!(
+            find_marker(&decoded),
+            (3 + 5, 3 + 2),
+            "the source marker should shift by exactly (left, top)"
+        );
+        assert_eq!(*decoded.get_pixel(0, 0), Rgb(DEFAULT_BACKGROUND));
+    }
+
+    /// #51: `dpr` multiplies an explicit `width` (aspect-preserving, since
+    /// `height` is unset) - the primary "responsive images" use case the
+    /// issue calls out. Dimension-only (not marker-position): `dpr`/`zoom`
+    /// are pure resampling multipliers, and resampling interpolates
+    /// (unlike rotate/flip/trim/extend/padding's pixel-exact permutations),
+    /// so a single-pixel marker doesn't survive intact - the *dimensions*
+    /// are the property this option actually controls.
+    #[test]
+    fn dpr_multiplies_explicit_width_aspect_preserving() {
+        let img = marker_image(10, 10, 0, 0);
+        let bytes = encode_test_png(&img);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            width: Some(20),
+            dpr: 2.0,
+            // 20 * dpr 2 = 40, larger than the 10x10 source - needs
+            // `enlarge` opted in, same as any other option that inflates
+            // the effective target past the source (#36's guard applies
+            // uniformly, see `Self::effective_resize_box`'s doc comment).
+            enlarge: true,
+            ..geometry_query()
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+
+        assert_eq!(
+            decoded.dimensions(),
+            (40, 40),
+            "width 20 * dpr 2 = 40; square source stays square"
+        );
+    }
+
+    /// #51: `min-width` forces the output up to at least the given size
+    /// even with `enlarge` left at its default `false` - matching
+    /// imgproxy's own documented behaviour (`prepare.go`'s min-width block
+    /// runs unconditionally, bypassing the enlarge-gated shrink cap).
+    #[test]
+    fn min_width_bypasses_the_enlarge_guard() {
+        let img = marker_image(10, 10, 0, 0);
+        let bytes = encode_test_png(&img);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            min_width: Some(50),
+            ..geometry_query()
+        };
+        assert!(!params.enlarge, "test assumes enlarge defaults to false");
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+
+        assert_eq!(
+            decoded.dimensions(),
+            (50, 50),
+            "min-width should force upscaling past the source despite enlarge=false"
+        );
+    }
+
+    /// #51 combined-operation test (explicitly required by the issue,
+    /// since these operations don't commute): `rotate:90` together with an
+    /// explicit `width`/`height` resize. Without the axis swap in
+    /// `Self::effective_resize_box`, this would silently produce an
+    /// 80x40 image instead of the requested 40x80 - exactly the "parses
+    /// but means something different" trap #51 warns against. Uses a
+    /// landscape (100x50) source with a *portrait* target (40x80) so the
+    /// swap is actually exercised (a square source/target wouldn't
+    /// distinguish a correct implementation from a buggy one that forgot
+    /// to swap), and picks target dimensions that fit within the source's
+    /// rotated-into-final-orientation box (50x100) so the #36 enlarge
+    /// guard (left at its default `false`) doesn't also need to be
+    /// involved - this test is isolating the axis swap, not the guard.
+    #[test]
+    fn rotate_90_combined_with_explicit_resize_yields_requested_final_dimensions() {
+        let img = marker_image(100, 50, 0, 0); // landscape source
+        let bytes = encode_test_png(&img);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            rotate: 90,
+            width: Some(40),
+            height: Some(80),
+            resize_type: ResizeType::Force,
+            ..geometry_query()
+        };
+        assert!(!params.enlarge, "test assumes enlarge defaults to false");
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+
+        assert_eq!(
+            decoded.dimensions(),
+            (40, 80),
+            "the final, post-rotation image should match the requested width x height \
+             exactly, not the pre-rotation resize box"
+        );
+    }
+
+    /// #51 second combined-operation test: `trim` then `resize` - these
+    /// don't commute (resizing first would blend the border into the
+    /// interior via interpolation, making it untrimmable), so trim must
+    /// run *before* resize sees the image. A source with a uniform border
+    /// around a distinctly-marked interior is trimmed down to just the
+    /// interior, then resized (with `Force`, so the exact target
+    /// dimensions are unambiguous) - proving both that trim ran first
+    /// (else the border would still be present, uniformly stretched, and
+    /// wouldn't survive as sharp scaled-marker content the way this test
+    /// checks) and that the resize afterwards used the post-trim size as
+    /// its source, not the original.
+    #[test]
+    fn trim_then_resize_applies_trim_before_resize_sees_the_image() {
+        const BORDER: u32 = 4;
+        const INNER: u32 = 8;
+        const SIZE: u32 = INNER + BORDER * 2;
+        let border_colour = [200, 200, 200];
+
+        let mut img = RgbImage::from_pixel(SIZE, SIZE, Rgb(border_colour));
+        for y in BORDER..BORDER + INNER {
+            for x in BORDER..BORDER + INNER {
+                img.put_pixel(x, y, Rgb([10, 10, 10]));
+            }
+        }
+
+        let bytes = encode_test_png(&img);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            trim: Some(TrimOptions {
+                threshold: 0.0,
+                color: Some(border_colour),
+                equal_hor: false,
+                equal_ver: false,
+            }),
+            width: Some(32),
+            height: Some(32),
+            resize_type: ResizeType::Force,
+            // Upscaling from the post-trim 8x8 interior to 32x32 needs
+            // `enlarge` opted in (#36) - irrelevant to what this test is
+            // actually checking (trim-before-resize ordering), so it's
+            // just switched on rather than picking non-upscaling numbers,
+            // to keep the border-proportion arithmetic in the comment
+            // below simple.
+            enlarge: true,
+            ..geometry_query()
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgb8();
+
+        assert_eq!(decoded.dimensions(), (32, 32));
+
+        // If trim had *not* run before resize, the border would still
+        // occupy its original proportion (4/16 = 25%) of each edge after
+        // a uniform Force stretch, so the resized border band would be
+        // 25% of 32px = 8px wide/tall. Since trim removes the border
+        // first, the resize source is a flat 8x8 interior with no border
+        // at all - every corner of the 32x32 output should be the
+        // interior colour, not the border colour.
+        for &(x, y) in &[(0u32, 0u32), (31, 0), (0, 31), (31, 31)] {
+            assert_eq!(
+                *decoded.get_pixel(x, y),
+                Rgb([10, 10, 10]),
+                "corner ({x}, {y}) should be interior colour - trim must run before resize"
+            );
+        }
+    }
+
+    /// #52 pixel-exact opacity: same setup as above but `opacity: 0.5` over
+    /// an opaque base - the covered region must be the exact 50/50 blend,
+    /// not either input colour.
+    #[test]
+    fn apply_watermark_honors_opacity() {
+        let base = DynamicImage::ImageRgba8(solid_rgba(20, 20, [0, 0, 0, 255]));
+        let watermark_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(10, 10, [255, 255, 255, 255]));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let wm = WatermarkQuery {
+            opacity: 0.5,
+            ..watermark_query()
+        };
+
+        let composited = ImageService::apply_watermark(base, &watermark_bytes, &wm).unwrap();
+        let rgba = composited.to_rgba8();
+
+        // Centre of a 20x20 base with a centred 10x10 watermark is (10, 10)
+        // - inside the watermark's footprint.
+        assert_eq!(rgba.get_pixel(10, 10).0, [128, 128, 128, 255]);
+        // Untouched corner keeps the base colour exactly.
+        assert_eq!(rgba.get_pixel(0, 0).0, [0, 0, 0, 255]);
+    }
+
+    /// #52: `scale` resizes the watermark to `base_size * scale` (fit,
+    /// preserving aspect ratio) before positioning - a square watermark
+    /// scaled by 0.5 into a 40x40 base must land as a 20x20 region, not its
+    /// original 10x10 size.
+    #[test]
+    fn apply_watermark_honors_scale() {
+        let base_color = [10, 10, 10, 255];
+        let watermark_color = [200, 200, 200, 255];
+        let base = DynamicImage::ImageRgba8(solid_rgba(40, 40, base_color));
+        let watermark_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(10, 10, watermark_color));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let wm = WatermarkQuery {
+            scale: 0.5, // -> target 20x20 (fit within a 20x20 box)
+            ..watermark_query()
+        };
+
+        let composited = ImageService::apply_watermark(base, &watermark_bytes, &wm).unwrap();
+        let rgba = composited.to_rgba8();
+
+        // Centred 20x20 watermark on a 40x40 base spans [10, 30) on both
+        // axes. Just inside that boundary must be watermark colour, just
+        // outside must still be the base colour.
+        assert_eq!(rgba.get_pixel(10, 20).0, watermark_color, "inside scaled watermark");
+        assert_eq!(rgba.get_pixel(29, 20).0, watermark_color, "inside scaled watermark, far edge");
+        assert_eq!(rgba.get_pixel(9, 20).0, base_color, "just outside scaled watermark");
+        assert_eq!(rgba.get_pixel(30, 20).0, base_color, "just outside scaled watermark");
+    }
+
+    /// #52 end-to-end: watermarking wired into the real decode/resize/
+    /// encode pipeline, through a lossless format (PNG) so the composited
+    /// pixels can be asserted exactly after a real encode/decode round
+    /// trip - not just at the `apply_watermark` unit level above.
+    #[test]
+    fn watermark_composites_through_the_full_pipeline() {
+        let base_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(20, 20, [255, 0, 0, 255]));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let watermark_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(10, 10, [0, 255, 0, 255]));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            watermark: Some(watermark_query()),
+            ..query(None, None)
+        };
+        let config = PerformanceConfig::default();
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits_and_watermark(
+                &base_bytes,
+                &params,
+                &config,
+                Some(&watermark_bytes),
+            )
+            .expect("watermarked processing should succeed");
+
+        let decoded = image::load_from_memory(&output)
+            .expect("output should decode")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (20, 20));
+        // Centre (inside the centred 10x10 watermark) is green; a corner
+        // (outside it) is still the base's red.
+        assert_eq!(decoded.get_pixel(10, 10).0, [0, 255, 0, 255]);
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    /// #52's `process_image_blocking_with_limits` (the pre-existing
+    /// 3-argument form every other test in this module calls) must remain
+    /// exactly equivalent to "no watermark" - a watermark-carrying
+    /// `ResizeQuery` passed through it must be processed as if `watermark`
+    /// were `None`, since this entry point has no watermark bytes to
+    /// composite. This is what lets the ~20 pre-existing call sites stay
+    /// unmodified by #52 without silently changing their behaviour.
+    #[test]
+    fn three_argument_entry_point_ignores_watermark_field_with_no_bytes_supplied() {
+        let base_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(10, 10, [1, 2, 3, 255]));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            watermark: Some(watermark_query()),
+            ..query(None, None)
+        };
+        let config = PerformanceConfig::default();
+
+        let (output, _) =
+            ImageService::process_image_blocking_with_limits(&base_bytes, &params, &config)
+                .expect("processing should succeed even though there is no watermark to composite");
+        let decoded = image::load_from_memory(&output).unwrap().to_rgba8();
+        assert_eq!(decoded.get_pixel(5, 5).0, [1, 2, 3, 255]);
+    }
+
+    /// #52's SSRF regression test: a watermark URL that resolves to a
+    /// blocked private address must be refused through the exact same
+    /// guard the main source URL goes through (#21/#57) - not silently
+    /// skipped, not fetched anyway.
+    #[tokio::test]
+    async fn watermark_url_pointing_at_blocked_private_address_is_refused() {
+        let service = ImageService::with_config(PerformanceConfig::default()).unwrap();
+        let params = ResizeQuery {
+            watermark: Some(WatermarkQuery {
+                url: Some("http://127.0.0.1:1/watermark.png".to_string()),
+                ..watermark_query()
+            }),
+            ..query(Some(10), Some(10))
+        };
+        let bytes = Bytes::from(fixtures::tiny());
+
+        let err = service
+            .process_image(&bytes, &params)
+            .await
+            .expect_err("a watermark URL pointing at a blocked private address must be refused");
+
+        let rejected = err.downcast_ref::<crate::services::image::source_guard::SourceRejected>();
+        assert!(
+            rejected.is_some(),
+            "expected a typed SourceRejected rejection, got: {err}"
+        );
+    }
+
+    /// A `wm:` request with neither `wmu:` nor a configured `WATERMARK_URL`
+    /// default is a clear error, not a silently-skipped watermark.
+    #[tokio::test]
+    async fn watermark_requested_with_no_source_available_is_an_error() {
+        let service = ImageService::with_config(PerformanceConfig::default()).unwrap();
+        let params = ResizeQuery {
+            watermark: Some(watermark_query()), // url: None, and config.watermark_url is also None
+            ..query(Some(10), Some(10))
+        };
+        let bytes = Bytes::from(fixtures::tiny());
+
+        let err = service
+            .process_image(&bytes, &params)
+            .await
+            .expect_err("watermark with no available source must fail, not silently skip");
+        assert!(
+            err.to_string().to_lowercase().contains("watermark"),
+            "expected an error mentioning the watermark, got: {err}"
+        );
+    }
+
+    /// The deployment's configured `WATERMARK_URL` default is used when
+    /// the request's own `wmu:` is absent.
+    #[tokio::test]
+    async fn configured_default_watermark_url_is_used_when_request_supplies_none() {
+        let watermark_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(4, 4, [0, 255, 0, 255]));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = watermark_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(&body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let config = PerformanceConfig {
+            enable_http2: false,
+            allow_loopback_source_addresses: true,
+            watermark_url: Some(format!("http://{addr}/wm.png")),
+            ..PerformanceConfig::default()
+        };
+        let service = ImageService::with_config(config).unwrap();
+
+        let base_bytes = {
+            let img = DynamicImage::ImageRgba8(solid_rgba(10, 10, [255, 0, 0, 255]));
+            let mut buf = Cursor::new(Vec::new());
+            img.write_to(&mut buf, ImageFormat::Png).unwrap();
+            buf.into_inner()
+        };
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            watermark: Some(watermark_query()), // wmu: absent - must fall back to config
+            ..query(None, None)
+        };
+
+        let (output, _) = service
+            .process_image(&Bytes::from(base_bytes), &params)
+            .await
+            .expect("should fall back to the configured default watermark URL");
+        let decoded = image::load_from_memory(&output).unwrap().to_rgba8();
+        assert_eq!(decoded.get_pixel(5, 5).0, [0, 255, 0, 255]);
     }
 }

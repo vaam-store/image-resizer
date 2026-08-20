@@ -8,33 +8,62 @@
 
 use crate::models::params::ResizeQuery;
 use crate::modules::api::handler::ApiService;
+use crate::modules::negotiation;
 use crate::modules::signing::SigningConfig;
 use crate::modules::signing::verify::verify_signature;
 use crate::modules::url::{self, SignedRequest, UrlParseError};
 use crate::modules::utils::err::AppError;
 use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, LOCATION};
-use axum::http::{HeaderValue, StatusCode, Uri};
+use axum::http::header::{ACCEPT, CACHE_CONTROL, LOCATION, VARY};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use tracing::error;
 
-pub async fn resize_handler(State(api_service): State<Arc<ApiService>>, uri: Uri) -> Response {
-    match handle(&api_service, uri.path()).await {
-        Ok(location) => redirect_response(&location),
+pub async fn resize_handler(
+    State(api_service): State<Arc<ApiService>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    match handle(&api_service, uri.path(), &headers).await {
+        Ok((location, negotiated)) => redirect_response(&location, negotiated),
         Err(err) => err.into_response(),
     }
 }
 
-async fn handle(api_service: &ApiService, raw_path: &str) -> Result<String, AppError> {
+/// Returns the resolved CDN location plus whether the output format was
+/// content-negotiated (#49, `.auto` extension) - the caller needs to know
+/// that to decide whether to add `Vary: Accept` to the response, since only
+/// a negotiated result actually varies with the `Accept` header. An
+/// explicit `.jpg`/`.png`/`.webp`/`.avif`/`.gif` request's location is fully
+/// determined by the URL alone.
+async fn handle(
+    api_service: &ApiService,
+    raw_path: &str,
+    headers: &HeaderMap,
+) -> Result<(String, bool), AppError> {
     let signed = url::split(raw_path).map_err(url_parse_error)?;
 
     verify_or_reject(&api_service.signing, &signed)?;
 
-    let parsed = signed.parse().map_err(url_parse_error)?;
-    let query = parsed.into_resize_query();
+    // #52: presets and the processing-option allowlist are applied here,
+    // ahead of the plain grammar parse - see
+    // `SignedRequest::parse_with_config`.
+    let parsed = signed
+        .parse_with_config(&api_service.presets, &api_service.allowed_options)
+        .map_err(url_parse_error)?;
+    let mut query = parsed.into_resize_query();
 
-    perform_resize(api_service, &query).await
+    // #49: resolve `.auto` against the request's `Accept` header *before*
+    // `query` is handed to `ResizeService`/`CacheService::generate_key` -
+    // everything below this point only ever sees a concrete format, exactly
+    // like every other request shape.
+    let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
+    let (resolved_format, negotiated) = negotiation::resolve(query.format, accept);
+    query.format = resolved_format;
+
+    let location = perform_resize(api_service, &query).await?;
+    Ok((location, negotiated))
 }
 
 /// The actual resize call, split out from [`handle`] so tests can exercise
@@ -100,13 +129,22 @@ fn url_parse_error(err: UrlParseError) -> AppError {
 /// issues a `308 Permanent Redirect`, not `301`, and the old generated
 /// `ResizeResponse::Status301_...` response (and the test suite pinning
 /// this behaviour) is specifically `301`.
-fn redirect_response(location: &str) -> Response {
+///
+/// `negotiated` (#49) adds `Vary: Accept` when `true` - only a
+/// content-negotiated `.auto` request's `Location` actually depends on the
+/// `Accept` header, so every other (explicit-format) request deliberately
+/// leaves `Vary` unset rather than needlessly telling shared caches this
+/// otherwise URL-determined redirect varies by a header it doesn't.
+fn redirect_response(location: &str, negotiated: bool) -> Response {
     let mut response = (StatusCode::MOVED_PERMANENTLY, ()).into_response();
     let headers = response.headers_mut();
     headers.insert(
         CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
+    if negotiated {
+        headers.insert(VARY, HeaderValue::from_static("Accept"));
+    }
     match HeaderValue::from_str(location) {
         Ok(value) => {
             headers.insert(LOCATION, value);
@@ -180,7 +218,9 @@ mod tests {
         }
     }
 
-    fn build_test_api_service(signing: SigningConfig) -> (ApiService, StorageService, TestStorageDir) {
+    fn build_test_api_service(
+        signing: SigningConfig,
+    ) -> (ApiService, StorageService, TestStorageDir) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = TestStorageDir(std::env::temp_dir().join(format!(
@@ -267,15 +307,7 @@ mod tests {
             height: Some(4),
             resize_type: crate::models::params::ResizeType::Fit,
             format: ImageFormat::Png,
-            blur_sigma: None,
-            grayscale: None,
-            enlarge: false,
-            quality: None,
-            jpeg_quality: None,
-            webp_quality: None,
-            webp_lossless: None,
-            background: None,
-            autorotate: true,
+            ..Default::default()
         }
     }
 
@@ -326,6 +358,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
@@ -338,6 +371,81 @@ mod tests {
         assert!(location.to_str().unwrap().starts_with("http://cdn.test/"));
     }
 
+    /// #49: a `.auto` request negotiates its output format from the
+    /// `Accept` header and the redirect response carries `Vary: Accept` -
+    /// an explicit-format request (the test above) must not get that
+    /// header at all, since its `Location` doesn't depend on `Accept`.
+    #[tokio::test]
+    async fn auto_extension_negotiates_and_sets_vary_header() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
+        let source_url = spawn_test_image_server(tiny_png_bytes()).await;
+        let encoded = URL_SAFE_NO_PAD.encode(source_url.as_bytes());
+        let signed_path = format!("/rs:fill:4:4/{encoded}.auto");
+        let signature = crate::modules::signing::verify::sign(
+            &api_service.signing.key,
+            &api_service.signing.salt,
+            &signed_path,
+        );
+        let raw_path = format!("/{signature}{signed_path}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("image/avif,image/webp,image/*;q=0.8"),
+        );
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            headers,
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        let location = response
+            .headers()
+            .get("location")
+            .expect("redirect has a location header")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.ends_with(".avif"),
+            "expected the AVIF-preferring Accept header to negotiate .avif, got {location:?}"
+        );
+        assert_eq!(
+            response.headers().get(VARY).map(|v| v.to_str().unwrap()),
+            Some("Accept"),
+            "a negotiated response must carry Vary: Accept"
+        );
+    }
+
+    /// A request naming an explicit format (not `.auto`) must not carry
+    /// `Vary: Accept` - its `Location` is fully determined by the URL, not
+    /// by the `Accept` header.
+    #[tokio::test]
+    async fn explicit_format_request_has_no_vary_header() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_enabled());
+        let source_url = spawn_test_image_server(tiny_png_bytes()).await;
+        let encoded = URL_SAFE_NO_PAD.encode(source_url.as_bytes());
+        let signed_path = format!("/rs:fill:4:4/{encoded}.png");
+        let signature = crate::modules::signing::verify::sign(
+            &api_service.signing.key,
+            &api_service.signing.salt,
+            &signed_path,
+        );
+        let raw_path = format!("/{signature}{signed_path}");
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            HeaderMap::new(),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(response.headers().get(VARY), None);
+    }
+
     /// #27: a tampered signature (correct shape, wrong bytes) must be
     /// rejected with `403`, never processed.
     #[tokio::test]
@@ -348,6 +456,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
@@ -365,6 +474,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
@@ -383,6 +493,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
@@ -399,6 +510,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
@@ -419,6 +531,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;
@@ -434,6 +547,7 @@ mod tests {
 
         let response = resize_handler(
             State(Arc::new(api_service)),
+            HeaderMap::new(),
             raw_path.parse::<Uri>().expect("valid uri"),
         )
         .await;

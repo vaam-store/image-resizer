@@ -113,9 +113,15 @@ async fn malformed_shape_keys_are_rejected() {
         "not-a-hash.jpg",
         "present.png", // realistic-looking but not what generate_key emits
         &VALID_KEY[..VALID_KEY.len() - 1], // hash one char short
-        &format!("{VALID_KEY}x"),          // trailing garbage after the extension
-        &VALID_KEY.to_uppercase(),         // uppercase hex
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.gif", // wrong extension
+        &format!("{VALID_KEY}x"), // trailing garbage after the extension
+        &VALID_KEY.to_uppercase(), // uppercase hex
+        // wrong/unsupported extension - `gif` and `avif` are real
+        // extensions now (#49), so a still-rejected one is needed here;
+        // `auto` is deliberately never a real generated-key extension (see
+        // `key_validation::ALLOWED_EXTENSIONS`'s doc comment) so it's
+        // covered separately below.
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bmp",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.auto",
     ] {
         assert!(
             storage.check_cache(key).await.is_err(),

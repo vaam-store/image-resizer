@@ -21,15 +21,7 @@ fn query(width: Option<u32>, height: Option<u32>, format: ApiImageFormat) -> Res
         height,
         resize_type: ResizeType::Fit,
         format,
-        blur_sigma: None,
-        grayscale: None,
-        enlarge: false,
-        quality: None,
-        jpeg_quality: None,
-        webp_quality: None,
-        webp_lossless: None,
-        background: None,
-        autorotate: true,
+        ..Default::default()
     }
 }
 

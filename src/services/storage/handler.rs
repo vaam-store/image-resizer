@@ -464,15 +464,7 @@ mod tests {
             height: Some(100),
             resize_type: ResizeType::Fit,
             format: ImageFormat::Png,
-            blur_sigma: None,
-            grayscale: None,
-            enlarge: false,
-            quality: None,
-            jpeg_quality: None,
-            webp_quality: None,
-            webp_lossless: None,
-            background: None,
-            autorotate: true,
+            ..Default::default()
         };
         let key = cache.generate_key(&params);
         assert!(

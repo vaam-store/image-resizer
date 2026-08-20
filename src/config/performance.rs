@@ -49,6 +49,22 @@ pub struct PerformanceConfig {
     pub max_output_width: u32,
     /// Maximum requested *output* height in pixels (#26).
     pub max_output_height: u32,
+    /// Maximum number of frames read from an animated GIF/WebP source
+    /// before the animated encode path (#49) gives up rather than keep
+    /// decoding (a many-tiny-frames GIF is a real, cheap-to-craft
+    /// decompression-bomb variant distinct from the large-single-frame one
+    /// `max_src_resolution_mp` already guards against - each frame can be
+    /// individually tiny in *resolution* while the frame *count* alone
+    /// drives unbounded memory/CPU). Enforced while iterating
+    /// (`ImageService::collect_frames_capped`), not after collecting every
+    /// frame first.
+    pub max_animation_frames: usize,
+    /// Default watermark image URL (#52), used when a request sets `wm:`
+    /// without its own `wmu:{base64url}`. `None` means a request must
+    /// supply `wmu:` itself or `wm:` is an error - see
+    /// `ImageService::process_image`. Fetched through the same SSRF guard
+    /// as any other source URL.
+    pub watermark_url: Option<String>,
 }
 
 impl Default for PerformanceConfig {
@@ -69,6 +85,8 @@ impl Default for PerformanceConfig {
             max_src_resolution_mp: 50,
             max_output_width: 4096,
             max_output_height: 4096,
+            max_animation_frames: 512,
+            watermark_url: None,
         }
     }
 }
@@ -92,6 +110,8 @@ impl PerformanceConfig {
             max_src_resolution_mp: 50,
             max_output_width: 4096,
             max_output_height: 4096,
+            max_animation_frames: 512,
+            watermark_url: None,
         }
     }
 
@@ -113,6 +133,8 @@ impl PerformanceConfig {
             max_src_resolution_mp: 50,
             max_output_width: 4096,
             max_output_height: 4096,
+            max_animation_frames: 512,
+            watermark_url: None,
         }
     }
 
@@ -134,6 +156,8 @@ impl PerformanceConfig {
             max_src_resolution_mp: 25, // tighter than the 50MP default, in keeping with the smaller max_image_size
             max_output_width: 2048,
             max_output_height: 2048,
+            max_animation_frames: 128, // tighter than the 512 default, same reasoning as the resolution/size caps above
+            watermark_url: None,
         }
     }
 
@@ -222,6 +246,14 @@ impl PerformanceConfig {
         if let Some(max_output_height) = env_config.max_output_height {
             config.max_output_height = max_output_height;
         }
+
+        if let Some(max_animation_frames) = env_config.max_animation_frames {
+            config.max_animation_frames = max_animation_frames;
+        }
+
+        if let Some(ref watermark_url) = env_config.watermark_url {
+            config.watermark_url = Some(watermark_url.clone());
+        }
     }
 
     /// Parses `ALLOWED_SOURCES`'s comma-separated-prefixes shape (imgproxy's
@@ -284,6 +316,8 @@ impl From<&EnvConfig> for PerformanceConfig {
             max_src_resolution_mp: env_config.max_src_resolution_mp.unwrap_or(50),
             max_output_width: env_config.max_output_width.unwrap_or(4096),
             max_output_height: env_config.max_output_height.unwrap_or(4096),
+            max_animation_frames: env_config.max_animation_frames.unwrap_or(512),
+            watermark_url: env_config.watermark_url.clone(),
         }
     }
 }
@@ -384,9 +418,13 @@ mod tests {
             max_src_resolution_mp: None,
             max_output_width: None,
             max_output_height: None,
+            max_animation_frames: None,
             signing_key: None,
             signing_salt: None,
             allow_unsigned_requests: None,
+            watermark_url: None,
+            presets: None,
+            allowed_processing_options: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
@@ -406,6 +444,8 @@ mod tests {
         assert_eq!(perf_config.max_src_resolution_mp, 50);
         assert_eq!(perf_config.max_output_width, 4096);
         assert_eq!(perf_config.max_output_height, 4096);
+        assert_eq!(perf_config.max_animation_frames, 512);
+        assert_eq!(perf_config.watermark_url, None);
     }
 
     #[test]
@@ -455,9 +495,13 @@ mod tests {
             max_src_resolution_mp: Some(80),
             max_output_width: Some(2048),
             max_output_height: Some(1024),
+            max_animation_frames: Some(256),
             signing_key: None,
             signing_salt: None,
             allow_unsigned_requests: None,
+            watermark_url: Some("https://cdn.example.com/logo.png".to_string()),
+            presets: None,
+            allowed_processing_options: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
@@ -483,6 +527,11 @@ mod tests {
         assert_eq!(perf_config.max_src_resolution_mp, 80);
         assert_eq!(perf_config.max_output_width, 2048);
         assert_eq!(perf_config.max_output_height, 1024);
+        assert_eq!(perf_config.max_animation_frames, 256);
+        assert_eq!(
+            perf_config.watermark_url,
+            Some("https://cdn.example.com/logo.png".to_string())
+        );
     }
 
     #[test]

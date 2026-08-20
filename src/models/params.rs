@@ -8,15 +8,35 @@
 /// Output image format - the imgproxy-style path grammar's trailing
 /// `.{extension}` (`crate::modules::url::source`), not a query parameter.
 ///
-/// Kept as exactly `{Jpg, Png, Webp}` (#53 explicitly keeps `Webp`): another
-/// agent is concurrently adding lossy WebP encoding on top of this enum in
-/// `src/services/image/handler.rs`.
+/// #49 adds three variants on top of the original `{Jpg, Png, Webp}`:
+/// - `Avif` - encode-only. `image`'s AVIF *decoder* lives behind the
+///   separate `avif-native` cargo feature (`dav1d`, a C library) which this
+///   crate does not enable (see `Cargo.lock` - no `dav1d`/`mp4parse`
+///   present); only the pure-Rust `ravif`-backed encoder (the plain `avif`
+///   feature, already on via `image`'s own default features - see
+///   `Cargo.toml`'s `image` dependency, which does not disable
+///   `default-features`) is available. An AVIF *source* URL therefore still
+///   fails to decode - unchanged from before this issue, just now
+///   documented as a deliberate limitation rather than an oversight.
+/// - `Gif` - decode and encode, including multi-frame animation
+///   (`ImageService::process_image_blocking_with_limits`,
+///   `src/services/image/handler.rs`).
+/// - `Auto` - not a real output format at all: the URL grammar's `.auto`
+///   extension, resolved to a concrete format by `Accept`-driven content
+///   negotiation (`crate::modules::negotiation`) at the HTTP edge
+///   (`crate::modules::api::resize::handle`) before a `ResizeQuery` is ever
+///   built. Every other layer - `CacheService::generate_key`, `ImageService`
+///   - only ever sees a concrete format; `Auto` reaching either is a bug in
+///   the negotiation call site, not a real request shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImageFormat {
     #[default]
     Jpg,
     Png,
     Webp,
+    Avif,
+    Gif,
+    Auto,
 }
 
 impl std::fmt::Display for ImageFormat {
@@ -25,6 +45,9 @@ impl std::fmt::Display for ImageFormat {
             ImageFormat::Jpg => "jpg",
             ImageFormat::Png => "png",
             ImageFormat::Webp => "webp",
+            ImageFormat::Avif => "avif",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Auto => "auto",
         })
     }
 }
@@ -37,8 +60,11 @@ impl std::str::FromStr for ImageFormat {
             "jpg" | "jpeg" => Ok(ImageFormat::Jpg),
             "png" => Ok(ImageFormat::Png),
             "webp" => Ok(ImageFormat::Webp),
+            "avif" => Ok(ImageFormat::Avif),
+            "gif" => Ok(ImageFormat::Gif),
+            "auto" => Ok(ImageFormat::Auto),
             other => Err(format!(
-                "unsupported image format {other:?} (expected jpg, jpeg, png or webp)"
+                "unsupported image format {other:?} (expected jpg, jpeg, png, webp, avif, gif or auto)"
             )),
         }
     }
@@ -104,6 +130,116 @@ impl std::str::FromStr for ResizeType {
             )),
         }
     }
+}
+
+/// imgproxy's `g:{type}:{x_offset}:{y_offset}` gravity option (#50) -
+/// <https://docs.imgproxy.net/usage/processing#gravity> - controlling which
+/// part of the image survives a `fill`-type crop (the resize pipeline's
+/// `ResizeType::Fill`/`Auto`-as-fill branch, `src/services/image/handler.rs`)
+/// and, separately, anchoring an explicit [`Crop`] region.
+///
+/// Deliberately scoped down from imgproxy's own grammar in two ways, both
+/// documented rather than silently approximated:
+/// - No `x_offset`/`y_offset` nudge for the directional/corner/center
+///   variants - imgproxy lets every gravity type take an extra offset pair
+///   to nudge the anchor point; this crate only exposes that for
+///   [`Gravity::FocusPoint`] (where the offset *is* the point), keeping the
+///   directional variants at their plain anchor. A future URL-grammar change
+///   can add the nudge without touching this enum's shape.
+/// - No smart (`sm`) or object-detection (`obj`/`objw`, imgproxy Pro-only)
+///   gravity. A real saliency implementation is out of scope for this change
+///   (see the #50 issue body) - the URL parser
+///   (`src/modules/url/options.rs::parse_gravity`) rejects `sm`/`obj`/`objw`
+///   tokens with the same 400-shaped `InvalidOptionValue` error an unknown
+///   token gets, rather than silently aliasing `sm` to `Center` and shipping
+///   a fake "smart" gravity.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Gravity {
+    #[default]
+    Center,
+    North,
+    South,
+    East,
+    West,
+    NorthEast,
+    NorthWest,
+    SouthEast,
+    SouthWest,
+    /// imgproxy's `fp:{x}:{y}` gravity - `x`/`y` are fractions in `[0, 1]` of
+    /// the container's width/height respectively, marking the point the crop
+    /// box should be centred on (clamped so the box stays fully inside the
+    /// container - see `ImageService::gravity_anchor`,
+    /// `src/services/image/handler.rs`).
+    FocusPoint {
+        x: f64,
+        y: f64,
+    },
+}
+
+impl std::fmt::Display for Gravity {
+    /// Canonical short form, matching imgproxy's own `g:` token vocabulary -
+    /// used both for round-tripping and as the string hashed into the cache
+    /// key (`CacheService::generate_key`, `src/services/cache/handler.rs`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Gravity::Center => f.write_str("ce"),
+            Gravity::North => f.write_str("no"),
+            Gravity::South => f.write_str("so"),
+            Gravity::East => f.write_str("ea"),
+            Gravity::West => f.write_str("we"),
+            Gravity::NorthEast => f.write_str("noea"),
+            Gravity::NorthWest => f.write_str("nowe"),
+            Gravity::SouthEast => f.write_str("soea"),
+            Gravity::SouthWest => f.write_str("sowe"),
+            Gravity::FocusPoint { x, y } => write!(f, "fp:{x}:{y}"),
+        }
+    }
+}
+
+/// One axis of an explicit `c:{width}:{height}:{gravity}` crop region (#50) -
+/// <https://docs.imgproxy.net/usage/processing#crop>. Mirrors imgproxy's own
+/// three-way convention for each of `width`/`height`: `0` means "use the
+/// full source dimension on this axis" (no crop on that axis alone), a value
+/// `>= 1` is an absolute pixel size, and a value in `(0, 1)` is a fraction of
+/// the source dimension on that axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CropDimension {
+    Full,
+    Absolute(u32),
+    Relative(f64),
+}
+
+impl std::fmt::Display for CropDimension {
+    /// Canonical string form hashed into the cache key
+    /// (`CacheService::generate_key`) - `Relative` renders its exact `f64`
+    /// bit pattern via `{}` (not lossy-rounded), so two distinct relative
+    /// fractions can never collide onto the same cache key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CropDimension::Full => f.write_str("full"),
+            CropDimension::Absolute(v) => write!(f, "abs:{v}"),
+            CropDimension::Relative(v) => write!(f, "rel:{v}"),
+        }
+    }
+}
+
+/// imgproxy's explicit `crop`/`c:{width}:{height}:{gravity}` processing
+/// option (#50) - "Defines an area of the image to be processed (crop
+/// before resize)." Applied to the decoded source image, before any
+/// fit/fill/force/auto resize math runs, by
+/// `ImageService::process_image_blocking_with_limits`
+/// (`src/services/image/handler.rs`) - every downstream dimension
+/// (upscale guard, `resize_dimensions`, fill/auto orientation comparison)
+/// is computed against the *cropped* image, matching imgproxy's own
+/// "crop before resize" ordering.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crop {
+    pub width: CropDimension,
+    pub height: CropDimension,
+    /// Anchors the crop region within the source image. Defaults to
+    /// `Gravity::default()` (`Center`) when the URL's `c:` segment omits a
+    /// gravity token.
+    pub gravity: Gravity,
 }
 
 /// The fully-parsed set of resize parameters, built by
@@ -199,6 +335,274 @@ pub struct ResizeQuery {
     /// `Rotate270` orientation swaps width and height, and applying it
     /// after a crop would compose the crop against the wrong axes.
     pub autorotate: bool,
+
+    /// Explicit `crop`/`c:` processing option (#50) - `None` means no
+    /// explicit crop, the pre-#50 behaviour. See [`Crop`].
+    pub crop: Option<Crop>,
+
+    /// `gravity`/`gr:` processing option (#50) - see [`Gravity`]. Always
+    /// present (not `Option<Gravity>`, mirroring `resize_type`/`enlarge`
+    /// above): it has a meaningful default (`Center`, imgproxy's own
+    /// default) even when the URL never names a `gr:` segment, and every
+    /// `Fill`-type crop needs *some* gravity to anchor on regardless.
+    /// Consumed two ways in `ImageService`
+    /// (`src/services/image/handler.rs`): as the anchor for the
+    /// `ResizeType::Fill`/`Auto`-as-fill cover-crop, and as the default
+    /// anchor for an explicit [`Crop`] whose own `gravity` wasn't set in
+    /// the URL (`ParsedRequest::into_resize_query`,
+    /// `src/modules/url/mod.rs`, wires the same top-level `gr:` value in
+    /// unless the `c:` segment named its own).
+    pub gravity: Gravity,
+
+    // --- #51: geometry operations (rotate, flip, trim, extend, padding,
+    // zoom, dpr, min-width/min-height). Kept as one contiguous, clearly
+    // commented block so the integration diff against the sibling #49/#50/
+    // #52 issues stays legible - see `src/services/cache/handler.rs` for
+    // the matching contiguous block added to `generate_key`'s hashed
+    // stream (CACHE_KEY_VERSION bumped to v8 once, covering all four
+    // issues - see that constant's own doc comment).
+    //
+    /// imgproxy's `rotate`/`rot:{angle}` processing option. Always
+    /// normalised to one of `0`/`90`/`180`/`270` by the URL parser
+    /// (`crate::modules::url::options`) before it ever reaches here -
+    /// `ImageService` can therefore match on exactly those four values.
+    /// Applied *after* resize, matching imgproxy's own pipeline order
+    /// (`processing/processing.go`'s `mainPipeline`: `scale` then
+    /// `rotateAndFlip`) - see `ImageService::effective_resize_box` for how
+    /// a 90/270 rotation swaps the width/height box fed into the resize
+    /// step itself, so the *final* (post-rotation) image still matches the
+    /// requested `width`/`height`.
+    pub rotate: i32,
+
+    /// imgproxy's `flip`/`fl:{horizontal}:{vertical}` processing option -
+    /// mirrors the image along the given axis/axes. Applied together with
+    /// `rotate`, immediately after it (imgproxy's `rotateAndFlip` is a
+    /// single pipeline step covering both).
+    pub flip_horizontal: bool,
+    pub flip_vertical: bool,
+
+    /// imgproxy's `trim`/`t:{threshold}:{color}:{equal_hor}:{equal_ver}`
+    /// processing option - removes uniform-colour borders. `None` means no
+    /// trim requested. Always the *first* geometry operation applied (right
+    /// after decode, before dimensions are read for the resize/enlarge-guard
+    /// math) - matches imgproxy's own pipeline, where `trim` is the very
+    /// first step, ahead of `scaleOnLoad`/`crop`/`scale`.
+    pub trim: Option<TrimOptions>,
+
+    /// imgproxy's `extend`/`ex:{enabled}` processing option - pads the
+    /// image up to the requested `width`x`height` (centred) if it would
+    /// otherwise come out smaller, instead of never doing so (`enlarge`
+    /// stays about upscaling actual pixels; `extend` is the
+    /// background-fill alternative). This crate only accepts the boolean
+    /// `enabled` argument - imgproxy's optional second `:gravity` argument
+    /// is rejected at parse time (400) rather than silently ignored, since
+    /// only centre-gravity extend is implemented here (gravity/crop as a
+    /// whole is out of #51's scope). A no-op unless both `width` and
+    /// `height` are set (there is no other well-defined target canvas to
+    /// extend into).
+    pub extend: bool,
+
+    /// imgproxy's `padding`/`pd:{top}:{right}:{bottom}:{left}` processing
+    /// option (CSS-style shorthand - see [`Padding`]). Applied after
+    /// `extend`, matching imgproxy's own pipeline order, and always
+    /// enlarges the final canvas via `background` fill.
+    pub padding: Option<Padding>,
+
+    /// imgproxy's `zoom`/`z:{zoom_x}:{zoom_y}` processing option - a
+    /// multiplier (default `1.0`) applied to an *explicitly requested*
+    /// `width`/`height` before resize. Unlike imgproxy, this crate only
+    /// scales an axis that already has an explicit `width`/`height` set -
+    /// see `ImageService::effective_resize_box`'s doc comment for why this
+    /// is a deliberate narrowing rather than full parity.
+    pub zoom_x: f32,
+    pub zoom_y: f32,
+
+    /// imgproxy's `dpr:{value}` processing option - a multiplier (default
+    /// `1.0`) applied to an explicitly requested `width`/`height`, same as
+    /// `zoom` (and combined with it: both multiply the same axis). This is
+    /// how responsive images are served in practice (`w:300/dpr:2` for a
+    /// 300 CSS-px slot on a 2x-density screen) - see
+    /// `ImageService::effective_resize_box` for exactly how it interacts
+    /// with the #36 enlarge guard and the #26 output-dimension cap.
+    pub dpr: f32,
+
+    /// imgproxy's `min-width`/`mw:{width}` and `min-height`/`mh:{height}`
+    /// processing options - a floor on the *resulting* image size that,
+    /// matching imgproxy's own behaviour, is **not** gated by `enlarge`: it
+    /// can force upscaling past the source even with `enlarge=false`. `0`
+    /// (or absent) means "no floor", mirroring the `width`/`height`
+    /// `0`-means-unset convention already used elsewhere in this grammar.
+    pub min_width: Option<u32>,
+    pub min_height: Option<u32>,
+    // --- #51 additions end.
+
+    /// Watermark request (imgproxy's `watermark`/`wm:` option and its
+    /// modifiers, #52). `None` means no watermark is composited. See
+    /// [`WatermarkQuery`] for the individual fields and
+    /// `ImageService::process_image`/`ImageService::apply_watermark`
+    /// (`src/services/image/handler.rs`) for how it's fetched and
+    /// composited - *before* the #34/#60 alpha-flatten/normalise stage, so
+    /// a watermark's own alpha contributes to what gets flattened/
+    /// normalised rather than slipping past it.
+    pub watermark: Option<WatermarkQuery>,
+}
+
+/// imgproxy's `padding` processing option, parsed CSS-shorthand style: a
+/// missing `right` copies `top`, a missing `bottom` copies `top`, and a
+/// missing `left` copies `right` (in that order) - reproducing imgproxy's
+/// exact cascading-fallback parse (`options/parser/apply.go`'s
+/// `applyPaddingOption`), which is what makes `pd:10` mean "10 on every
+/// side", `pd:10:20` mean "10 top/bottom, 20 left/right", etc., exactly
+/// like CSS's own shorthand - even though the underlying parse is really
+/// positional-with-fallback, not a value-count switch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Padding {
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub left: u32,
+}
+
+/// imgproxy's `trim` processing option's parsed arguments. See
+/// [`ResizeQuery::trim`] and `ImageService::apply_trim`
+/// (`src/services/image/handler.rs`) for how these are consumed.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TrimOptions {
+    /// Colour-similarity tolerance. Compared as the maximum per-channel
+    /// (Chebyshev) distance from the target colour - a simpler, more
+    /// predictable metric than imgproxy's own perceptual "smart" trim, and
+    /// one whose result is easy to reason about/test pixel-exactly.
+    pub threshold: f32,
+    /// Explicit background colour to trim. `None` means "auto-detect from
+    /// the image's top-left corner pixel" - a deliberately simpler stand-in
+    /// for imgproxy's own multi-corner "smart" detection.
+    pub color: Option<[u8; 3]>,
+    /// When set, the left and right trim amounts are equalised (both take
+    /// the smaller of the two), so only a symmetric amount is cut.
+    pub equal_hor: bool,
+    /// Same as `equal_hor`, for the top/bottom trim amounts.
+    pub equal_ver: bool,
+}
+
+impl Default for ResizeQuery {
+    /// Every #51 field defaults to "no effect": `rotate = 0`,
+    /// `flip_horizontal`/`flip_vertical` = `false`, `trim`/`padding` =
+    /// `None`, `extend = false`, `zoom_x`/`zoom_y`/`dpr = 1.0` (a `1.0`
+    /// multiplier is the neutral element, unlike the other fields' `0`/
+    /// `None`/`false`), `min_width`/`min_height = None`. Exists mainly so
+    /// the many `ResizeQuery { .. , ..Default::default() }` test/bench
+    /// call sites across the crate don't all need to be taught about every
+    /// new field this issue adds. `autorotate` (#33) defaults to `true` -
+    /// not `bool`'s own zero value - matching its own field doc comment's
+    /// "autorotate stays on unless a caller opts out" default; `crop`/
+    /// `gravity` (#50) default to "no explicit crop" / `Gravity::default()`
+    /// (`Center`), same as `ProcessingOptions`'s own hand-written `Default`
+    /// (`src/modules/url/options.rs`).
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            width: None,
+            height: None,
+            resize_type: ResizeType::default(),
+            format: ImageFormat::default(),
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
+            jpeg_quality: None,
+            webp_quality: None,
+            webp_lossless: None,
+            background: None,
+            autorotate: true,
+            crop: None,
+            gravity: Gravity::default(),
+            rotate: 0,
+            flip_horizontal: false,
+            flip_vertical: false,
+            trim: None,
+            extend: false,
+            padding: None,
+            zoom_x: 1.0,
+            zoom_y: 1.0,
+            dpr: 1.0,
+            min_width: None,
+            min_height: None,
+            watermark: None,
+        }
+    }
+}
+
+/// Placement anchor for a composited watermark (#52), mirroring imgproxy's
+/// `watermark`/`wm:` position codes
+/// (<https://docs.imgproxy.net/usage/processing#watermark>). Tiling modes
+/// (`re` repeat, `ch` chessboard) are not implemented - every other
+/// documented position is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WatermarkPosition {
+    #[default]
+    Center,
+    North,
+    South,
+    East,
+    West,
+    NorthEast,
+    NorthWest,
+    SouthEast,
+    SouthWest,
+}
+
+/// A resolved watermark request (#52), built by
+/// [`crate::modules::url::ParsedRequest::into_resize_query`] once the
+/// `wm:`/`watermark` option is present - see
+/// [`crate::modules::url::options::ProcessingOptions`] for the individual
+/// `wm`/`wmu`/`wms`/`wmr`/`wmsh` fields this is assembled from.
+///
+/// `url` (from `wmu:{base64url}`) is `None` when the request relies on this
+/// deployment's configured default watermark (`WATERMARK_URL`,
+/// `PerformanceConfig::watermark_url`) instead of naming its own - see
+/// `ImageService::process_image` (`src/services/image/handler.rs`) for how
+/// the two are resolved into a single URL to fetch. Whichever URL is used,
+/// it goes through the exact same SSRF guard
+/// (`services::image::source_guard`, #21/#57) as the main source image - a
+/// watermark URL is just as much an attacker-reachable fetch target as the
+/// source URL when it comes from the request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatermarkQuery {
+    /// Final opacity applied to the watermark (imgproxy: `base_opacity *
+    /// opacity`; this crate has no separate configured base opacity, so
+    /// this is used directly). Clamped to `[0.0, 1.0]` at composite time.
+    pub opacity: f32,
+    pub position: WatermarkPosition,
+    /// Horizontal offset from `position`'s anchor. A magnitude `>= 1.0` is
+    /// absolute pixels; anything smaller is a fraction of the base image's
+    /// width - imgproxy's own `x_offset` convention.
+    pub x_offset: f32,
+    /// Vertical offset from `position`'s anchor, same absolute-vs-relative
+    /// convention as `x_offset` but against the base image's height.
+    pub y_offset: f32,
+    /// Watermark size relative to the base image size (both dimensions
+    /// scaled by this factor, then fit preserving the watermark's own
+    /// aspect ratio). `0.0` (the default, `wm:`'s scale slot left blank)
+    /// means "no scaling" - use `size` if set, otherwise the watermark's
+    /// natural resolution.
+    pub scale: f32,
+    /// Per-request watermark source (`wmu:{base64url}`, imgproxy Pro's
+    /// arbitrary-URL watermark). `None` falls back to this deployment's
+    /// configured default.
+    pub url: Option<String>,
+    /// Explicit watermark dimensions (`wms:{width}:{height}`, imgproxy
+    /// Pro). Either dimension may be `0`, meaning "derive from the other
+    /// via the watermark's own aspect ratio" - imgproxy's own convention
+    /// for this option. Always resized with `fit` semantics (never
+    /// stretched), matching imgproxy's documented behaviour.
+    pub size: Option<(u32, u32)>,
+    /// Clockwise rotation in degrees (`wmr:{angle}`, imgproxy Pro). `0.0`
+    /// (the default) applies no rotation.
+    pub rotate: f32,
+    /// Gaussian blur sigma for a drop-shadow silhouette drawn behind the
+    /// watermark (`wmsh:{sigma}`, imgproxy Pro). `None`/`Some(0.0)` draws
+    /// no shadow.
+    pub shadow: Option<f32>,
 }
 
 /// Path parameter for the (unsigned, key-validated) download route
@@ -220,6 +624,9 @@ mod tests {
             (ImageFormat::Jpg, "jpg"),
             (ImageFormat::Png, "png"),
             (ImageFormat::Webp, "webp"),
+            (ImageFormat::Avif, "avif"),
+            (ImageFormat::Gif, "gif"),
+            (ImageFormat::Auto, "auto"),
         ] {
             assert_eq!(fmt.to_string(), text);
             assert_eq!(text.parse::<ImageFormat>().unwrap(), fmt);
@@ -233,7 +640,8 @@ mod tests {
 
     #[test]
     fn image_format_rejects_unknown_values() {
-        assert!("gif".parse::<ImageFormat>().is_err());
+        assert!("bmp".parse::<ImageFormat>().is_err());
+        assert!("heic".parse::<ImageFormat>().is_err());
         assert!("".parse::<ImageFormat>().is_err());
     }
 
@@ -269,5 +677,51 @@ mod tests {
     #[test]
     fn resize_type_default_is_fit() {
         assert_eq!(ResizeType::default(), ResizeType::Fit);
+    }
+
+    /// #50: `Gravity`'s `Display` impl is hashed into the cache key
+    /// (`CacheService::generate_key`, `src/services/cache/handler.rs`) -
+    /// pinning its exact short-form output here means a future refactor of
+    /// this `fmt` impl that accidentally changes the string (without also
+    /// bumping `CACHE_KEY_VERSION`) is caught here instead of silently
+    /// invalidating/colliding cache entries.
+    #[test]
+    fn gravity_display_matches_imgproxy_short_form_tokens() {
+        for (gravity, text) in [
+            (Gravity::Center, "ce"),
+            (Gravity::North, "no"),
+            (Gravity::South, "so"),
+            (Gravity::East, "ea"),
+            (Gravity::West, "we"),
+            (Gravity::NorthEast, "noea"),
+            (Gravity::NorthWest, "nowe"),
+            (Gravity::SouthEast, "soea"),
+            (Gravity::SouthWest, "sowe"),
+        ] {
+            assert_eq!(gravity.to_string(), text);
+        }
+        assert_eq!(
+            Gravity::FocusPoint { x: 0.25, y: 0.75 }.to_string(),
+            "fp:0.25:0.75"
+        );
+    }
+
+    #[test]
+    fn gravity_default_is_center() {
+        assert_eq!(Gravity::default(), Gravity::Center);
+    }
+
+    #[test]
+    fn crop_dimension_display_distinguishes_every_variant() {
+        assert_eq!(CropDimension::Full.to_string(), "full");
+        assert_eq!(CropDimension::Absolute(300).to_string(), "abs:300");
+        assert_eq!(CropDimension::Relative(0.5).to_string(), "rel:0.5");
+        // Absolute and Relative must never render to the same string for
+        // any pair of values a caller could plausibly send, since that
+        // string is what the cache key hashes.
+        assert_ne!(
+            CropDimension::Absolute(1).to_string(),
+            CropDimension::Relative(1.0).to_string()
+        );
     }
 }

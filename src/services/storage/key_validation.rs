@@ -20,8 +20,14 @@ use std::fmt;
 const HASH_LEN: usize = 64;
 
 /// Extensions `CacheService::generate_key` can produce (mirrors `ImageFormat`'s
-/// `Display` impl in `src/models/params.rs`).
-const ALLOWED_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
+/// `Display` impl in `src/models/params.rs`). `avif` and `gif` added by #49;
+/// `auto` deliberately excluded - it's resolved to a concrete format by
+/// content negotiation (`crate::modules::negotiation`) before a
+/// `ResizeQuery` is ever built, so `CacheService::generate_key` can never
+/// actually produce a key ending in `.auto`, and a request that names one
+/// directly (`GET /api/images/files/{key}`) must still be rejected the same
+/// way as any other never-generated shape.
+const ALLOWED_EXTENSIONS: [&str; 5] = ["jpg", "png", "webp", "avif", "gif"];
 
 /// A cache key that failed validation.
 ///
@@ -136,14 +142,14 @@ mod tests {
 
     #[test]
     fn rejects_all_allowed_extensions_only() {
-        for ext in ["jpg", "png", "webp"] {
+        for ext in ["jpg", "png", "webp", "avif", "gif"] {
             let key = format!("{VALID_HASH}.{ext}");
             assert!(
                 validate_cache_key(&key, "").is_ok(),
                 "{ext} should be accepted"
             );
         }
-        for ext in ["gif", "bmp", "jpeg", "svg", "JPG"] {
+        for ext in ["bmp", "jpeg", "svg", "JPG", "auto", "heic"] {
             let key = format!("{VALID_HASH}.{ext}");
             assert!(
                 validate_cache_key(&key, "").is_err(),

@@ -140,6 +140,13 @@ pub struct EnvConfig {
     #[envconfig(from = "MAX_OUTPUT_HEIGHT")]
     pub max_output_height: Option<u32>,
 
+    /// Maximum number of frames read from an animated GIF/WebP source
+    /// before the animated encode path (#49) refuses the request - guards
+    /// against a many-tiny-frames animation bomb that `MAX_SRC_RESOLUTION_MP`
+    /// doesn't catch (each frame can be individually small).
+    #[envconfig(from = "MAX_ANIMATION_FRAMES")]
+    pub max_animation_frames: Option<usize>,
+
     // Signed URLs (#27)
     /// Hex-encoded HMAC-SHA256 key used to verify signed URLs. Required
     /// unless `ALLOW_UNSIGNED_REQUESTS=true` - signing is the default, not
@@ -159,4 +166,30 @@ pub struct EnvConfig {
     /// the default, this only ever widens the `unsigned` escape path.
     #[envconfig(from = "ALLOW_UNSIGNED_REQUESTS")]
     pub allow_unsigned_requests: Option<bool>,
+
+    // Watermarking (#52)
+    /// Default watermark image URL, used when a request sets `wm:` without
+    /// its own `wmu:{base64url}`. Fetched through the same SSRF guard
+    /// (`services::image::source_guard`, #21/#57) as any other source URL -
+    /// see `ImageService::process_image`. imgproxy equivalent:
+    /// `IMGPROXY_WATERMARK_URL`.
+    #[envconfig(from = "WATERMARK_URL")]
+    pub watermark_url: Option<String>,
+
+    // Presets and the processing-option allowlist (#52)
+    /// Preset definitions: comma-separated `{name}={options}` entries,
+    /// `{options}` itself `/`-separated processing-option segments - e.g.
+    /// `thumbnail=rs:fill:300:300/q:80,default=el:1`. See
+    /// `modules::url::presets::PresetRegistry::parse`. imgproxy
+    /// equivalent: `IMGPROXY_PRESETS`.
+    #[envconfig(from = "PRESETS")]
+    pub presets: Option<String>,
+
+    /// Comma-separated allowlist of processing-option short codes (e.g.
+    /// `rs,q,pr`) permitted directly in a request URL. Unset/blank means
+    /// unrestricted. Does not apply to options used *inside* a preset's own
+    /// definition - see `modules::url::presets::AllowedOptions`. imgproxy
+    /// equivalent: `IMGPROXY_ALLOWED_PROCESSING_OPTIONS`.
+    #[envconfig(from = "ALLOWED_PROCESSING_OPTIONS")]
+    pub allowed_processing_options: Option<String>,
 }

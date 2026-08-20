@@ -176,6 +176,80 @@ pub fn bomb() -> Vec<u8> {
     })
 }
 
+/// #50: source dimensions for [`gravity_marker`] - landscape (2:1), so
+/// `ResizeType::Fill` into a square or narrower box always has real overflow
+/// to crop on at least one axis, which is what makes the gravity/crop
+/// golden-image tests meaningful in the first place (a centred crop and a
+/// directional crop of a *square* source into a square box could
+/// legitimately produce the same pixels).
+pub const MARKER_W: u32 = 400;
+pub const MARKER_H: u32 = 200;
+/// Marker square side length, in source pixels. Small relative to
+/// `MARKER_W`/`MARKER_H` so a half-size crop window
+/// (`MARKER_W / 2 x MARKER_H / 2`, the size the gravity tests below crop to)
+/// still isolates a single corner marker with margin either side, and small
+/// enough relative to a 2x integer downscale (the gravity/crop tests' `Fill`
+/// case) that interior marker pixels survive resampling as the exact
+/// marker colour - see `gravity_marker`'s own doc comment.
+pub const MARKER_SIZE: u32 = 40;
+
+/// One value per corner plus the centre, each visually distinct (pure
+/// primary/secondary colours) so a decoded output pixel can be matched back
+/// to exactly one marker with a simple equality check - no thresholding or
+/// distance metric needed.
+pub const MARKER_NORTHWEST: Rgb<u8> = Rgb([220, 20, 20]); // red
+pub const MARKER_NORTHEAST: Rgb<u8> = Rgb([20, 180, 20]); // green
+pub const MARKER_SOUTHWEST: Rgb<u8> = Rgb([20, 20, 220]); // blue
+pub const MARKER_SOUTHEAST: Rgb<u8> = Rgb([220, 200, 20]); // yellow
+pub const MARKER_CENTER: Rgb<u8> = Rgb([200, 20, 200]); // magenta
+pub const MARKER_BACKGROUND: Rgb<u8> = Rgb([110, 110, 110]); // neutral grey
+
+/// `MARKER_W x MARKER_H` solid grey field with five `MARKER_SIZE`-square,
+/// solid-colour markers stamped at each corner and the centre (#50) - the
+/// "distinctive marker in the fixture" the gravity/crop golden-image tests
+/// (`src/services/image/handler.rs::tests`) assert the position of, instead
+/// of only checking output dimensions (which a centred crop and e.g. a
+/// north crop of the same source share, even though their *content*
+/// differs).
+///
+/// Every region (background and every marker) is a single flat colour, not
+/// noise or a gradient - deliberately, so that after a resize/crop pass
+/// (including `Fill`'s cover-scale-then-crop, which does real resampling,
+/// not just pixel extraction) a pixel sampled from *inside* a marker
+/// square, away from its edge, still decodes to exactly that marker's RGB:
+/// every sample point a resampling kernel could touch within one marker's
+/// interior is that same flat colour, so there's nothing to blend away from.
+pub fn gravity_marker_rgb(width: u32, height: u32) -> RgbImage {
+    let marker = MARKER_SIZE.min(width / 4).min(height / 4).max(1);
+    let cx = width / 2 - marker / 2;
+    let cy = height / 2 - marker / 2;
+
+    ImageBuffer::from_fn(width, height, |x, y| {
+        let in_square = |sx: u32, sy: u32| x >= sx && x < sx + marker && y >= sy && y < sy + marker;
+        if in_square(0, 0) {
+            MARKER_NORTHWEST
+        } else if in_square(width - marker, 0) {
+            MARKER_NORTHEAST
+        } else if in_square(0, height - marker) {
+            MARKER_SOUTHWEST
+        } else if in_square(width - marker, height - marker) {
+            MARKER_SOUTHEAST
+        } else if in_square(cx, cy) {
+            MARKER_CENTER
+        } else {
+            MARKER_BACKGROUND
+        }
+    })
+}
+
+/// PNG encoding of [`gravity_marker_rgb`] at `MARKER_W x MARKER_H`.
+pub fn gravity_marker() -> Vec<u8> {
+    cached("gravity_marker.png", || {
+        let img = DynamicImage::ImageRgb8(gravity_marker_rgb(MARKER_W, MARKER_H));
+        encode(&img, ImageFormat::Png)
+    })
+}
+
 /// Same photo-like content, at an arbitrary size/format - used by the decode
 /// benchmark to cover multiple resolutions per codec without hand-generating
 /// each one.
@@ -303,7 +377,7 @@ pub fn oriented(exif_orientation: u8) -> Vec<u8> {
 pub fn content_type_for(name: &str) -> &'static str {
     match name {
         "photo_like" | "tiny" => "image/jpeg",
-        "flat" | "alpha" | "bomb" => "image/png",
+        "flat" | "alpha" | "bomb" | "gravity_marker" => "image/png",
         _ => "application/octet-stream",
     }
 }
@@ -318,6 +392,7 @@ pub fn by_name(name: &str) -> Option<Vec<u8>> {
         "alpha" => Some(alpha()),
         "tiny" => Some(tiny()),
         "bomb" => Some(bomb()),
+        "gravity_marker" => Some(gravity_marker()),
         _ => None,
     }
 }

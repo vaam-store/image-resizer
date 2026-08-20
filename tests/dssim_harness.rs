@@ -26,15 +26,7 @@ fn dump_dssim_comparison_png() {
         height: Some(height),
         resize_type: ResizeType::Fit,
         format: ApiImageFormat::Png,
-        blur_sigma: None,
-        grayscale: None,
-        enlarge: false,
-        quality: None,
-        jpeg_quality: None,
-        webp_quality: None,
-        webp_lossless: None,
-        background: None,
-        autorotate: true,
+        ..Default::default()
     };
 
     let (bytes_out, _) = ImageService::process_image_blocking(&bytes, &params).expect("process");

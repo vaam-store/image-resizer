@@ -23,10 +23,12 @@
 //!    called once the signature has checked out.
 
 pub mod options;
+pub mod presets;
 pub mod source;
 
-use crate::models::params::ResizeQuery;
+use crate::models::params::{ResizeQuery, WatermarkQuery};
 use options::ProcessingOptions;
+use presets::{AllowedOptions, PresetRegistry};
 use source::SourceSpec;
 use thiserror::Error;
 
@@ -42,6 +44,15 @@ pub enum UrlParseError {
     EmptySource,
     #[error("invalid source: {0}")]
     InvalidSource(String),
+    /// #52: `code` is a real, recognised option, but this deployment's
+    /// `ALLOWED_PROCESSING_OPTIONS` doesn't include it. Never raised for an
+    /// option that only appears *inside* a preset's own expansion - see
+    /// `presets::AllowedOptions`'s doc comment for why.
+    #[error("processing option {0:?} is not allowed by this deployment's configuration")]
+    OptionNotAllowed(String),
+    /// #52: a `pr:{name}` segment named a preset that isn't configured.
+    #[error("unknown preset {0:?}")]
+    UnknownPreset(String),
 }
 
 /// The signature segment plus the exact byte string that was (or should
@@ -81,7 +92,35 @@ impl<'a> SignedRequest<'a> {
     /// Parses the processing-options + source grammar out of everything
     /// after the signature segment. Only call this once the signature (or
     /// the `unsigned` escape) has already been accepted.
+    ///
+    /// No presets, no allowlist restriction - equivalent to
+    /// `parse_with_config(&PresetRegistry::empty(), &AllowedOptions::unrestricted())`.
+    /// Kept as the zero-config entry point so every pre-#52 call site (and
+    /// test) is unaffected.
     pub fn parse(&self) -> Result<ParsedRequest, UrlParseError> {
+        self.parse_with_config(&PresetRegistry::empty(), &AllowedOptions::unrestricted())
+    }
+
+    /// [`Self::parse`], but with presets expanded and the processing-option
+    /// allowlist enforced (#52).
+    ///
+    /// Only the *directly-present* option segments in the request are
+    /// checked against `allowed` and eligible to be a `pr:{name}` preset
+    /// invocation - a preset's own expansion is spliced in verbatim,
+    /// neither re-checked against `allowed` (imgproxy's own documented
+    /// behaviour, see `presets::AllowedOptions`) nor eligible to itself
+    /// contain a `pr:` segment (rejected at config-load time,
+    /// `PresetRegistry::parse`, so there's nothing to recurse into here).
+    ///
+    /// A configured `default` preset is prepended ahead of the request's
+    /// own segments, so a request can still override any field the default
+    /// sets (`ProcessingOptions::parse` processes segments in order; a
+    /// later assignment to the same field wins).
+    pub fn parse_with_config(
+        &self,
+        presets: &PresetRegistry,
+        allowed: &AllowedOptions,
+    ) -> Result<ParsedRequest, UrlParseError> {
         let segments = &self.remainder_segments;
 
         let source_index = segments
@@ -89,7 +128,31 @@ impl<'a> SignedRequest<'a> {
             .position(|seg| *seg == "plain" || !options::looks_like_option(seg))
             .unwrap_or(segments.len());
 
-        let options = ProcessingOptions::parse(&segments[..source_index])?;
+        let mut expanded: Vec<String> = Vec::new();
+        if let Some(default_segments) = presets.default_preset() {
+            expanded.extend(default_segments.iter().cloned());
+        }
+
+        for seg in &segments[..source_index] {
+            let code = seg.split(':').next().unwrap_or_default();
+            if !allowed.is_allowed(code) {
+                return Err(UrlParseError::OptionNotAllowed(code.to_string()));
+            }
+
+            if code == "pr" {
+                for name in seg.split(':').skip(1) {
+                    let preset_segments = presets
+                        .get(name)
+                        .ok_or_else(|| UrlParseError::UnknownPreset(name.to_string()))?;
+                    expanded.extend(preset_segments.iter().cloned());
+                }
+            } else {
+                expanded.push((*seg).to_string());
+            }
+        }
+
+        let expanded_refs: Vec<&str> = expanded.iter().map(String::as_str).collect();
+        let options = ProcessingOptions::parse(&expanded_refs)?;
         let source = source::parse_source(&segments[source_index..])?;
 
         Ok(ParsedRequest { options, source })
@@ -104,6 +167,21 @@ pub struct ParsedRequest {
 
 impl ParsedRequest {
     pub fn into_resize_query(self) -> ResizeQuery {
+        // #52: watermarking is only enabled once `wm:` supplied an opacity
+        // - every other `watermark_*` field is a modifier that's inert
+        // without it (see `options::ProcessingOptions`'s doc comment).
+        let watermark = self.options.watermark_opacity.map(|opacity| WatermarkQuery {
+            opacity,
+            position: self.options.watermark_position,
+            x_offset: self.options.watermark_x_offset,
+            y_offset: self.options.watermark_y_offset,
+            scale: self.options.watermark_scale,
+            url: self.options.watermark_url,
+            size: self.options.watermark_size,
+            rotate: self.options.watermark_rotate,
+            shadow: self.options.watermark_shadow,
+        });
+
         ResizeQuery {
             url: self.source.url,
             width: self.options.width,
@@ -119,6 +197,23 @@ impl ParsedRequest {
             webp_lossless: self.options.webp_lossless,
             background: self.options.background,
             autorotate: self.options.autorotate.unwrap_or(true),
+            crop: self.options.crop,
+            gravity: self.options.gravity,
+            // #51: geometry operations - see `ProcessingOptions`'s doc
+            // comments (`src/modules/url/options.rs`) for each option's
+            // grammar and default.
+            rotate: self.options.rotate,
+            flip_horizontal: self.options.flip_horizontal,
+            flip_vertical: self.options.flip_vertical,
+            trim: self.options.trim,
+            extend: self.options.extend.unwrap_or(false),
+            padding: self.options.padding,
+            zoom_x: self.options.zoom_x,
+            zoom_y: self.options.zoom_y,
+            dpr: self.options.dpr,
+            min_width: self.options.min_width,
+            min_height: self.options.min_height,
+            watermark,
         }
     }
 }
@@ -159,7 +254,7 @@ mod tests {
         // Exercises every option the grammar accepts in one path, so a new
         // option that silently fails to round-trip shows up here.
         let path = format!(
-            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/ar:0/{encoded}.webp"
+            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/ar:0/c:150:150:noea/gr:sowe/{encoded}.webp"
         );
         let signed = split(&path).unwrap();
         let parsed = signed.parse().unwrap();
@@ -179,6 +274,24 @@ mod tests {
         assert_eq!(query.format, ImageFormat::Webp);
         assert_eq!(query.background, Some([255, 0, 0]));
         assert!(!query.autorotate, "ar:0 in the URL must disable autorotate");
+
+        // #50: `c:`'s own gravity token (`noea`) wins over the top-level
+        // `gr:` value (`sowe`) for the crop itself, but the top-level
+        // `gravity` field (which also drives `Fill`'s cover-crop) reflects
+        // `gr:` directly - see `crop_with_its_own_gravity_overrides_the_top_level_gravity_option`
+        // in `modules::url::options::tests` for the same assertion at the
+        // `ProcessingOptions` layer.
+        let crop = query.crop.expect("crop should be set");
+        assert_eq!(
+            crop.width,
+            crate::models::params::CropDimension::Absolute(150)
+        );
+        assert_eq!(
+            crop.height,
+            crate::models::params::CropDimension::Absolute(150)
+        );
+        assert_eq!(crop.gravity, crate::models::params::Gravity::NorthEast);
+        assert_eq!(query.gravity, crate::models::params::Gravity::SouthWest);
     }
 
     #[test]
@@ -206,6 +319,59 @@ mod tests {
             query.autorotate,
             "autorotate must default to true when no `ar` segment is present"
         );
+        assert_eq!(query.crop, None);
+        assert_eq!(query.gravity, crate::models::params::Gravity::default());
+
+        // #51 defaults: every geometry option is "no effect" when absent.
+        assert_eq!(query.rotate, 0);
+        assert!(!query.flip_horizontal);
+        assert!(!query.flip_vertical);
+        assert_eq!(query.trim, None);
+        assert!(!query.extend);
+        assert_eq!(query.padding, None);
+        assert_eq!(query.zoom_x, 1.0);
+        assert_eq!(query.zoom_y, 1.0);
+        assert_eq!(query.dpr, 1.0);
+        assert_eq!(query.min_width, None);
+        assert_eq!(query.min_height, None);
+    }
+
+    /// #51: every new geometry option, parsed from a signed URL end to end
+    /// through `into_resize_query` - the same "does the wiring actually
+    /// reach `ResizeQuery`" check `full_grammar_round_trips_every_capability`
+    /// already does for #53's original option set.
+    #[test]
+    fn full_grammar_round_trips_every_51_geometry_option() {
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!(
+            "/SIG/rs:fill:300:300/rot:90/fl:1:1/t:5:ffffff:1:1/ex:1/pd:1:2:3:4/z:2/dpr:2/mw:50/mh:60/{encoded}.jpg"
+        );
+        let signed = split(&path).unwrap();
+        let query = signed.parse().unwrap().into_resize_query();
+
+        assert_eq!(query.rotate, 90);
+        assert!(query.flip_horizontal);
+        assert!(query.flip_vertical);
+        let trim = query.trim.expect("trim should be set");
+        assert_eq!(trim.threshold, 5.0);
+        assert_eq!(trim.color, Some([255, 255, 255]));
+        assert!(trim.equal_hor);
+        assert!(trim.equal_ver);
+        assert!(query.extend);
+        assert_eq!(
+            query.padding,
+            Some(crate::models::params::Padding {
+                top: 1,
+                right: 2,
+                bottom: 3,
+                left: 4
+            })
+        );
+        assert_eq!(query.zoom_x, 2.0);
+        assert_eq!(query.zoom_y, 2.0);
+        assert_eq!(query.dpr, 2.0);
+        assert_eq!(query.min_width, Some(50));
+        assert_eq!(query.min_height, Some(60));
     }
 
     #[test]
@@ -233,5 +399,145 @@ mod tests {
         let path = format!("/SIG/rs:fill:notanumber:300/{encoded}.jpg");
         let signed = split(&path).unwrap();
         assert!(signed.parse().is_err());
+    }
+
+    #[test]
+    fn watermark_option_round_trips_into_resize_query() {
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/wm:0.8:soea:10:20:0.3/{encoded}.jpg");
+        let query = split(&path).unwrap().parse().unwrap().into_resize_query();
+
+        let wm = query.watermark.expect("watermark should be set");
+        assert_eq!(wm.opacity, 0.8);
+        assert_eq!(
+            wm.position,
+            crate::models::params::WatermarkPosition::SouthEast
+        );
+        assert_eq!(wm.x_offset, 10.0);
+        assert_eq!(wm.y_offset, 20.0);
+        assert_eq!(wm.scale, 0.3);
+        assert_eq!(wm.url, None);
+    }
+
+    #[test]
+    fn no_watermark_option_means_no_watermark() {
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/{encoded}.jpg");
+        let query = split(&path).unwrap().parse().unwrap().into_resize_query();
+        assert_eq!(query.watermark, None);
+    }
+
+    /// #52's core preset guarantee: `pr:{name}` must resolve to exactly the
+    /// same `ResizeQuery` as writing the preset's own options out explicitly
+    /// in the URL.
+    #[test]
+    fn preset_expands_to_the_same_resize_query_as_explicit_options() {
+        let presets =
+            presets::PresetRegistry::parse("thumb=rs:fill:300:300/q:80").expect("valid presets");
+        let allowed = presets::AllowedOptions::unrestricted();
+
+        let encoded = b64("https://example.com/img.jpg");
+        let preset_path = format!("/SIG/pr:thumb/{encoded}.jpg");
+        let explicit_path = format!("/SIG/rs:fill:300:300/q:80/{encoded}.jpg");
+
+        let via_preset = split(&preset_path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap()
+            .into_resize_query();
+        let via_explicit = split(&explicit_path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap()
+            .into_resize_query();
+
+        assert_eq!(via_preset, via_explicit);
+    }
+
+    /// A request's own explicit options, placed after `pr:`, must be able
+    /// to override what the preset set - segments are applied in order.
+    #[test]
+    fn explicit_option_after_preset_overrides_it() {
+        let presets = presets::PresetRegistry::parse("thumb=q:50").expect("valid presets");
+        let allowed = presets::AllowedOptions::unrestricted();
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/pr:thumb/q:90/{encoded}.jpg");
+
+        let query = split(&path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap()
+            .into_resize_query();
+
+        assert_eq!(query.quality, Some(90));
+    }
+
+    /// A configured `default` preset applies even when the request names no
+    /// preset at all, and can still be overridden by an explicit option.
+    #[test]
+    fn default_preset_applies_automatically() {
+        let presets = presets::PresetRegistry::parse("default=el:1").expect("valid presets");
+        let allowed = presets::AllowedOptions::unrestricted();
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/{encoded}.jpg");
+
+        let query = split(&path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap()
+            .into_resize_query();
+
+        assert!(query.enlarge);
+    }
+
+    #[test]
+    fn unknown_preset_name_is_a_parse_error() {
+        let presets = presets::PresetRegistry::empty();
+        let allowed = presets::AllowedOptions::unrestricted();
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/pr:nonexistent/{encoded}.jpg");
+
+        let err = split(&path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap_err();
+        assert!(matches!(err, UrlParseError::UnknownPreset(name) if name == "nonexistent"));
+    }
+
+    /// #52's allowlist requirement: an option excluded by
+    /// `ALLOWED_PROCESSING_OPTIONS` is rejected outright when used directly.
+    #[test]
+    fn option_not_in_allowlist_is_rejected() {
+        let presets = presets::PresetRegistry::empty();
+        let allowed = presets::AllowedOptions::parse("rs,q");
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/bl:5/{encoded}.jpg");
+
+        let err = split(&path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap_err();
+        assert!(matches!(err, UrlParseError::OptionNotAllowed(code) if code == "bl"));
+    }
+
+    /// The security point of #52's allowlist design: a preset can still use
+    /// an option that's excluded from direct use, since presets aren't
+    /// checked against the allowlist - this is what lets an operator hand
+    /// out a restricted set of presets while forbidding the raw options
+    /// they're built from.
+    #[test]
+    fn allowlist_does_not_apply_to_options_inside_a_preset() {
+        let presets = presets::PresetRegistry::parse("thumb=bl:5/q:80").expect("valid presets");
+        let allowed = presets::AllowedOptions::parse("pr,q"); // "bl" not directly allowed
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/pr:thumb/{encoded}.jpg");
+
+        let query = split(&path)
+            .unwrap()
+            .parse_with_config(&presets, &allowed)
+            .unwrap()
+            .into_resize_query();
+
+        assert_eq!(query.blur_sigma, Some(5.0));
     }
 }
