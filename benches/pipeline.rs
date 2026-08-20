@@ -28,6 +28,7 @@ fn query(width: Option<u32>, height: Option<u32>, format: ApiImageFormat) -> Res
         webp_quality: None,
         webp_lossless: None,
         background: None,
+        autorotate: true,
     }
 }
 

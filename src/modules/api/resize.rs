@@ -275,6 +275,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         }
     }
 

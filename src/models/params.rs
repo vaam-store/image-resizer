@@ -179,6 +179,26 @@ pub struct ResizeQuery {
     /// (PNG/WebP), so invisible pixels compress instead of carrying whatever
     /// garbage RGB the source had under `alpha=0` (#60).
     pub background: Option<[u8; 3]>,
+
+    /// Whether to rotate/flip the decoded image according to its EXIF
+    /// `Orientation` tag before any resize happens (#33; imgproxy's
+    /// `auto_rotate`/`ar` processing option -
+    /// <https://docs.imgproxy.net/usage/processing#auto-rotate>).
+    ///
+    /// Defaults to `true` - unlike every other boolean option on this
+    /// struct (`enlarge`, `grayscale`), matching imgproxy's own documented
+    /// default (`IMGPROXY_AUTO_ROTATE: true`): a phone photo's pixels are
+    /// stored sideways/upside-down as a matter of course, so leaving them
+    /// that way unless a caller opts in would produce the wrong output for
+    /// the common case, not just an unusual one.
+    ///
+    /// `ImageService::process_image_blocking_with_limits`
+    /// (`src/services/image/handler.rs`) applies this via
+    /// `DynamicImage::apply_orientation` immediately after decode and
+    /// before any resize/crop math - order matters, since a `Rotate90`/
+    /// `Rotate270` orientation swaps width and height, and applying it
+    /// after a crop would compose the crop against the wrong axes.
+    pub autorotate: bool,
 }
 
 /// Path parameter for the (unsigned, key-validated) download route

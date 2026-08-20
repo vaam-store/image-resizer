@@ -472,6 +472,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         };
         let key = cache.generate_key(&params);
         assert!(

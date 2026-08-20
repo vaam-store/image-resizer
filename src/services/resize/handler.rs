@@ -501,6 +501,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         });
 
         let mut handles = Vec::with_capacity(100);
@@ -581,6 +582,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         });
 
         let mut handles = Vec::with_capacity(20);

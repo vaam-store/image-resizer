@@ -7,7 +7,8 @@ use derive_builder::Builder;
 use fast_image_resize as fir;
 use futures::StreamExt;
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView, ImageFormat};
+use image::metadata::Orientation;
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageEncoder, ImageFormat};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
 use std::io::Cursor;
@@ -423,7 +424,20 @@ impl ImageService {
         let (src_width, src_height) = Self::peek_dimensions(image_bytes, format)?;
         Self::check_source_resolution(src_width, src_height, config.max_src_resolution_mp)?;
 
-        let img = Self::decode_with_limits(image_bytes, format, config.max_src_resolution_mp)?;
+        let (mut img, orientation, icc_profile) =
+            Self::decode_with_limits(image_bytes, format, config.max_src_resolution_mp)?;
+
+        // #33: autorotate (imgproxy's `auto_rotate`/`ar` option, on by
+        // default - see `ResizeQuery::autorotate`) must be applied *before*
+        // any resize/crop math below, not after: `Orientation::Rotate90`/
+        // `Rotate270` swap width and height, so `src_width`/`src_height`
+        // (read immediately below, and used for every fit/fill/force/auto
+        // decision and the #36 upscale guard) must already reflect the
+        // corrected axes. Applying it after a crop would compose the crop
+        // against the wrong axes entirely.
+        if params.autorotate {
+            img.apply_orientation(orientation);
+        }
 
         let (src_width, src_height) = img.dimensions();
 
@@ -586,13 +600,30 @@ impl ImageService {
         // already depends on, not a new dependency. JPEG now uses an
         // explicit `JpegEncoder::new_with_quality` (#35) instead of
         // `write_to`'s implicit default-quality construction, so
-        // `params.quality`/`params.jpeg_quality` actually reach the encoder.
+        // `params.quality`/`params.jpeg_quality` actually reach the encoder
+        // - and, being an explicit `JpegEncoder` rather than whatever
+        // `write_to` builds internally, it's also the only way to reach
+        // `ImageEncoder::set_icc_profile` (#33), so the same encoder value
+        // now carries both the requested quality and the forwarded colour
+        // profile.
         //
         // PNG has no quality knob in `params` to honour - `CompressionType`
         // is a fixed lossless setting, not a continuous 0-100 scale, and
         // `fq:png:N` is rejected at parse time
         // (`src/modules/url/options.rs`) rather than silently accepted and
         // ignored here.
+        //
+        // #33: `icc_profile`, if the source carried one, is forwarded to
+        // whichever of these two encoders is used - both support embedding
+        // it (`image-0.25.10/src/codecs/{png,jpeg/encoder}.rs`). WebP is
+        // the one format this can't cover: the `webp` crate (0.3.1, this
+        // service's only route to *lossy* WebP encoding - see the doc
+        // comment above) has no ICC-profile API at all, so a source colour
+        // profile is still dropped on that path. Fixing that would mean
+        // either switching WebP encoding to a crate with profile support or
+        // patching raw ICC chunks into libwebp's container format by hand -
+        // real work, not a small addition, so it's left as follow-up rather
+        // than half-done here.
         let output_bytes = match output_format {
             ImageFormat::WebP => {
                 let lossless = params.webp_lossless.unwrap_or(false);
@@ -614,11 +645,19 @@ impl ImageService {
                 let estimated_size = Self::estimate_output_size(&img, &output_format);
                 let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
 
-                let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                let mut encoder = image::codecs::png::PngEncoder::new_with_quality(
                     &mut buf,
                     image::codecs::png::CompressionType::Best,
                     image::codecs::png::FilterType::Adaptive,
                 );
+                if let Some(icc) = icc_profile {
+                    // `PngEncoder::set_icc_profile` only fails for
+                    // genuinely unsupported encoders, never for
+                    // `PngEncoder` itself - ignore failure rather than turn
+                    // a best-effort colour-fidelity improvement into a hard
+                    // request error.
+                    let _ = encoder.set_icc_profile(icc);
+                }
                 img.write_with_encoder(encoder)
                     .context(format!("Failed to encode image to {:?}", output_format))?;
 
@@ -633,7 +672,15 @@ impl ImageService {
                 let estimated_size = Self::estimate_output_size(&img, &output_format);
                 let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
 
-                let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+                let mut encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+                if let Some(icc) = icc_profile {
+                    // Same best-effort reasoning as the PNG branch above:
+                    // `JpegEncoder::set_icc_profile` only fails for
+                    // genuinely unsupported encoders, never for
+                    // `JpegEncoder` itself.
+                    let _ = encoder.set_icc_profile(icc);
+                }
                 img.write_with_encoder(encoder)
                     .context(format!("Failed to encode image to {:?}", output_format))?;
 
@@ -987,14 +1034,49 @@ impl ImageService {
     /// accidental 512MiB `max_alloc` default (#26). This is defense in
     /// depth behind `check_source_resolution`'s header-only check, not a
     /// replacement for it.
+    ///
+    /// Also returns the source's EXIF `Orientation` (#33) and embedded ICC
+    /// colour profile, if any - both must be read off the `ImageDecoder`
+    /// before it's consumed by `DynamicImage::from_decoder`, which is why
+    /// this goes through `ImageReader::into_decoder` rather than the
+    /// simpler `ImageReader::decode` it used to call directly.
+    /// `orientation` defaults to `Orientation::NoTransforms` (rather than
+    /// failing the whole request) if it can't be read - a source with
+    /// malformed EXIF should still decode and process, just without
+    /// autorotation.
     fn decode_with_limits(
         image_bytes: &[u8],
         format: Option<ImageFormat>,
         max_src_resolution_mp: u64,
-    ) -> Result<image::DynamicImage> {
+    ) -> Result<(image::DynamicImage, Orientation, Option<Vec<u8>>)> {
         let mut reader = Self::make_reader(image_bytes, format)?;
-        reader.limits(Self::build_decode_limits(max_src_resolution_mp));
-        reader.decode().context("Failed to decode image")
+        let limits = Self::build_decode_limits(max_src_resolution_mp);
+        reader.limits(limits.clone());
+
+        let mut decoder = reader
+            .into_decoder()
+            .context("Failed to construct image decoder")?;
+
+        // `ImageReader::decode` applies one extra allocation guard beyond
+        // `set_limits`'s dimension check: it reserves `decoder.total_bytes()`
+        // against `max_alloc` before any pixel data is decoded.
+        // `into_decoder` alone (needed here so orientation/ICC can be read
+        // off the decoder before it's consumed) skips that step, so it's
+        // replicated by hand to keep the exact same allocation guard #26
+        // relies on.
+        let mut reserved_limits = limits;
+        reserved_limits
+            .reserve(decoder.total_bytes())
+            .context("Failed to decode image")?;
+        decoder
+            .set_limits(reserved_limits)
+            .context("Failed to decode image")?;
+
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        let icc_profile = decoder.icc_profile().ok().flatten();
+
+        let img = image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
+        Ok((img, orientation, icc_profile))
     }
 
     /// Explicit decode limits derived from the configured max source
@@ -1103,6 +1185,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background: None,
+            autorotate: true,
         }
     }
 
@@ -2023,6 +2106,7 @@ mod tests {
             webp_quality: None,
             webp_lossless: None,
             background,
+            autorotate: true,
         }
     }
 
@@ -2378,6 +2462,169 @@ mod tests {
             out_lossy.len(),
             out_lossless.len(),
             "lossy and lossless webp encodes of the same photographic source should differ in size"
+        );
+    }
+
+    // ---- #33: EXIF autorotate ----
+
+    /// `fixtures::oriented(code)`'s marker sits in the top-left
+    /// `ORIENTED_MARKER`x`ORIENTED_MARKER` block of the *canonical*
+    /// (already-upright) image - see that fixture's doc comment. `(5, 5)`
+    /// is well inside it regardless of any JPEG-block-boundary blur from
+    /// decoding the lossy source.
+    fn assert_reddish(pixel: [u8; 3], context: &str) {
+        let [r, g, b] = pixel;
+        assert!(
+            r > 150 && i32::from(r) - i32::from(b) > 40,
+            "{context}: expected a reddish marker pixel, got {pixel:?} (r={r} g={g} b={b})"
+        );
+    }
+
+    /// Counterpart to `assert_reddish` for the canonical image's blue
+    /// background.
+    fn assert_blueish(pixel: [u8; 3], context: &str) {
+        let [r, g, b] = pixel;
+        assert!(
+            b > 150 && i32::from(b) - i32::from(r) > 40,
+            "{context}: expected a blueish background pixel, got {pixel:?} (r={r} g={g} b={b})"
+        );
+    }
+
+    /// #33: every one of the eight standard EXIF orientation values must
+    /// decode to the same upright `ORIENTED_W`x`ORIENTED_H` layout -
+    /// `fixtures::oriented`'s canonical marker (red top-left block on a
+    /// blue background) landing in the same place regardless of how the
+    /// source pixels were actually stored, dimensions included (5-8 swap
+    /// width/height in the stored file). No resize is requested here, so
+    /// this isolates autorotate itself from the resize/crop math the next
+    /// test covers.
+    #[test]
+    fn all_eight_exif_orientations_render_upright() {
+        let config = PerformanceConfig::default();
+
+        for code in 1u8..=8 {
+            let bytes = fixtures::oriented(code);
+            let params = ResizeQuery {
+                format: ApiImageFormat::Png,
+                ..query(None, None)
+            };
+
+            let (output, _content_type) =
+                ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                    .unwrap_or_else(|e| {
+                        panic!("orientation {code}: processing should succeed: {e}")
+                    });
+
+            let decoded = image::load_from_memory(&output)
+                .unwrap_or_else(|e| panic!("orientation {code}: output should decode: {e}"));
+            assert_eq!(
+                decoded.dimensions(),
+                (fixtures::ORIENTED_W, fixtures::ORIENTED_H),
+                "orientation {code}: expected the canonical upright dimensions"
+            );
+
+            let rgb = decoded.to_rgb8();
+            assert_reddish(
+                rgb.get_pixel(5, 5).0,
+                &format!("orientation {code}, marker corner"),
+            );
+            assert_blueish(
+                rgb.get_pixel(100, 70).0,
+                &format!("orientation {code}, background"),
+            );
+        }
+    }
+
+    /// #33: the order-of-operations case the issue explicitly calls out -
+    /// autorotate must be applied *before* resize, or a crop/scale composes
+    /// against the wrong axes. `fixtures::oriented(6)` is stored 90-degrees
+    /// rotated (80x120, portrait) under EXIF orientation 6; a `Fit` request
+    /// naming only a width is aspect-ratio-preserving against whatever
+    /// dimensions the resize step sees. If autorotation happened after
+    /// resize (or not at all), the resize would run against the stored
+    /// 80x120 portrait shape instead of the corrected 120x80 landscape one,
+    /// producing the wrong output dimensions and a sideways marker.
+    #[test]
+    fn rotated_source_with_resize_produces_correctly_oriented_output_at_right_dimensions() {
+        let bytes = fixtures::oriented(6); // stored 80x120, corrects to 120x80
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            ..query(Some(60), None) // half-scale fit, preserving the corrected 3:2 aspect
+        };
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        assert_eq!(
+            decoded.dimensions(),
+            (60, 40),
+            "expected the corrected (landscape) aspect ratio scaled to width 60, not the \
+             stored (portrait) shape"
+        );
+
+        let rgb = decoded.to_rgb8();
+        assert_reddish(rgb.get_pixel(3, 3).0, "resized marker corner");
+        assert_blueish(rgb.get_pixel(50, 35).0, "resized background");
+    }
+
+    /// #33: `autorotate: false` must leave the image exactly as stored -
+    /// the opt-out this crate's `ar:0` URL option (and imgproxy's own
+    /// `IMGPROXY_AUTO_ROTATE=false`) exists for. No resize is requested, so
+    /// the output dimensions must match the *stored* (portrait, un-rotated)
+    /// shape, not the corrected (landscape) one the previous two tests
+    /// assert.
+    #[test]
+    fn autorotate_disabled_leaves_image_as_stored() {
+        let bytes = fixtures::oriented(6); // stored 80x120
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            autorotate: false,
+            ..query(None, None)
+        };
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        assert_eq!(
+            decoded.dimensions(),
+            (fixtures::ORIENTED_H, fixtures::ORIENTED_W),
+            "autorotate=false must leave the stored (portrait) dimensions untouched, not \
+             apply the EXIF correction"
+        );
+    }
+
+    /// #33: a source with no EXIF orientation tag at all must be completely
+    /// unaffected by `autorotate` - `fixtures::photo_like` carries no Exif
+    /// segment, so `decoder.orientation()` reports `NoTransforms` either
+    /// way and `apply_orientation` is a no-op regardless of the flag,
+    /// making output byte-for-byte identical between the two.
+    #[test]
+    fn images_without_orientation_tag_are_unaffected_by_autorotate() {
+        let bytes = fixtures::photo_like(); // 1920x1080, no Exif segment
+        let config = PerformanceConfig::default();
+
+        let with_autorotate = query_with_type(Some(300), Some(200), ResizeType::Fit);
+        let without_autorotate = ResizeQuery {
+            autorotate: false,
+            ..query_with_type(Some(300), Some(200), ResizeType::Fit)
+        };
+
+        let (output_on, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &with_autorotate, &config)
+                .expect("autorotate=true processing should succeed");
+        let (output_off, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &without_autorotate, &config)
+                .expect("autorotate=false processing should succeed");
+
+        assert_eq!(
+            output_on, output_off,
+            "a source with no EXIF orientation tag must produce identical output regardless \
+             of autorotate"
         );
     }
 }
