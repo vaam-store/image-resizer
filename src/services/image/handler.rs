@@ -6,7 +6,7 @@ use bytes::{Bytes, BytesMut};
 use derive_builder::Builder;
 use futures::StreamExt;
 use image::imageops::FilterType;
-use image::{GenericImageView, ImageFormat};
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Response};
 use std::io::Cursor;
@@ -14,6 +14,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use url::Url;
+
+/// Placeholder lossy-WebP encode quality (0.0-100.0, libwebp's own scale).
+/// `ResizeQuery` (`src/models/params.rs`) now carries a real `quality:
+/// Option<u8>` field, parsed from the signed URL grammar's `q:{0-100}`
+/// processing option (#53/#27) - wiring it into the call site below instead
+/// of this placeholder is a one-line change (`ImageService::encode_webp`
+/// already accepts `quality`/`lossless` as plain parameters), just not made
+/// here since it's this file's own call to make. 82.0 is a commonly-cited
+/// "high quality, still meaningfully smaller than lossless" WebP setting.
+///
+/// `pub` (like `encode_webp` itself) so `benches/encode.rs` can benchmark
+/// the exact default production uses instead of a hardcoded duplicate that
+/// could silently drift from it.
+pub const DEFAULT_WEBP_QUALITY: f32 = 82.0;
 
 #[derive(Clone, Builder)]
 pub struct ImageService {
@@ -423,20 +437,73 @@ impl ImageService {
         };
 
         // Optimize encoding based on format
+        // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is
+        // now hand-written in `src/models/params.rs`. Mechanical path
+        // change only - same three variants, no logic here changed.
         let (output_format, content_type) = match params.format {
-            gen_server::models::ImageFormat::Jpg => (ImageFormat::Jpeg, "image/jpeg"),
-            gen_server::models::ImageFormat::Png => (ImageFormat::Png, "image/png"),
-            gen_server::models::ImageFormat::Webp => (ImageFormat::WebP, "image/webp"),
+            crate::models::params::ImageFormat::Jpg => (ImageFormat::Jpeg, "image/jpeg"),
+            crate::models::params::ImageFormat::Png => (ImageFormat::Png, "image/png"),
+            crate::models::params::ImageFormat::Webp => (ImageFormat::WebP, "image/webp"),
         };
 
-        // Pre-allocate buffer based on estimated size
-        let estimated_size = Self::estimate_output_size(&img, &output_format);
-        let mut output_bytes = Cursor::new(Vec::with_capacity(estimated_size));
+        // WebP goes through the dedicated `webp` crate (`Self::encode_webp`),
+        // not `DynamicImage::write_to` - the `image` crate's own WebP
+        // encoder (`image-webp`, pulled in via the `webp` cargo feature) is
+        // lossless-only, which produced far larger output than intended.
+        // JPEG/PNG are unaffected and keep going through `write_to` exactly
+        // as before.
+        let output_bytes = match output_format {
+            ImageFormat::WebP => Self::encode_webp(&img, DEFAULT_WEBP_QUALITY, false)
+                .context(format!("Failed to encode image to {:?}", output_format))?,
+            _ => {
+                // Pre-allocate buffer based on estimated size - only
+                // meaningful for the `write_to` path below; the WebP path
+                // above gets its output buffer from libwebp itself.
+                let estimated_size = Self::estimate_output_size(&img, &output_format);
+                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
 
-        img.write_to(&mut output_bytes, output_format)
-            .context(format!("Failed to encode image to {:?}", output_format))?;
+                img.write_to(&mut buf, output_format)
+                    .context(format!("Failed to encode image to {:?}", output_format))?;
 
-        Ok((output_bytes.into_inner(), content_type.to_string()))
+                buf.into_inner()
+            }
+        };
+
+        Ok((output_bytes, content_type.to_string()))
+    }
+
+    /// Encodes `img` to WebP via the `webp` crate directly (libwebp
+    /// bindings), rather than through `DynamicImage::write_to` - the
+    /// `image` crate's own WebP encoder is lossless-only, which is exactly
+    /// the bug this exists to fix. `quality` (0.0-100.0) is used only when
+    /// `lossless` is `false`.
+    ///
+    /// `pub` (rather than private) for two reasons: so `benches/encode.rs`
+    /// can benchmark the exact lossy path production uses instead of
+    /// duplicating it against the raw `image` crate encoder, and so a real
+    /// `quality`/`lossless` field added to the request-parameter surface
+    /// later can be threaded straight through without changing this
+    /// function's signature.
+    ///
+    /// Normalizes `img` to `Rgba8` before handing it to
+    /// `webp::Encoder::from_rgba` rather than using
+    /// `webp::Encoder::from_image` directly: `from_image` only supports the
+    /// `Rgb8`/`Rgba8` `DynamicImage` variants and returns `Err` for
+    /// everything else, including `Luma8`/`LumaA8` - exactly what
+    /// `DynamicImage::grayscale()` (the `params.grayscale` filter applied
+    /// above) produces. Normalizing up front means a `grayscale=true` WebP
+    /// request encodes correctly instead of failing.
+    pub fn encode_webp(img: &DynamicImage, quality: f32, lossless: bool) -> Result<Vec<u8>> {
+        let rgba = img.to_rgba8();
+        let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
+
+        let memory = if lossless {
+            encoder.encode_lossless()
+        } else {
+            encoder.encode(quality)
+        };
+
+        Ok(memory.to_vec())
     }
 
     /// Rejects a request whose requested output width/height exceed the
@@ -602,7 +669,10 @@ mod fixtures;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gen_server::models::ImageFormat as ApiImageFormat;
+    // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is now
+    // hand-written in `src/models/params.rs`. Mechanical import change
+    // only - no logic here changed.
+    use crate::models::params::ImageFormat as ApiImageFormat;
 
     fn query(width: Option<u32>, height: Option<u32>) -> ResizeQuery {
         ResizeQuery {
@@ -613,6 +683,7 @@ mod tests {
             blur_sigma: None,
             grayscale: None,
             enlarge: false,
+            quality: None,
         }
     }
 

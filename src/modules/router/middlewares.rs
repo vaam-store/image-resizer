@@ -136,9 +136,8 @@ async fn saturation_and_timeout_middleware(
 }
 
 /// Path prefix of the single-object download route
-/// (`/api/images/files/{key}`, registered by `gen_server::server::new` -
-/// out of scope for this change, see the final report) that conditional
-/// requests (#44) apply to.
+/// (`/api/images/files/{key}`, registered by `src/modules/router/router.rs`)
+/// that conditional requests (#44) apply to.
 const DOWNLOAD_PATH_PREFIX: &str = "/api/images/files/";
 
 /// Serves conditional-GET revalidation for the download endpoint (#44):
@@ -198,13 +197,14 @@ fn apply_conditional_headers(headers: &mut HeaderMap, etag: &str) {
             .unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
     );
     // Real per-`Accept` content negotiation isn't implemented for this
-    // route today (`download()` in `src/modules/api/resize.rs` ignores the
-    // request's `Accept` header entirely - the served format is fixed by
-    // the cache key) - but `openapi.yaml:80-88` declares four possible
-    // content types for this response, and a shared cache keyed on URL
-    // alone has no other signal that the representation could ever differ
-    // per requester. `Vary: Accept` costs nothing today and is exactly the
-    // header a future real negotiation would need.
+    // route today (`download_handler` in `src/modules/api/download.rs`
+    // ignores the request's `Accept` header entirely - the served format is
+    // fixed by the cache key's own extension), but this response can be
+    // `image/jpeg`, `image/png`, or `image/webp` depending on that key, and
+    // a shared cache keyed on URL alone has no other signal that the
+    // representation could ever differ per requester. `Vary: Accept` costs
+    // nothing today and is exactly the header a future real negotiation
+    // would need.
     headers.insert(VARY, HeaderValue::from_static("Accept"));
 }
 
@@ -226,11 +226,11 @@ fn not_modified_response(etag: &str) -> Response {
 #[inline]
 pub fn apply_common_middlewares(router: Router, config: MiddlewareConfig) -> Router {
     let cors = CorsLayer::new()
-        // Every registered route (`/api/images/files/{key}`,
-        // `/api/images/resize`, `/health`[, `/metrics`]) is a `GET` -
-        // advertising `PUT`/`DELETE`/`PATCH`/`POST` was needless surface
-        // (#43): they'd 405 anyway, but there's no reason to advertise
-        // methods nothing here accepts.
+        // Every registered route (`/api/images/files/{key}`, the signed
+        // `/{signature}/{*rest}` resize route, `/health`[, `/metrics`]) is a
+        // `GET` - advertising `PUT`/`DELETE`/`PATCH`/`POST` was needless
+        // surface (#43): they'd 405 anyway, but there's no reason to
+        // advertise methods nothing here accepts.
         .allow_methods([Method::GET, Method::OPTIONS])
         // allow requests from any origin
         .allow_origin(Any);

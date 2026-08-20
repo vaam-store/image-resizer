@@ -1,25 +1,30 @@
 use crate::config::performance::PerformanceConfig;
 use crate::modules::env::env::EnvConfig;
-use crate::modules::utils::err::AppError;
+use crate::modules::signing::SigningConfig;
 use crate::services::cache::handler::CacheServiceBuilder;
 use crate::services::resize::handler::ResizeService;
 use crate::services::storage::handler::StorageService;
 use anyhow::Result;
-use async_trait::async_trait;
-use axum::http::{Method, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum_extra::extract::CookieJar;
 use derive_builder::Builder;
-use gen_server::apis::ErrorHandler;
-use headers::Host;
 
+/// Shared application state (#53: replaces the generated `gen_server`
+/// router's `ApiService` - same role, but there's no `ErrorHandler` trait
+/// to implement any more: handlers in `src/modules/api/{resize,download}.rs`
+/// build `AppError` responses directly).
 #[derive(Clone, Builder)]
 pub struct ApiService {
     pub resize_service: ResizeService,
+    pub signing: SigningConfig,
 }
 
 impl ApiService {
     pub fn create(config: EnvConfig) -> Result<Self> {
+        // Read before anything below partially moves individual fields out
+        // of `config` - `SigningConfig::from_env` only needs a shared
+        // borrow, so it must run first (fails closed at startup per #27 if
+        // signing isn't configured and wasn't explicitly opted out of).
+        let signing = SigningConfig::from_env(&config)?;
+
         // Create performance configuration from environment
         let performance_config = PerformanceConfig::from(&config);
 
@@ -75,29 +80,10 @@ impl ApiService {
         // Create API service
         let api_service = ApiServiceBuilder::default()
             .resize_service(resize_service)
+            .signing(signing)
             .build()?;
 
         Ok(api_service)
-    }
-}
-
-/// Turns an `AppError` returned from an `Images` handler (see
-/// `src/modules/api/resize.rs`) into a real HTTP response with the correct
-/// status code, bypassing the generated `DownloadResponse`/`ResizeResponse`
-/// enums entirely. This is the generated router's own extension point
-/// (`packages/gen-server/src/server/mod.rs` calls `handle_error` whenever
-/// the trait method returns `Err`), so no OpenAPI regeneration is needed to
-/// add error status codes (#41, #25).
-#[async_trait]
-impl ErrorHandler<AppError> for ApiService {
-    async fn handle_error(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-        error: AppError,
-    ) -> Result<Response, StatusCode> {
-        Ok(error.into_response())
     }
 }
 

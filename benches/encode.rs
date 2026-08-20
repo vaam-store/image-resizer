@@ -1,13 +1,18 @@
 //! Encode-stage benchmarks: each output format the service supports.
 //!
-//! Calls `DynamicImage::write_to`, the same call
+//! JPEG/PNG call `DynamicImage::write_to` - the same call
 //! `ImageService::process_image_blocking` (src/services/image/handler.rs)
-//! makes for its final encode step.
+//! makes for those formats' final encode step. WebP instead calls
+//! `ImageService::encode_webp`, the dedicated lossy-WebP path (via the
+//! `webp` crate) that `process_image_blocking` actually uses - the `image`
+//! crate's own WebP encoder that `write_to` would reach is lossless-only,
+//! so benchmarking it here would measure the wrong encoder.
 
 #[path = "fixtures.rs"]
 mod fixtures;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use emgr::services::image::handler::{DEFAULT_WEBP_QUALITY, ImageService};
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 
@@ -33,9 +38,14 @@ fn bench_encode(c: &mut Criterion) {
     for (name, format) in FORMATS {
         group.bench_with_input(BenchmarkId::from_parameter(name), &format, |b, &format| {
             b.iter(|| {
-                let mut buf = Cursor::new(Vec::new());
-                img.write_to(&mut buf, format).expect("encode fixture");
-                buf.into_inner()
+                if format == ImageFormat::WebP {
+                    ImageService::encode_webp(&img, DEFAULT_WEBP_QUALITY, false)
+                        .expect("encode fixture")
+                } else {
+                    let mut buf = Cursor::new(Vec::new());
+                    img.write_to(&mut buf, format).expect("encode fixture");
+                    buf.into_inner()
+                }
             });
         });
     }

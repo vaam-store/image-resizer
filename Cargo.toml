@@ -2,6 +2,9 @@
 name = "emgr"
 version = "0.1.2"
 edition = "2024"
+# A deployed service, never published to crates.io. Also lets cargo-deny's
+# `allow-wildcard-paths` apply, which it refuses to do for public crates.
+publish = false
 # benches/fixtures.rs is a shared module (pulled in via `#[path]` by the
 # real bench targets below, the `benchmark` bin, and tests/), not a bench
 # target itself - disable autodiscovery so Cargo doesn't also try to treat
@@ -49,12 +52,9 @@ name = "pipeline"
 harness = false
 
 [dependencies]
-gen-server = { path = "./packages/gen-server", features = ["conversion"] }
 mimalloc = "0.1"
 
 axum = { version = "0.8", features = ["tracing", "tokio", "macros"] }
-axum-extra = { version = "0.12", features = ["cookie", "multipart", "typed-header"] }
-headers = "0.4" # `Host` type required by the generated gen-server Images trait
 axum-otel-metrics = { version = "0.11" }
 axum-tracing-opentelemetry = { version = "0.29" }
 tower-http = { version = "0.6", features = ["compression-full", "cors"] }
@@ -77,8 +77,6 @@ thiserror = { version = "2" }
 urlencoding = "2.1"
 url = "2.5"      # source-URL parsing and scheme validation (#21)
 ipnet = "2.9"    # private/link-local range checks for SSRF filtering (#21)
-
-o2o = { version = "0.5.4", features = ["default"] }
 
 # For hashing the cache key
 sha2 = "0.10"   # NOT "0": 0.11 changed finalize()'s return type and breaks the cache key
@@ -104,6 +102,10 @@ tracing = { version = "0.1", features = ["attributes"] }
 prometheus = { version = "0.14", optional = true }
 dashmap = "6"
 tower_governor = "0.8"
+webp = "0.3"
+hmac = "0.12"
+subtle = "2.6"
+base64 = "0.22"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

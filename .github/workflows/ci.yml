@@ -4,12 +4,13 @@ name: CI
 # only runs super-linter - neither ran `cargo test` or a real `cargo
 # clippy`. This workflow adds the missing test/lint/audit/benchmark gates.
 #
-# GH #45: `gen-server` is a path dependency generated from openapi.yaml by
-# `make init` (which needs Docker). It used to be gitignored, so a fresh
-# clone - and every job here - failed with "failed to get `gen-server` as a
-# dependency" before running a single test. It is now committed, so no job
-# needs `make init` and the generated API surface shows up in diffs.
-# Regenerating is a deliberate step; #53 removes codegen entirely.
+# GH #45 / #53: `gen-server` used to be a path dependency generated from
+# openapi.yaml by `make init` (which needed Docker) and, before that, was
+# gitignored - so a fresh clone (and every job here) failed with "failed to
+# get `gen-server` as a dependency" before running a single test. #53
+# removed the codegen entirely: the HTTP router is hand-written now
+# (src/modules/api, src/modules/router, src/modules/url), so no job needs
+# Docker or `make init` at all any more.
 
 on:
   push:

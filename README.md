@@ -4,27 +4,26 @@ EmgR is a high-performance image resizing service built with Rust, designed to e
 
 ## Features
 
-*   **Dynamic Image Resizing**: Resize images on-the-fly by specifying URL, width, height, and desired output format.
+*   **Dynamic Image Resizing**: Resize images on-the-fly via an imgproxy-compatible signed URL path, specifying source, dimensions, and output format.
 *   **Multiple Output Formats**: Supports common image formats like JPG, PNG, and WebP.
 *   **Efficient Caching**: (Implicit) Resized images are cached to ensure fast delivery for subsequent requests.
 *   **Storage Agility**: Supports multiple storage backends for resized images:
     *   Local filesystem
     *   AWS S3 (or S3-compatible services like MinIO)
     *   In-memory (primarily for testing or specific use-cases)
-*   **OpenAPI Specification**: Clearly defined API using OpenAPI v3.
+*   **Signed URLs**: HMAC-SHA256 request signing, matching imgproxy's scheme closely enough that a client library written for imgproxy works against this service (see [GH #27](https://github.com/vaam-store/image-resizer/issues/27)). Signing is the default, not opt-in.
 *   **Containerized**: Easily deployable using Docker and Docker Compose.
 *   **Observability**: Integrated with Jaeger for tracing via OpenTelemetry.
 
 ## Technology Stack
 
 *   **Language**: Rust (Edition 2024)
-*   **Web Framework**: Axum
+*   **Web Framework**: Axum (hand-written router - no OpenAPI code generation, see [GH #53](https://github.com/vaam-store/image-resizer/issues/53))
 *   **Async Runtime**: Tokio
 *   **Image Processing**: `image` crate
 *   **Containerization**: Docker, Docker Compose
-*   **API Specification**: OpenAPI 3.0
 *   **Tracing**: Jaeger, OpenTelemetry
-*   **Dependencies**: `reqwest` (HTTP client), `sha2` (hashing), `envconfig` (configuration), `validator` (input validation), `aws-sdk-s3` (for S3 storage).
+*   **Dependencies**: `reqwest` (HTTP client), `sha2`/`hmac` (hashing/signing), `envconfig` (configuration), `aws-sdk-s3` (for S3 storage).
 
 ## Getting Started
 
@@ -43,21 +42,17 @@ These instructions will get you a copy of the project up and running on your loc
     git clone https://your-repository-url/emgr.git
     cd emgr
     ```
+    A fresh clone builds with plain `cargo build` - no Docker step needed
+    first (that used to require `make init` to run OpenAPI codegen; removed
+    under [GH #53](https://github.com/vaam-store/image-resizer/issues/53)).
 
-2.  **Initialize the project (Generates server code from OpenAPI spec):**
-    This step uses `docker compose` to run the OpenAPI generator.
-    ```bash
-    make init
-    ```
-
-3.  **Build the project images:**
+2.  **Build the project images:**
     This command builds the Docker images defined in [`compose.yaml`](compose.yaml:1).
     ```bash
     make build
     ```
-    *Note: `make init` is a prerequisite for `make build`.*
 
-4.  **Start the application and dependent services (including Jaeger for tracing):**
+3.  **Start the application and dependent services (including Jaeger for tracing):**
     This brings up the `app` service and its dependencies (like `tracking` for Jaeger). The application will be accessible on port `13001`.
     ```bash
     make up
@@ -67,7 +62,7 @@ These instructions will get you a copy of the project up and running on your loc
     make up-app
     ```
 
-5.  **Verify the application is running:**
+4.  **Verify the application is running:**
     You can check the status of the containers:
     ```bash
     make ps
@@ -82,10 +77,16 @@ These instructions will get you a copy of the project up and running on your loc
 
 ### Testing the Resize Endpoint
 
-You can test the image resizing functionality using `curl`. The service listens on `localhost:13001`.
+The resize endpoint takes an HMAC-signed URL path, not query parameters -
+see the [API reference](docs/user-guide/api-reference.md) for the full
+grammar and [Examples](docs/user-guide/examples.md) for how to compute a
+signature in Python/JavaScript/bash. With the placeholder
+`SIGNING_KEY=6d792d7369676e696e672d6b6579` /
+`SIGNING_SALT=6d792d73616c74` from [`.env.example`](.env.example) (never
+use these for anything real) and the service listening on `localhost:13001`:
 
 ```bash
-curl -LI 'http://localhost:13001/api/images/resize?url=https%3A%2F%2Fimages.pexels.com%2Fphotos%2F32138887%2Fpexels-photo-32138887.jpeg%3Fcs%3Dsrgb%26dl%3Dpexels-branka-krnjaja-1475677195-32138887.jpg%26fm%3Djpg%26w%3D1280%26h%3D1910&width=1000&height=1000&format=jpg'
+curl -LI 'http://localhost:13001/de7BKgwO8wFeNZWRWgp3UB9jKwOkVoYM_eMKau2ECgw/rs:fill:300:300/q:80/aHR0cHM6Ly9pbWFnZXMuZXhhbXBsZS5jb20vcGhvdG8uanBn.jpg'
 ```
 
 You should see a `301 Moved Permanently` response, with a `Location` header pointing to the resized image:
@@ -110,9 +111,9 @@ You can then open the `location` URL in your browser to view the resized image, 
 ```bash
 open http://localhost:13001/api/images/files/your-image-hash.jpg
 ```
-Or, open the direct resize URL (which will perform the resize and then redirect):
+Or, open the signed resize URL directly (which will perform the resize and then redirect):
 ```bash
-open 'http://localhost:13001/api/images/resize?url=https%3A%2F%2Fimages.pexels.com%2Fphotos%2F32138887%2Fpexels-photo-32138887.jpeg%3Fcs%3Dsrgb%26dl%3Dpexels-branka-krnjaja-1475677195-32138887.jpg%26fm%3Djpg%26w%3D1280%26h%3D1910&width=200&height=200&format=jpg'
+open 'http://localhost:13001/de7BKgwO8wFeNZWRWgp3UB9jKwOkVoYM_eMKau2ECgw/rs:fill:300:300/q:80/aHR0cHM6Ly9pbWFnZXMuZXhhbXBsZS5jb20vcGhvdG8uanBn.jpg'
 ```
 
 ### Other Useful Commands
@@ -136,23 +137,24 @@ open 'http://localhost:13001/api/images/resize?url=https%3A%2F%2Fimages.pexels.c
 
 ## API Endpoints
 
-The API is defined in [`openapi.yaml`](openapi.yaml:1). Key endpoints include:
+The full grammar and every response code live in the
+[API reference](docs/user-guide/api-reference.md) - there is no
+`openapi.yaml` any more ([GH #53](https://github.com/vaam-store/image-resizer/issues/53)
+replaced OpenAPI code generation with a hand-written router). Summary:
 
-*   `GET /api/images/resize`
-    *   **Summary**: Resizes an image based on the provided parameters.
-    *   **Query Parameters**:
-        *   `url` (string, required): The URL of the image to resize.
-        *   `width` (integer, optional): The desired width of the resized image (min: 10, max: 4096, default: 200).
-        *   `height` (integer, optional): The desired height of the resized image (min: 10, max: 4096, default: 200).
-        *   `format` (string, required): The desired output format (`png`, `webp`, `jpg`).
+*   `GET /{signature}/{processing_options}/{plain|base64 source}.{extension}`
+    *   **Summary**: HMAC-signed, imgproxy-compatible resize URL. Fetches the source, resizes/transforms it, caches the result, and redirects to it.
+    *   **`{signature}`**: base64url HMAC-SHA256 over the rest of the path, keyed by `SIGNING_KEY`/`SIGNING_SALT` (see [Configuration](#configuration)) - or the literal `unsigned` when `ALLOW_UNSIGNED_REQUESTS=true` is set. Signing is the default, not opt-in.
+    *   **`{processing_options}`**: zero or more `/`-delimited `code:args` segments - `rs:{type}:{w}:{h}` (resize/crop), `q:{0-100}` (quality), `bl:{sigma}` (blur), `g:{true|false}` (grayscale), `el:{1|0}` (allow upscaling).
     *   **Responses**:
-        *   `301 Moved Permanently`: Redirects to the path of the resized image. The `Location` header contains the URL to the processed image. (Never a redirect to the caller-supplied `url` - see [GH #25](https://github.com/vaam-store/image-resizer/issues/25).)
-        *   `400 Bad Request`: The source URL doesn't decode as an image, or exceeds a configured limit.
+        *   `301 Moved Permanently`: Redirects to the path of the resized image. The `Location` header contains the URL to the processed image. (Never a redirect to the caller-supplied source - see [GH #25](https://github.com/vaam-store/image-resizer/issues/25).)
+        *   `400 Bad Request`: The signed-URL path is malformed, or the source URL doesn't decode as an image, or exceeds a configured limit.
+        *   `403 Forbidden`: The signature is missing, invalid, or `unsigned` without `ALLOW_UNSIGNED_REQUESTS=true`.
         *   `502 Bad Gateway`: The origin server for the requested image failed.
         *   `503 Service Unavailable`: The service is shedding load (concurrency limits reached).
 
 *   `GET /api/images/files/{key}`
-    *   **Summary**: Downloads a previously resized image.
+    *   **Summary**: Downloads a previously resized image. Unsigned - only ever serves already-cached, hash-addressed bytes, not an arbitrary fetch.
     *   **Path Parameters**:
         *   `key` (string, required): The unique key (hash) of the image file.
     *   **Responses**:
@@ -172,6 +174,7 @@ to `.env` (gitignored). The most commonly-touched variables, as seen in
 
 *   `STORAGE_TYPE`: Storage backend - `LOCAL_FS` or `S3` (alias `MINIO`).
 *   `CDN_BASE_URL`: The base URL for constructing links to served image files (e.g., `http://localhost:13001/api/images/files`).
+*   `SIGNING_KEY` / `SIGNING_SALT`: Hex-encoded HMAC-SHA256 key/salt for signed URLs ([GH #27](https://github.com/vaam-store/image-resizer/issues/27)). Required unless `ALLOW_UNSIGNED_REQUESTS=true` - signing is the default, the process refuses to start without one or the other.
 *   `LOG_LEVEL`: Sets the logging verbosity (e.g., `info`, `debug`).
 *   `OTLP_SPAN_ENDPOINT`: Endpoint for OpenTelemetry trace collector (Jaeger).
 *   `OTLP_METRIC_ENDPOINT`: Endpoint for OpenTelemetry metrics collector.

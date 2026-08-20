@@ -2,9 +2,9 @@
 //! (src/services/cache/handler.rs), called directly and unmodified.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use emgr::models::params::ImageFormat as ApiImageFormat;
 use emgr::models::params::ResizeQuery;
 use emgr::services::cache::handler::CacheServiceBuilder;
-use gen_server::models::ImageFormat as ApiImageFormat;
 
 fn bench_cache_key(c: &mut Criterion) {
     let cache = CacheServiceBuilder::default()
@@ -20,6 +20,7 @@ fn bench_cache_key(c: &mut Criterion) {
         blur_sigma: Some(1.5),
         grayscale: Some(false),
         enlarge: false,
+        quality: None,
     };
 
     c.bench_function("cache_key/generate_key", |b| {

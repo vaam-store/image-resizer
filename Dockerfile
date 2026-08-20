@@ -16,7 +16,6 @@ FROM builder as local_fs_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -31,7 +30,6 @@ FROM builder as local_fs_otel_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -46,7 +44,6 @@ FROM builder as s3_fs_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -61,7 +58,6 @@ FROM builder as s3_fs_otel_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \
@@ -76,7 +72,6 @@ FROM builder AS healthcheck_builder
 RUN \
   --mount=type=bind,source=./Cargo.lock,target=/app/Cargo.lock \
   --mount=type=bind,source=./Cargo.toml,target=/app/Cargo.toml \
-  --mount=type=bind,source=./packages,target=/app/packages \
   --mount=type=bind,source=./src,target=/app/src \
   --mount=type=bind,source=./benches,target=/app/benches \
   --mount=type=cache,target=/app/target \

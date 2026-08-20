@@ -1,0 +1,212 @@
+# Head-to-head benchmark harness: emgr vs. imgproxy.
+#
+# Fairness controls applied here (see README.md for the full rationale and
+# caveats -- read it before trusting any number this produces):
+#
+#   - `emgr` and `imgproxy` get IDENTICAL cpu/memory limits (`&engine_limits`
+#     anchor below) and identical explicit concurrency knobs
+#     (MAX_CONCURRENT_PROCESSING == IMGPROXY_WORKERS, TOKIO_WORKER_THREADS
+#     == GOMAXPROCS). This is the single most important fairness control in
+#     this file -- an unequal limit invalidates the whole comparison.
+#   - Both fetch source images from the same local `origin` nginx service,
+#     never the public internet.
+#   - Signature checking is disabled on both: imgproxy via unset
+#     IMGPROXY_KEY/IMGPROXY_SALT (its documented "insecure mode"); emgr has
+#     no signed-URL scheme implemented yet at all (see README's "URL API
+#     targeted" section), so there is nothing to disable on its side today.
+#   - `emgr` runs the `fs_deploy` build target (no OTel instrumentation) so
+#     neither proxy pays a tracing tax the other doesn't.
+#
+# Non-obvious wiring: `emgr` is started with `network_mode: "service:origin"`
+# -- it shares the `origin` container's network namespace instead of
+# getting its own. This is NOT a benchmark-only hack; it is the same
+# pattern the project's own internal load tester
+# (`src/bin/benchmark.rs`, see its `ALLOW_LOOPBACK_SOURCE_ADDRESSES` usage)
+# already uses, made necessary by `src/services/image/source_guard.rs`:
+# that SSRF guard unconditionally blocks every RFC1918 address
+# (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) with NO override -- and a
+# plain docker-compose bridge network address for a sibling "origin"
+# container is always in one of those ranges. The guard's one sanctioned
+# escape hatch is `ALLOW_LOOPBACK_SOURCE_ADDRESSES=true` plus reaching the
+# origin at 127.0.0.1, which requires sharing a network namespace with it.
+# `imgproxy` has no equivalent restriction and reaches `origin` normally,
+# over the regular `bench` bridge network, by service name.
+#
+# Consequence worth knowing before you read timings: emgr's requests to the
+# origin traverse a shared loopback interface, while imgproxy's traverse a
+# normal container-to-container bridge hop. Both are "local, no internet"
+# and both are sub-millisecond compared to decode/resize/encode cost, but
+# they are not bit-for-bit the same network path. See README.md.
+
+x-engine-resources: &engine_limits
+  cpus: "2"
+  memory: 1g
+
+services:
+  origin:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    networks:
+      - bench
+    volumes:
+      - ./origin/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./fixtures/corpus:/usr/share/nginx/html/corpus:ro
+    # Deliberately generous and un-equalized: origin serving cost is shared
+    # equally by both proxies (same files, same server), so it is not part
+    # of the emgr-vs-imgproxy comparison and doesn't need parity with
+    # `engine_limits`. It only needs to never be the bottleneck.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256m
+    ports:
+      # Host-published for manual debugging only (curl from the host). The
+      # load driver never uses these -- it talks to `origin`/`imgproxy` by
+      # service name on the `bench` network.
+      - "18080:80" # nginx corpus
+      - "18081:3000" # emgr, reachable here because it shares this
+      # container's network namespace (see the header comment above) --
+      # not because nginx itself listens on 3000.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Distroless nonroot (uid 65532, the base_deploy image emgr runs from)
+  # can't write to a fresh named volume, which docker creates root-owned.
+  # One-shot chown, same pattern the root compose.yaml uses for the same
+  # reason -- see that file's own `volume_init` service.
+  volume_init:
+    image: busybox:1.36@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+    volumes:
+      - emgr_data:/app/data/images
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -ex
+        chown -R 65532:65532 /app/data/images
+        chmod -R 775 /app/data/images
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 32m
+
+  emgr:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      # No OTel: keeps this comparison to image-processing cost, not
+      # instrumentation overhead imgproxy doesn't pay either.
+      target: fs_deploy
+    # Shares `origin`'s network namespace -- see the header comment. This
+    # also means emgr's own port 3000 is reachable at `origin:3000` /
+    # `localhost:18081`, NOT at an `emgr:3000` DNS name (this container has
+    # no network identity of its own to publish a hostname for).
+    network_mode: "service:origin"
+    depends_on:
+      origin:
+        condition: service_healthy
+      volume_init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits: *engine_limits
+    volumes:
+      - emgr_data:/app/data/images
+    environment:
+      STORAGE_TYPE: LOCAL_FS
+      LOCAL_FS_STORAGE_PATH: /app/data/images
+      HOST: 0.0.0.0
+      PORT: "3000"
+      # Points back at emgr's own shared-namespace address so the load
+      # driver's 301 redirect-follow (see driver/k6-script.js) resolves
+      # without leaving the compose network.
+      CDN_BASE_URL: http://origin:3000/api/images/files
+      ENABLE_HTTP2: "false" # origin speaks plain HTTP/1.1
+      # The origin is only reachable at 127.0.0.1 from inside this shared
+      # namespace -- this is the documented, sanctioned opt-in
+      # (src/services/image/source_guard.rs), not a weakened guard: RFC1918
+      # ranges stay blocked regardless of this flag.
+      ALLOW_LOOPBACK_SOURCE_ADDRESSES: "true"
+      # Explicit, equal-to-imgproxy concurrency knobs -- see the file
+      # header. Left un-set, these size off `effective_cpu_count()`
+      # (src/config/performance.rs), which *should* already be
+      # cgroup-aware (#44), but pinning them explicitly here means the
+      # comparison doesn't depend on trusting that detection to have
+      # picked up `engine_limits.cpus` correctly on every host.
+      MAX_CONCURRENT_PROCESSING: "2"
+      # Downloads are I/O-bound against a local origin, not CPU-bound --
+      # deliberately given more headroom than MAX_CONCURRENT_PROCESSING so
+      # download concurrency is never the bottleneck being measured.
+      # imgproxy has no equivalent separate download-concurrency knob; see
+      # README's fairness notes.
+      MAX_CONCURRENT_DOWNLOADS: "8"
+      CPU_THREAD_POOL_SIZE: "2"
+      TOKIO_WORKER_THREADS: "2"
+      HTTP_TIMEOUT_SECS: "30"
+      MAX_IMAGE_SIZE_MB: "100"
+      MAX_SRC_RESOLUTION_MP: "50" # matches imgproxy's IMGPROXY_MAX_SRC_RESOLUTION below
+
+  imgproxy:
+    # Pinned to a specific patch release (not `latest`), same rationale as
+    # the root Dockerfile's own pinning comments: reproducible builds
+    # across machines/days.
+    image: darthsim/imgproxy:v4.0.13@sha256:f6af7f85266fdc0d5b396e0f2f8b87f655edb960d2bcb6524fb690998a21f11c
+    networks:
+      - bench
+    deploy:
+      resources:
+        limits: *engine_limits
+    environment:
+      IMGPROXY_BIND: ":8080"
+      # No IMGPROXY_KEY / IMGPROXY_SALT set => "insecure mode": the
+      # signature segment of the URL is accepted unchecked. This is
+      # imgproxy's own documented way to disable signing, matching emgr
+      # having no signature scheme at all today.
+      GOMAXPROCS: "2"
+      IMGPROXY_WORKERS: "2" # == MAX_CONCURRENT_PROCESSING above
+      IMGPROXY_MAX_SRC_RESOLUTION: "50" # == MAX_SRC_RESOLUTION_MP above
+      IMGPROXY_READ_TIMEOUT: "30"
+      IMGPROXY_WRITE_TIMEOUT: "30"
+      IMGPROXY_TTL: "0" # disable client-side Cache-Control on responses;
+      # nothing in this harness relies on browser caching, and leaving it
+      # at imgproxy's default would make imgproxy's HTTP responses look
+      # cheaper to re-fetch than they actually were to produce.
+      IMGPROXY_USE_ETAG: "false"
+    ports:
+      - "18082:8080" # host-published for manual debugging only
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Load driver, run on demand via `docker compose run --rm driver ...`
+  # (see driver/run.sh) -- not started by `docker compose up`. Not part of
+  # the fairness comparison, so it gets no matching resource limit; it
+  # only needs to not itself be the bottleneck. If you're benchmarking on
+  # a host with few cores, don't run the driver against both engines'
+  # containers at once (run.sh doesn't, by default) -- their combined
+  # demand can exceed a small host's real core count even though each is
+  # individually capped at `engine_limits.cpus`.
+  driver:
+    image: grafana/k6:2.2.0@sha256:9bd01d6941fca969cb61bb57d2da5ee9b385fe2aa8881df3798c196564d6ace6
+    networks:
+      - bench
+    volumes:
+      - ./driver:/scripts:ro
+      - ./results:/results
+    profiles:
+      - driver
+    entrypoint: ["k6"]
+
+networks:
+  bench:
+    driver: bridge
+
+volumes:
+  emgr_data:

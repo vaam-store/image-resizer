@@ -30,4 +30,9 @@ pub mod modules {
     pub mod utils {
         pub mod cgroup;
     }
+
+    /// Exposed so `src/bin/benchmark.rs` can sign the URLs it generates and
+    /// therefore exercise the real verification path, rather than only ever
+    /// hitting the `unsigned` escape.
+    pub mod signing;
 }

@@ -393,7 +393,10 @@ mod tests {
     use super::*;
     use crate::models::params::ResizeQuery;
     use crate::services::cache::handler::CacheServiceBuilder;
-    use gen_server::models::ImageFormat;
+    // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is now
+    // hand-written in `src/models/params.rs`. Mechanical import change
+    // only - no logic here changed.
+    use crate::models::params::ImageFormat;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Owns a per-test local_fs storage directory under the OS temp dir and
@@ -463,6 +466,7 @@ mod tests {
             blur_sigma: None,
             grayscale: None,
             enlarge: false,
+            quality: None,
         };
         let key = cache.generate_key(&params);
         assert!(
