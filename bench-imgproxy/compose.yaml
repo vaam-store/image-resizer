@@ -132,6 +132,12 @@ services:
       # (src/services/image/source_guard.rs), not a weakened guard: RFC1918
       # ranges stay blocked regardless of this flag.
       ALLOW_LOOPBACK_SOURCE_ADDRESSES: "true"
+      # emgr fails closed at startup without a signing key (#27), so this
+      # opt-out is mandatory, not incidental. Mirrors imgproxy running with
+      # IMGPROXY_KEY/SALT unset and an `insecure` signature segment: both
+      # engines skip verification, keeping the comparison about image
+      # processing rather than HMAC throughput.
+      ALLOW_UNSIGNED_REQUESTS: "true"
       # Explicit, equal-to-imgproxy concurrency knobs -- see the file
       # header. Left un-set, these size off `effective_cpu_count()`
       # (src/config/performance.rs), which *should* already be

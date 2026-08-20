@@ -3,17 +3,13 @@
 // services under test -- see ../compose.yaml and ../README.md.
 //
 // The URL shape for each engine lives entirely in the `urlBuilders` map
-// below, keyed by ENGINE. emgr's URL API is being rewritten right now
-// (imgproxy-compatible signed paths, see adr/0002-url-api-shape.md at the
-// repo root) -- this driver targets emgr's CURRENT query-parameter API
-// (`GET /api/images/resize?url=...&width=...&height=...&format=...`, see
-// openapi.yaml at the time this was written). When the rewrite lands,
-// add a new entry to `urlBuilders` for the new shape rather than editing
-// the emgr builder in place, so both remain runnable side by side during
-// the transition.
+// below, keyed by ENGINE. Both engines now use an imgproxy-style signed
+// path; emgr's rewrite (#53/#27) has landed, so the old query-parameter
+// endpoint no longer exists.
 import http from 'k6/http';
 import { Counter, Trend } from 'k6/metrics';
 import { check } from 'k6';
+import encoding from 'k6/encoding';
 
 // ---------------------------------------------------------------------
 // Configuration (all via env vars, set by ../driver/run.sh per scenario)
@@ -86,15 +82,35 @@ function imgproxyPlainEncode(url) {
   return url.replace(/%/g, '%25').replace(/\?/g, '%3F').replace(/@/g, '%40');
 }
 
+// base64url, no padding — emgr's source encoding. Chosen over its
+// `plain/` form because the source URL contains slashes, and a base64url
+// segment never does, so there is no ambiguity about what got signed.
+function base64UrlEncode(s) {
+  return encoding
+    .b64encode(s, 'rawurl');
+}
+
 const urlBuilders = {
-  // Current emgr API: query params on GET /api/images/resize, see
-  // openapi.yaml. 301-redirects to CDN_BASE_URL/api/images/files/{key};
-  // k6 follows redirects by default, so `res.timings.duration` below
-  // covers the full round trip (initial resize/lookup + the storage
-  // fetch), matching how a real client experiences it.
+  // emgr's signed-path API (#53/#27), which replaced the old
+  // /api/images/resize query endpoint. Grammar:
+  //   /{signature}/{processing_options}/{base64url source}.{extension}
+  //
+  // "unsigned" as the signature segment, mirroring imgproxy's "insecure"
+  // below: ALLOW_UNSIGNED_REQUESTS=true is set in compose.yaml so both
+  // engines skip signature verification and the comparison stays about
+  // image processing rather than HMAC throughput.
+  //
+  // rs:fit:{w}:{h} matches the `rt:fit` asked of imgproxy — both engines
+  // are told to fit within WxH preserving aspect ratio. el:0 forbids
+  // upscaling on emgr's side; the fixture-resolution logic above already
+  // guarantees we never request one.
+  //
+  // Still 301-redirects to CDN_BASE_URL/...; k6 follows redirects by
+  // default, so res.timings.duration covers the full round trip (resize
+  // plus the storage fetch), which is how a real client experiences it.
   emgr(sourceUrl, w, h, format) {
-    const qs = `url=${encodeURIComponent(sourceUrl)}&width=${w}&height=${h}&format=${format}`;
-    return `${ENGINE_BASE_URL}/api/images/resize?${qs}`;
+    const options = `rs:fit:${w}:${h}/el:0`;
+    return `${ENGINE_BASE_URL}/unsigned/${options}/${base64UrlEncode(sourceUrl)}.${format}`;
   },
 
   // imgproxy: /{signature}/{options}/plain/{source}. "insecure" as the
