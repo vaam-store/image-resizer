@@ -30,7 +30,11 @@ pub struct PerformanceConfig {
     pub max_redirects: u8,
     /// Optional allowlist of source URL prefixes (imgproxy's
     /// `ALLOWED_SOURCES` shape). `None`/empty means "no allowlist
-    /// restriction" (still subject to the private-range guard).
+    /// restriction" (still subject to the private-range guard). A host
+    /// that matches an entry here is also exempted from the private-range
+    /// (RFC1918/CGNAT/IPv6 ULA) block for that hop - see
+    /// `source_guard::is_allowed_source` (#57). Loopback and link-local
+    /// are unaffected; they have their own flags below.
     pub allowed_sources: Option<Vec<String>>,
     /// Opt-in override to allow fetching from loopback source addresses.
     /// Default `false` (blocked). See `ALLOW_LOOPBACK_SOURCE_ADDRESSES`.

@@ -24,12 +24,27 @@
 //! Loopback and link-local blocking can each be independently disabled via
 //! `allow_loopback`/`allow_link_local` (imgproxy's
 //! `ALLOW_LOOPBACK_SOURCE_ADDRESSES` / `ALLOW_LINK_LOCAL_SOURCE_ADDRESSES`,
-//! both default `false`) - RFC1918, CGNAT and IPv6 unique-local are always
-//! blocked, there is no override for those. The override exists because a
-//! same-host "fetch from our own local fixture server" workflow (see
-//! `src/bin/benchmark.rs`, which serves fixtures on `127.0.0.1` and drives
-//! the resize endpoint against them) is otherwise indistinguishable from an
-//! attacker targeting loopback, and needs an explicit opt-in escape hatch.
+//! both default `false`). The override exists because a same-host "fetch
+//! from our own local fixture server" workflow (see `src/bin/benchmark.rs`,
+//! which serves fixtures on `127.0.0.1` and drives the resize endpoint
+//! against them) is otherwise indistinguishable from an attacker targeting
+//! loopback, and needs an explicit opt-in escape hatch.
+//!
+//! RFC1918, CGNAT and IPv6 unique-local (collectively "private" ranges
+//! below) have no *blanket* override - unlike loopback/link-local, which
+//! are each a single well-known-purpose range, "private" covers an entire
+//! operator network, so an unconditional `ALLOW_PRIVATE_SOURCE_ADDRESSES`
+//! toggle would let any attacker-influenced URL (a redirect, a
+//! DNS-controlled hostname) reach *anything* on that network - every
+//! internal admin panel, database, sibling pod, not just the one origin
+//! the operator meant to unblock (#57). Instead, an explicit
+//! `ALLOWED_SOURCES` match is what lifts the private-range block, and only
+//! for the specific host that matched, on the specific hop that matched it
+//! - see `is_allowed_source` and the `allow_private` parameter threaded
+//! through this module. This keeps the safe default (private ranges
+//! blocked unless configured) while making a named internal origin
+//! (Kubernetes Service ClusterIP, internal MinIO, private CDN shield)
+//! reachable without widening the guard for anything else.
 
 use anyhow::{Context, Result};
 use std::fmt;
@@ -141,51 +156,110 @@ pub fn validate_scheme(url: &Url) -> Result<()> {
 
 /// `true` if `url` matches at least one prefix in `allowed`. Mirrors
 /// imgproxy's `IMGPROXY_ALLOWED_SOURCES` shape: a comma-separated list of
-/// URL prefixes, matched via plain `starts_with`.
+/// URL prefixes.
+///
+/// Matching is **structural** (scheme + host + port compared as parsed
+/// fields, path compared as a segment-aware prefix), never a naive
+/// `candidate.starts_with(prefix)` on the raw URL text. A plain string
+/// `starts_with` is spoofable two ways that both matter here, since a
+/// match against this allowlist is what (#57) authorizes bypassing the
+/// private-IP-range block:
+/// - **userinfo**: `https://allowed.example.com@evil.com/x` *starts with*
+///   the literal text `https://allowed.example.com`, but its actual host
+///   (what the client connects to, and what `Url::host_str` returns) is
+///   `evil.com`. Comparing parsed `host_str()`/`scheme()`/port instead of
+///   raw text makes this not match.
+/// - **subdomain boundary**: without a separator check, a prefix
+///   `https://allowed.example.com` (no trailing slash) would also
+///   textually match `https://allowed.example.com.evil.com/x`. Comparing
+///   `host_str()` for exact equality closes this too.
+///
+/// A URL that merely *contains* an allowed prefix elsewhere (query string,
+/// fragment, path) was never a `starts_with` match in the first place and
+/// still isn't here.
 pub fn is_allowed_source(url: &Url, allowed: &[String]) -> bool {
-    let candidate = url.as_str();
     allowed
         .iter()
-        .any(|prefix| candidate.starts_with(prefix.as_str()))
+        .any(|prefix| matches_allowed_prefix(url, prefix))
 }
 
-fn is_blocked_ipv4(ip: Ipv4Addr, allow_loopback: bool, allow_link_local: bool) -> bool {
+/// Single-prefix half of [`is_allowed_source`]. The prefix is itself
+/// parsed as a URL so it goes through the same host/userinfo-stripping
+/// logic as the candidate - an allowlist entry is operator-configured, but
+/// there's no reason to hold it to a lower parsing standard than the
+/// request URL it's compared against.
+fn matches_allowed_prefix(url: &Url, prefix: &str) -> bool {
+    let Ok(prefix_url) = Url::parse(prefix) else {
+        return false;
+    };
+
+    url.scheme() == prefix_url.scheme()
+        && url.host_str().is_some()
+        && url.host_str() == prefix_url.host_str()
+        && url.port_or_known_default() == prefix_url.port_or_known_default()
+        && url.path().starts_with(prefix_url.path())
+}
+
+fn is_blocked_ipv4(
+    ip: Ipv4Addr,
+    allow_loopback: bool,
+    allow_link_local: bool,
+    allow_private: bool,
+) -> bool {
     (!allow_loopback && ip.is_loopback()) // 127.0.0.0/8
         || (!allow_link_local && ip.is_link_local()) // 169.254.0.0/16
-        || ip.is_private()    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918)
+        || (!allow_private && ip.is_private())    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918)
         || ip.is_unspecified() // 0.0.0.0
         || ip.is_broadcast()  // 255.255.255.255
-        || CGNAT_V4.contains(&ip) // 100.64.0.0/10 (RFC 6598)
+        || (!allow_private && CGNAT_V4.contains(&ip)) // 100.64.0.0/10 (RFC 6598)
 }
 
-fn is_blocked_ipv6(ip: Ipv6Addr, allow_loopback: bool, allow_link_local: bool) -> bool {
+fn is_blocked_ipv6(
+    ip: Ipv6Addr,
+    allow_loopback: bool,
+    allow_link_local: bool,
+    allow_private: bool,
+) -> bool {
     // IPv4-mapped IPv6 (::ffff:a.b.c.d) must be unwrapped and re-checked
     // against the IPv4 rules, otherwise `::ffff:169.254.169.254` would
     // sail straight past every IPv6-shaped check below.
     if let Some(mapped) = ip.to_ipv4_mapped() {
-        return is_blocked_ipv4(mapped, allow_loopback, allow_link_local);
+        return is_blocked_ipv4(mapped, allow_loopback, allow_link_local, allow_private);
     }
 
     (!allow_loopback && ip.is_loopback()) // ::1
         || ip.is_unspecified() // ::
         || (!allow_link_local && LINK_LOCAL_V6.contains(&ip)) // fe80::/10
-        || UNIQUE_LOCAL_V6.contains(&ip) // fc00::/7 (ULA)
+        || (!allow_private && UNIQUE_LOCAL_V6.contains(&ip)) // fc00::/7 (ULA)
 }
 
-/// Strict variant of [`is_blocked_ip_with_policy`] with both overrides off -
+/// Strict variant of [`is_blocked_ip_with_policy`] with every override off -
 /// what every request gets unless explicitly configured otherwise.
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
-    is_blocked_ip_with_policy(ip, false, false)
+    is_blocked_ip_with_policy(ip, false, false, false)
 }
 
 /// Single entry point for "is this address safe to connect to", honoring
-/// the `allow_loopback`/`allow_link_local` overrides. Used both for literal
-/// IP hosts and for every address a DNS lookup returns. RFC1918, CGNAT and
-/// IPv6 unique-local have no override - they are always blocked.
-pub fn is_blocked_ip_with_policy(ip: IpAddr, allow_loopback: bool, allow_link_local: bool) -> bool {
+/// the `allow_loopback`/`allow_link_local`/`allow_private` overrides. Used
+/// both for literal IP hosts and for every address a DNS lookup returns.
+///
+/// `allow_private` lifts the RFC1918/CGNAT/IPv6-unique-local block. Unlike
+/// `allow_loopback`/`allow_link_local`, which are blanket per-process
+/// toggles, callers must only pass `true` here for a hop whose *host*
+/// independently matched the operator's `ALLOWED_SOURCES` allowlist (#57)
+/// - see `is_allowed_source` and this module's doc comment. Loopback and
+/// link-local are deliberately not covered by `allow_private`: the cloud
+/// metadata endpoint (169.254.169.254) lives in link-local, and an
+/// allowlisted origin redirecting there must still be blocked.
+pub fn is_blocked_ip_with_policy(
+    ip: IpAddr,
+    allow_loopback: bool,
+    allow_link_local: bool,
+    allow_private: bool,
+) -> bool {
     match ip {
-        IpAddr::V4(v4) => is_blocked_ipv4(v4, allow_loopback, allow_link_local),
-        IpAddr::V6(v6) => is_blocked_ipv6(v6, allow_loopback, allow_link_local),
+        IpAddr::V4(v4) => is_blocked_ipv4(v4, allow_loopback, allow_link_local, allow_private),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6, allow_loopback, allow_link_local, allow_private),
     }
 }
 
@@ -266,19 +340,28 @@ fn parse_ip_literal(host: &str) -> Option<IpAddr> {
 
 /// Resolves `host` to a single validated [`SocketAddr`], rejecting it if it
 /// (or, for a DNS name, *any* address it resolves to) falls in a blocked
-/// range under the given `allow_loopback`/`allow_link_local` policy.
-/// Resolution happens exactly once here; the caller must connect to the
-/// returned address directly (e.g. via `ClientBuilder::resolve`) rather
+/// range under the given `allow_loopback`/`allow_link_local`/`allow_private`
+/// policy. Resolution happens exactly once here; the caller must connect to
+/// the returned address directly (e.g. via `ClientBuilder::resolve`) rather
 /// than letting the HTTP stack re-resolve the hostname, which is what
 /// closes the DNS-rebinding TOCTOU window.
+///
+/// `allow_private` must only be `true` when the caller has already
+/// confirmed, via [`is_allowed_source`], that *this specific `host`* (the
+/// one about to be resolved, not merely some URL earlier in a redirect
+/// chain) matches the operator's `ALLOWED_SOURCES` allowlist (#57). Passing
+/// a caller-wide constant here instead of a per-host, per-hop result would
+/// turn one allowlisted hostname into a bypass for the entire private
+/// range - callers must recompute the match for every hop.
 pub async fn resolve_validated_addr(
     host: &str,
     port: u16,
     allow_loopback: bool,
     allow_link_local: bool,
+    allow_private: bool,
 ) -> Result<SocketAddr> {
     if let Some(ip) = parse_ip_literal(host) {
-        if is_blocked_ip_with_policy(ip, allow_loopback, allow_link_local) {
+        if is_blocked_ip_with_policy(ip, allow_loopback, allow_link_local, allow_private) {
             return Err(SourceRejected::BlockedIpLiteral {
                 host: host.to_string(),
                 addr: ip,
@@ -301,7 +384,7 @@ pub async fn resolve_validated_addr(
     }
 
     for addr in &addrs {
-        if is_blocked_ip_with_policy(addr.ip(), allow_loopback, allow_link_local) {
+        if is_blocked_ip_with_policy(addr.ip(), allow_loopback, allow_link_local, allow_private) {
             return Err(SourceRejected::BlockedResolvedAddress {
                 host: host.to_string(),
                 addr: addr.ip(),
@@ -390,9 +473,10 @@ mod tests {
     }
 
     #[test]
-    fn unique_local_ipv6_has_no_override() {
-        // Unlike loopback/link-local, ULA has no allow_* override.
-        assert!(is_blocked_ip_with_policy(ip("fc00::1"), true, true));
+    fn unique_local_ipv6_has_no_loopback_or_link_local_override() {
+        // ULA is not touched by the loopback/link-local overrides - only
+        // `allow_private` (tested separately below) affects it.
+        assert!(is_blocked_ip_with_policy(ip("fc00::1"), true, true, false));
     }
 
     #[test]
@@ -411,17 +495,105 @@ mod tests {
 
     #[test]
     fn loopback_override_allows_loopback_but_nothing_else() {
-        assert!(!is_blocked_ip_with_policy(ip("127.0.0.1"), true, false));
-        assert!(!is_blocked_ip_with_policy(ip("::1"), true, false));
+        assert!(!is_blocked_ip_with_policy(
+            ip("127.0.0.1"),
+            true,
+            false,
+            false
+        ));
+        assert!(!is_blocked_ip_with_policy(ip("::1"), true, false, false));
         // RFC1918 stays blocked regardless of the loopback override.
-        assert!(is_blocked_ip_with_policy(ip("10.0.0.1"), true, false));
+        assert!(is_blocked_ip_with_policy(
+            ip("10.0.0.1"),
+            true,
+            false,
+            false
+        ));
     }
 
     #[test]
     fn link_local_override_allows_link_local_but_nothing_else() {
-        assert!(!is_blocked_ip_with_policy(ip("169.254.1.1"), false, true));
-        assert!(!is_blocked_ip_with_policy(ip("fe80::1"), false, true));
-        assert!(is_blocked_ip_with_policy(ip("127.0.0.1"), false, true));
+        assert!(!is_blocked_ip_with_policy(
+            ip("169.254.1.1"),
+            false,
+            true,
+            false
+        ));
+        assert!(!is_blocked_ip_with_policy(
+            ip("fe80::1"),
+            false,
+            true,
+            false
+        ));
+        assert!(is_blocked_ip_with_policy(
+            ip("127.0.0.1"),
+            false,
+            true,
+            false
+        ));
+    }
+
+    /// #57: `allow_private` lifts RFC1918/CGNAT/IPv6-ULA, and only those -
+    /// it must not also unblock loopback or link-local (the metadata
+    /// endpoint lives in link-local and must stay hard to reach even when
+    /// an origin's `ALLOWED_SOURCES` match sets `allow_private`).
+    #[test]
+    fn private_override_allows_private_ranges_but_not_loopback_or_link_local() {
+        assert!(!is_blocked_ip_with_policy(
+            ip("10.0.0.1"),
+            false,
+            false,
+            true
+        ));
+        assert!(!is_blocked_ip_with_policy(
+            ip("172.16.0.1"),
+            false,
+            false,
+            true
+        ));
+        assert!(!is_blocked_ip_with_policy(
+            ip("192.168.1.1"),
+            false,
+            false,
+            true
+        ));
+        assert!(!is_blocked_ip_with_policy(
+            ip("100.64.0.1"), // CGNAT
+            false,
+            false,
+            true
+        ));
+        assert!(!is_blocked_ip_with_policy(
+            ip("fc00::1"),
+            false,
+            false,
+            true
+        )); // IPv6 ULA
+
+        // Loopback and link-local (including the cloud metadata endpoint)
+        // stay blocked - `allow_private` is not a blanket override.
+        assert!(is_blocked_ip_with_policy(
+            ip("127.0.0.1"),
+            false,
+            false,
+            true
+        ));
+        assert!(is_blocked_ip_with_policy(
+            ip("169.254.169.254"),
+            false,
+            false,
+            true
+        ));
+
+        // Unspecified/broadcast still blocked too - never legitimate
+        // origins regardless of any override.
+        assert!(is_blocked_ip_with_policy(ip("0.0.0.0"), false, false, true));
+        assert!(is_blocked_ip_with_policy(
+            ip("255.255.255.255"),
+            false,
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -474,9 +646,75 @@ mod tests {
         assert!(!is_allowed_source(&bad_url, &allowed));
     }
 
+    /// #57: a URL that merely *contains* an allowed prefix somewhere other
+    /// than its actual host - query string, userinfo, path - must not
+    /// match. A match here is what authorizes bypassing the private-IP
+    /// block, so a spoofable match would reopen #21's SSRF.
+    #[test]
+    fn allowed_sources_does_not_match_prefix_embedded_in_query_string() {
+        let allowed = vec!["https://allowed.internal".to_string()];
+        let spoofed = Url::parse("https://evil.com/?x=https://allowed.internal/").unwrap();
+
+        assert!(!is_allowed_source(&spoofed, &allowed));
+    }
+
+    /// The userinfo trick: `https://allowed.internal@evil.com/x` *starts
+    /// with* the literal text `https://allowed.internal`, but its actual
+    /// host - what a client connects to, and what `Url::host_str` reports
+    /// - is `evil.com`. A naive `str::starts_with` match on the raw URL
+    /// text falls for this; structural host comparison does not.
+    #[test]
+    fn allowed_sources_does_not_match_prefix_embedded_in_userinfo() {
+        let allowed = vec!["https://allowed.internal".to_string()];
+        let spoofed = Url::parse("https://allowed.internal@evil.com/x").unwrap();
+
+        assert_eq!(spoofed.host_str(), Some("evil.com"));
+        assert!(!is_allowed_source(&spoofed, &allowed));
+    }
+
+    /// Subdomain-boundary trick: without an exact-host comparison, a
+    /// prefix `https://allowed.example.com` (no trailing slash) would also
+    /// textually match `https://allowed.example.com.evil.com/x` - a
+    /// completely different, attacker-registered host that merely starts
+    /// with the same characters.
+    #[test]
+    fn allowed_sources_does_not_match_subdomain_boundary_spoof() {
+        let allowed = vec!["https://allowed.example.com".to_string()];
+        let spoofed = Url::parse("https://allowed.example.com.evil.com/x").unwrap();
+
+        assert!(!is_allowed_source(&spoofed, &allowed));
+    }
+
+    /// A different scheme or port on an otherwise-matching host must not
+    /// match - imgproxy's `ALLOWED_SOURCES` shape is a *URL* prefix, not a
+    /// bare hostname allowlist.
+    #[test]
+    fn allowed_sources_requires_matching_scheme_and_port() {
+        let allowed = vec!["https://trusted.example.com/".to_string()];
+        let wrong_scheme = Url::parse("http://trusted.example.com/img.png").unwrap();
+        let wrong_port = Url::parse("https://trusted.example.com:8443/img.png").unwrap();
+
+        assert!(!is_allowed_source(&wrong_scheme, &allowed));
+        assert!(!is_allowed_source(&wrong_port, &allowed));
+    }
+
+    /// An allowlist entry can itself be a raw IP-literal prefix (e.g. a
+    /// Kubernetes Service ClusterIP with no DNS name at all) - the
+    /// operator's whole point in #57 is to name an internal address
+    /// directly.
+    #[test]
+    fn allowed_sources_matches_ip_literal_prefix() {
+        let allowed = vec!["http://10.0.0.5:8080/".to_string()];
+        let ok_url = Url::parse("http://10.0.0.5:8080/img.png").unwrap();
+        let other_ip = Url::parse("http://10.0.0.6:8080/img.png").unwrap();
+
+        assert!(is_allowed_source(&ok_url, &allowed));
+        assert!(!is_allowed_source(&other_ip, &allowed));
+    }
+
     #[tokio::test]
     async fn resolve_validated_addr_rejects_loopback_literal() {
-        let result = resolve_validated_addr("127.0.0.1", 80, false, false).await;
+        let result = resolve_validated_addr("127.0.0.1", 80, false, false, false).await;
         assert!(result.is_err());
     }
 
@@ -488,7 +726,7 @@ mod tests {
     /// falling through to the `502 Bad Gateway` default.
     #[tokio::test]
     async fn resolve_validated_addr_rejects_loopback_literal_as_typed_source_rejected() {
-        let err = resolve_validated_addr("127.0.0.1", 80, false, false)
+        let err = resolve_validated_addr("127.0.0.1", 80, false, false, false)
             .await
             .expect_err("loopback literal must be rejected");
         let rejected = err
@@ -499,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_validated_addr_rejects_metadata_endpoint_literal() {
-        let result = resolve_validated_addr("169.254.169.254", 80, false, false).await;
+        let result = resolve_validated_addr("169.254.169.254", 80, false, false, false).await;
         assert!(result.is_err());
     }
 
@@ -508,7 +746,7 @@ mod tests {
     /// as the loopback case above.
     #[tokio::test]
     async fn resolve_validated_addr_rejects_metadata_endpoint_as_typed_source_rejected() {
-        let err = resolve_validated_addr("169.254.169.254", 80, false, false)
+        let err = resolve_validated_addr("169.254.169.254", 80, false, false, false)
             .await
             .expect_err("metadata endpoint literal must be rejected");
         let rejected = err
@@ -544,19 +782,71 @@ mod tests {
         // Decimal-encoded 127.0.0.1 must be blocked exactly like the
         // dotted-quad form - this is the whole point of decoding literals
         // before the range check instead of after.
-        let result = resolve_validated_addr("2130706433", 80, false, false).await;
+        let result = resolve_validated_addr("2130706433", 80, false, false, false).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn resolve_validated_addr_allows_public_ip_literal() {
-        let result = resolve_validated_addr("8.8.8.8", 443, false, false).await;
+        let result = resolve_validated_addr("8.8.8.8", 443, false, false, false).await;
         assert_eq!(result.unwrap(), SocketAddr::new(ip("8.8.8.8"), 443));
     }
 
     #[tokio::test]
     async fn resolve_validated_addr_honors_loopback_override() {
-        let result = resolve_validated_addr("127.0.0.1", 8080, true, false).await;
+        let result = resolve_validated_addr("127.0.0.1", 8080, true, false, false).await;
         assert_eq!(result.unwrap(), SocketAddr::new(ip("127.0.0.1"), 8080));
+    }
+
+    /// #57: with `allow_private`, an RFC1918 literal resolves successfully
+    /// instead of being rejected - this is the actual fix, proven at the
+    /// address-validation layer (this function never touches the network
+    /// for an IP-literal host, so this needs no live private-network
+    /// server to test).
+    #[tokio::test]
+    async fn resolve_validated_addr_allows_rfc1918_literal_when_private_allowed() {
+        let result = resolve_validated_addr("10.0.0.5", 80, false, false, true).await;
+        assert_eq!(result.unwrap(), SocketAddr::new(ip("10.0.0.5"), 80));
+    }
+
+    #[tokio::test]
+    async fn resolve_validated_addr_allows_cgnat_literal_when_private_allowed() {
+        let result = resolve_validated_addr("100.64.0.1", 80, false, false, true).await;
+        assert_eq!(result.unwrap(), SocketAddr::new(ip("100.64.0.1"), 80));
+    }
+
+    #[tokio::test]
+    async fn resolve_validated_addr_allows_ipv6_ula_literal_when_private_allowed() {
+        let result = resolve_validated_addr("fd12:3456:789a::1", 80, false, false, true).await;
+        assert_eq!(
+            result.unwrap(),
+            SocketAddr::new(ip("fd12:3456:789a::1"), 80)
+        );
+    }
+
+    /// Without `allow_private` (the default), RFC1918 stays blocked - the
+    /// non-allowlisted case from the checklist.
+    #[tokio::test]
+    async fn resolve_validated_addr_still_blocks_rfc1918_literal_by_default() {
+        let result = resolve_validated_addr("10.0.0.5", 80, false, false, false).await;
+        assert!(result.is_err());
+    }
+
+    /// `allow_private` must not be a blanket escape hatch: the metadata
+    /// endpoint is link-local, not RFC1918/private, and must stay blocked
+    /// even when the caller passes `allow_private: true` for an
+    /// allowlisted origin that redirected there (#21's bypass).
+    #[tokio::test]
+    async fn resolve_validated_addr_rejects_metadata_endpoint_even_with_private_allowed() {
+        let result = resolve_validated_addr("169.254.169.254", 80, false, false, true).await;
+        assert!(result.is_err());
+    }
+
+    /// Same property for loopback: `allow_private` alone must not also
+    /// unblock loopback.
+    #[tokio::test]
+    async fn resolve_validated_addr_rejects_loopback_even_with_private_allowed() {
+        let result = resolve_validated_addr("127.0.0.1", 80, false, false, true).await;
+        assert!(result.is_err());
     }
 }

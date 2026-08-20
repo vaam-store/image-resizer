@@ -96,6 +96,17 @@ impl ImageService {
     /// rather than only on the original URL. Returns the final (non-3xx)
     /// response with the download size cap still unenforced - that's
     /// `download_image`'s job, since it needs to stream the body.
+    ///
+    /// #57: an explicit `ALLOWED_SOURCES` match is authoritative for the
+    /// private-IP-range block (RFC1918/CGNAT/IPv6-ULA) - `source_matches_allowlist`
+    /// below is recomputed from `current` at the top of *every* iteration
+    /// of this loop, so the bypass only ever applies to the one hop whose
+    /// host actually matched, never to a redirect target that didn't.
+    /// Loopback and link-local keep their own separate, unconditional
+    /// flags (`allow_loopback_source_addresses`/`allow_link_local_source_addresses`)
+    /// - an allowlist match never touches those, which is what keeps the
+    /// cloud metadata endpoint (link-local) hard to reach even from an
+    /// allowlisted origin's redirect.
     async fn fetch_validated(&self, url: &str) -> Result<Response> {
         let mut current = Url::parse(url).context("Invalid source URL")?;
 
@@ -104,14 +115,22 @@ impl ImageService {
         for _ in 0..=self.config.max_redirects {
             source_guard::validate_scheme(&current)?;
 
-            if let Some(allowed) = &self.config.allowed_sources {
-                if !allowed.is_empty() && !source_guard::is_allowed_source(&current, allowed) {
-                    return Err(source_guard::SourceRejected::NotAllowlisted {
-                        url: current.to_string(),
+            let source_matches_allowlist = match &self.config.allowed_sources {
+                Some(allowed) if !allowed.is_empty() => {
+                    if !source_guard::is_allowed_source(&current, allowed) {
+                        return Err(source_guard::SourceRejected::NotAllowlisted {
+                            url: current.to_string(),
+                        }
+                        .into());
                     }
-                    .into());
+                    true
                 }
-            }
+                // No allowlist configured (or configured empty) - no
+                // restriction on which URLs are fetched, but also no
+                // private-range bypass: private ranges stay blocked unless
+                // an operator has explicitly named this host.
+                _ => false,
+            };
 
             let host = current
                 .host_str()
@@ -128,6 +147,7 @@ impl ImageService {
                 port,
                 self.config.allow_loopback_source_addresses,
                 self.config.allow_link_local_source_addresses,
+                source_matches_allowlist,
             )
             .await?;
 
@@ -1322,6 +1342,240 @@ mod tests {
         assert!(
             msg.contains("blocked") || msg.contains("169.254"),
             "expected the redirect target to be rejected as blocked, got: {msg}"
+        );
+
+        server.abort();
+    }
+
+    /// #57: with no `ALLOWED_SOURCES` configured, an RFC1918 private
+    /// literal is still rejected by the guard itself - the pre-#57
+    /// behavior, unchanged when no allowlist opts a host in.
+    #[tokio::test]
+    async fn non_allowlisted_private_origin_is_still_refused() {
+        let service = ImageService::with_config(PerformanceConfig::default()).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.download_image("http://10.255.255.1/img.png"),
+        )
+        .await
+        .expect("must not hang");
+
+        let err = result.expect_err("non-allowlisted RFC1918 address must be rejected");
+        let rejected = err
+            .downcast_ref::<source_guard::SourceRejected>()
+            .expect("must be rejected by the guard itself (typed SourceRejected), not fail later");
+        assert!(
+            matches!(
+                rejected,
+                source_guard::SourceRejected::BlockedIpLiteral { .. }
+            ),
+            "unexpected rejection variant: {rejected:?}"
+        );
+    }
+
+    /// Same as above, but with an `ALLOWED_SOURCES` configured that does
+    /// *not* match this host - must still be refused, and specifically as
+    /// `NotAllowlisted` (fails before the private-range check is even
+    /// reached), not silently let through.
+    #[tokio::test]
+    async fn private_origin_not_matching_configured_allowlist_is_still_refused() {
+        let config = PerformanceConfig {
+            allowed_sources: Some(vec!["https://trusted.example.com/".to_string()]),
+            ..PerformanceConfig::default()
+        };
+        let service = ImageService::with_config(config).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.download_image("http://10.255.255.1/img.png"),
+        )
+        .await
+        .expect("must not hang");
+
+        let err = result.expect_err("RFC1918 address not matching the allowlist must be rejected");
+        let rejected = err
+            .downcast_ref::<source_guard::SourceRejected>()
+            .expect("must downcast to SourceRejected");
+        assert!(
+            matches!(
+                rejected,
+                source_guard::SourceRejected::NotAllowlisted { .. }
+            ),
+            "unexpected rejection variant: {rejected:?}"
+        );
+    }
+
+    /// #57's actual fix: once `ALLOWED_SOURCES` names this exact host, the
+    /// SSRF guard must let the request through instead of rejecting it at
+    /// the private-range check. Proven by absence of a `SourceRejected`
+    /// error rather than a live private-network connection (10.255.255.1
+    /// isn't reachable from this sandbox, and shouldn't need to be for
+    /// this to be a meaningful test - the guard's decision is what's under
+    /// test, not the TCP layer beneath it) - before this fix,
+    /// `fetch_validated` would reject this before ever attempting the
+    /// network call; after the fix, any failure here is a *connection*
+    /// failure, not a guard rejection.
+    #[tokio::test]
+    async fn allowlisted_private_origin_passes_the_guard_instead_of_being_blocked() {
+        let config = PerformanceConfig {
+            allowed_sources: Some(vec!["http://10.255.255.1/".to_string()]),
+            http_timeout: std::time::Duration::from_millis(500),
+            ..PerformanceConfig::default()
+        };
+        let service = ImageService::with_config(config).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.download_image("http://10.255.255.1/img.png"),
+        )
+        .await
+        .expect("must not hang");
+
+        let err = result.expect_err(
+            "connection to an address this sandbox can't route to should still fail overall",
+        );
+        assert!(
+            err.downcast_ref::<source_guard::SourceRejected>().is_none(),
+            "expected the request to pass the SSRF guard and fail at the network/connect layer \
+             instead of being rejected by the guard, got: {err}"
+        );
+    }
+
+    /// #57 requirement: an allowlisted origin that redirects to a
+    /// *different*, non-allowlisted private address must still be
+    /// refused. The allowlist match is re-evaluated per hop
+    /// (`fetch_validated` recomputes it from `current` every loop
+    /// iteration) - it does not "stick" once granted for the first hop.
+    #[tokio::test]
+    async fn allowlisted_origin_redirecting_to_non_allowlisted_private_ip_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => break,
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+
+            // Redirects to an RFC1918 address that is NOT in this test's
+            // ALLOWED_SOURCES below.
+            let response = "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.9/secret\r\nContent-Length: 0\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let config = PerformanceConfig {
+            // Only the origin itself is allowlisted - the redirect target
+            // (10.0.0.9) is a different host and must not inherit the
+            // origin's private-range bypass.
+            allowed_sources: Some(vec![format!("http://{addr}/")]),
+            allow_loopback_source_addresses: true, // the origin is loopback, unrelated to the private-range bypass under test
+            ..PerformanceConfig::default()
+        };
+        let service = ImageService::with_config(config).unwrap();
+
+        let url = format!("http://{addr}/redirect-me");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.download_image(&url),
+        )
+        .await
+        .expect("download_image should not hang");
+
+        let err =
+            result.expect_err("redirect to a non-allowlisted private address must be rejected");
+        let rejected = err
+            .downcast_ref::<source_guard::SourceRejected>()
+            .expect("must downcast to SourceRejected");
+        assert!(
+            matches!(
+                rejected,
+                source_guard::SourceRejected::NotAllowlisted { .. }
+            ),
+            "unexpected rejection variant: {rejected:?}"
+        );
+
+        server.abort();
+    }
+
+    /// #57 requirement, strongest form: even if an operator's
+    /// `ALLOWED_SOURCES` happens to *also* list the metadata endpoint
+    /// itself (so the allowlist match on that hop succeeds), the
+    /// private-range bypass must never reach it - link-local stays gated
+    /// behind its own separate `allow_link_local_source_addresses` flag,
+    /// which is untouched here. This is the exact bypass #21 closed;
+    /// #57's allowlist change must not reopen it.
+    #[tokio::test]
+    async fn redirect_to_metadata_endpoint_is_rejected_even_when_it_matches_the_allowlist() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") => break,
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+
+            let response = "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n";
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let config = PerformanceConfig {
+            // Deliberately allowlists BOTH the origin AND the metadata
+            // endpoint itself - even so, the metadata endpoint must stay
+            // blocked, because allow_private never lifts the link-local
+            // check.
+            allowed_sources: Some(vec![
+                format!("http://{addr}/"),
+                "http://169.254.169.254/".to_string(),
+            ]),
+            allow_loopback_source_addresses: true,
+            ..PerformanceConfig::default()
+        };
+        let service = ImageService::with_config(config).unwrap();
+
+        let url = format!("http://{addr}/redirect-me");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            service.download_image(&url),
+        )
+        .await
+        .expect("download_image should not hang");
+
+        let err = result.expect_err("redirect to the metadata endpoint must be rejected");
+        let rejected = err
+            .downcast_ref::<source_guard::SourceRejected>()
+            .expect("must downcast to SourceRejected");
+        assert!(
+            matches!(
+                rejected,
+                source_guard::SourceRejected::BlockedIpLiteral { .. }
+            ),
+            "unexpected rejection variant: {rejected:?}"
         );
 
         server.abort();

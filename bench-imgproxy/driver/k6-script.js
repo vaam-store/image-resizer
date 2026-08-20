@@ -17,13 +17,14 @@ import encoding from 'k6/encoding';
 
 const ENGINE = __ENV.ENGINE || 'emgr'; // 'emgr' | 'emgr_s3' | 'imgproxy'
 const SCENARIO = __ENV.SCENARIO || 'cold'; // 'cold' | 'warm'
-const ENGINE_BASE_URL = __ENV.ENGINE_BASE_URL || 'http://origin:3000';
+const ENGINE_BASE_URL = __ENV.ENGINE_BASE_URL || 'http://emgr:3000';
 // Where the *proxy itself* fetches source images from -- NOT necessarily
-// where k6 fetches the proxy from. Deliberately different per engine; see
-// the compose.yaml header comment and README.md for why (emgr's SSRF
-// guard unconditionally blocks RFC1918 addresses, so it must reach the
-// origin over a shared-namespace loopback instead of the normal docker
-// network hostname imgproxy uses).
+// where k6 fetches the proxy from. The same for every engine (#57): all
+// three reach `origin` over the normal `bench` bridge network by service
+// name. emgr/emgr_s3 are authorized to do so via
+// ALLOWED_SOURCES=http://origin:80/ in compose.yaml, which lifts the
+// SSRF guard's private-range block for that one named host - see that
+// file's header comment and src/services/image/source_guard.rs.
 const ORIGIN_SOURCE_BASE_URL = __ENV.ORIGIN_SOURCE_BASE_URL || 'http://origin:80';
 
 const VUS = parseInt(__ENV.VUS || '10', 10);

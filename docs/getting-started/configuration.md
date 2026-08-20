@@ -76,7 +76,7 @@ services. Mirrors imgproxy's equivalent settings, named in each row below.
 | Variable | Description | Default |
 |---|---|---|
 | `MAX_REDIRECTS` | Maximum redirects the source fetch follows; every hop is re-validated (scheme, allowlist, resolved address). imgproxy: *IMGPROXY_MAX_REDIRECTS*. | `5` |
-| `ALLOWED_SOURCES` | Comma-separated allowlist of source URL prefixes. Unset allows any `http(s)` URL, still subject to the private-range guard below. imgproxy: *IMGPROXY_ALLOWED_SOURCES*. | _unset_ |
+| `ALLOWED_SOURCES` | Comma-separated allowlist of source URL prefixes. Unset allows any `http(s)` URL, still subject to the private-range guard below. A host matching an entry here is also exempted from the private-IP-range block (RFC1918/CGNAT/IPv6 ULA) for that hop, so an explicitly-named internal origin (a Kubernetes Service ClusterIP, an internal MinIO, a private CDN shield) is reachable ([GH #57](https://github.com/vaam-store/image-resizer/issues/57)) - loopback and link-local are unaffected and keep their own flags below. Re-checked on every redirect hop. imgproxy: *IMGPROXY_ALLOWED_SOURCES*. | _unset_ |
 | `ALLOW_LOOPBACK_SOURCE_ADDRESSES` | Opt-in to allow fetching from loopback addresses (blocked by default). | `false` |
 | `ALLOW_LINK_LOCAL_SOURCE_ADDRESSES` | Opt-in to allow fetching from link-local addresses (blocked by default). | `false` |
 
