@@ -13,7 +13,11 @@ pub struct SourceSpec {
     pub format: ImageFormat,
 }
 
-const KNOWN_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+/// #49 adds `avif`, `gif` (real output formats - see `ImageFormat`'s doc
+/// comment for what each does and does not support) and `auto` (not a real
+/// format - the content-negotiation trigger, resolved by
+/// `crate::modules::negotiation` before a `ResizeQuery` is built).
+const KNOWN_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "avif", "gif", "auto"];
 
 /// Parses the trailing path segment(s) that carry the source: either
 /// `plain/{literal URL}.{extension}` (imgproxy's escape hatch for a
@@ -141,8 +145,24 @@ mod tests {
     #[test]
     fn unrecognized_extension_is_rejected() {
         let encoded = URL_SAFE_NO_PAD.encode("https://example.com/img.jpg");
-        let segment = format!("{encoded}.gif");
+        let segment = format!("{encoded}.bmp");
         assert!(parse_source(&[&segment]).is_err());
+    }
+
+    /// #49: `avif`, `gif` and `auto` are now recognised extensions, same as
+    /// the original `jpg`/`png`/`webp`.
+    #[test]
+    fn parses_new_49_extensions() {
+        for (ext, expected) in [
+            ("avif", ImageFormat::Avif),
+            ("gif", ImageFormat::Gif),
+            ("auto", ImageFormat::Auto),
+        ] {
+            let encoded = URL_SAFE_NO_PAD.encode("https://example.com/img.jpg");
+            let segment = format!("{encoded}.{ext}");
+            let spec = parse_source(&[&segment]).unwrap();
+            assert_eq!(spec.format, expected, "extension {ext:?}");
+        }
     }
 
     #[test]

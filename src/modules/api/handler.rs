@@ -1,10 +1,11 @@
 use crate::config::performance::PerformanceConfig;
 use crate::modules::env::env::EnvConfig;
 use crate::modules::signing::SigningConfig;
+use crate::modules::url::presets::{AllowedOptions, PresetRegistry};
 use crate::services::cache::handler::CacheServiceBuilder;
 use crate::services::resize::handler::ResizeService;
 use crate::services::storage::handler::StorageService;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use derive_builder::Builder;
 
 /// Shared application state (#53: replaces the generated `gen_server`
@@ -15,6 +16,18 @@ use derive_builder::Builder;
 pub struct ApiService {
     pub resize_service: ResizeService,
     pub signing: SigningConfig,
+    /// Preset definitions (#52) - see `PresetRegistry::parse` for the
+    /// `PRESETS` config format. `default: PresetRegistry::empty()` (no
+    /// presets configured) when unset via `ApiServiceBuilder`, so existing
+    /// tests that build an `ApiService` without ever mentioning presets are
+    /// unaffected.
+    #[builder(default = "PresetRegistry::empty()")]
+    pub presets: PresetRegistry,
+    /// Processing-option allowlist (#52) - see `AllowedOptions::parse` for
+    /// the `ALLOWED_PROCESSING_OPTIONS` config format. Defaults to
+    /// unrestricted.
+    #[builder(default = "AllowedOptions::unrestricted()")]
+    pub allowed_options: AllowedOptions,
 }
 
 impl ApiService {
@@ -24,6 +37,15 @@ impl ApiService {
         // borrow, so it must run first (fails closed at startup per #27 if
         // signing isn't configured and wasn't explicitly opted out of).
         let signing = SigningConfig::from_env(&config)?;
+
+        // Presets (#52) - fails closed at startup (mirrors `signing` above)
+        // rather than deferring a broken `PRESETS` value to the first
+        // request that happens to use one.
+        let presets = PresetRegistry::parse(config.presets.as_deref().unwrap_or(""))
+            .map_err(|e| anyhow::anyhow!("invalid PRESETS configuration: {e}"))
+            .context("failed to build preset registry")?;
+        let allowed_options =
+            AllowedOptions::parse(config.allowed_processing_options.as_deref().unwrap_or(""));
 
         // Create performance configuration from environment
         let performance_config = PerformanceConfig::from(&config);
@@ -81,6 +103,8 @@ impl ApiService {
         let api_service = ApiServiceBuilder::default()
             .resize_service(resize_service)
             .signing(signing)
+            .presets(presets)
+            .allowed_options(allowed_options)
             .build()?;
 
         Ok(api_service)

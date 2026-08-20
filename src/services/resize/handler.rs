@@ -493,15 +493,7 @@ mod tests {
             height: Some(2),
             resize_type: ResizeType::Fit,
             format: ImageFormat::Png,
-            blur_sigma: None,
-            grayscale: None,
-            enlarge: false,
-            quality: None,
-            jpeg_quality: None,
-            webp_quality: None,
-            webp_lossless: None,
-            background: None,
-            autorotate: true,
+            ..Default::default()
         });
 
         let mut handles = Vec::with_capacity(100);
@@ -574,15 +566,7 @@ mod tests {
             height: Some(2),
             resize_type: ResizeType::Fit,
             format: ImageFormat::Png,
-            blur_sigma: None,
-            grayscale: None,
-            enlarge: false,
-            quality: None,
-            jpeg_quality: None,
-            webp_quality: None,
-            webp_lossless: None,
-            background: None,
-            autorotate: true,
+            ..Default::default()
         });
 
         let mut handles = Vec::with_capacity(20);

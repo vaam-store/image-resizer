@@ -612,7 +612,7 @@ async fn main() -> Result<()> {
         "  BENCHMARK_FIXTURE_NAMES              - photo_like,flat,alpha,tiny (see benches/fixtures.rs)"
     );
     println!("  BENCHMARK_RESIZE_PARAMS              - e.g. '100x100,500x,x300'");
-    println!("  BENCHMARK_OUTPUT_FORMAT              - jpg|png|webp");
+    println!("  BENCHMARK_OUTPUT_FORMAT              - jpg|png|webp|avif|gif");
     println!("  BENCHMARK_REQUEST_TIMEOUT            - per-request timeout, seconds");
     println!("  BENCHMARK_WAIT_BETWEEN_TESTS         - pause between levels, seconds");
     println!(

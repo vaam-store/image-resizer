@@ -58,6 +58,18 @@ fn content_type_for_key(key: &str) -> &'static str {
         Ok(ImageFormat::Jpg) => "image/jpeg",
         Ok(ImageFormat::Png) => "image/png",
         Ok(ImageFormat::Webp) => "image/webp",
+        Ok(ImageFormat::Avif) => "image/avif",
+        Ok(ImageFormat::Gif) => "image/gif",
+        // `Auto` (#49) never appears in a real generated key -
+        // `CacheService::generate_key` always writes a concrete, already-
+        // negotiated format - and `key_validation::validate_cache_key`
+        // (`ALLOWED_EXTENSIONS`) rejects a `.auto`-suffixed key before
+        // `download` ever returns `Ok` here anyway, so this arm is
+        // unreachable in practice; still handled explicitly (rather than
+        // folded into `Err(_)`) so this match stays exhaustive against
+        // `ImageFormat` without silently reinterpreting a future new
+        // variant as "unknown, serve octet-stream".
+        Ok(ImageFormat::Auto) => "application/octet-stream",
         Err(_) => "application/octet-stream",
     }
 }
@@ -165,6 +177,8 @@ mod tests {
         assert_eq!(content_type_for_key("abc.jpg"), "image/jpeg");
         assert_eq!(content_type_for_key("abc.png"), "image/png");
         assert_eq!(content_type_for_key("abc.webp"), "image/webp");
+        assert_eq!(content_type_for_key("abc.avif"), "image/avif");
+        assert_eq!(content_type_for_key("abc.gif"), "image/gif");
         assert_eq!(content_type_for_key("abc.bin"), "application/octet-stream");
     }
 }
