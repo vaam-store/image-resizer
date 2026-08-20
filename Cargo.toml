@@ -106,6 +106,7 @@ webp = "0.3"
 hmac = "0.12"
 subtle = "2.6"
 base64 = "0.22"
+fast_image_resize = { version = "6.1", features = ["image"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
