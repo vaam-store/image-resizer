@@ -21,7 +21,7 @@
 #     doesn't.
 #
 # THE POINT OF THE THREE-WAY SPLIT: `emgr` (local_fs) 301-redirects the
-# client back to itself (CDN_BASE_URL = http://origin:3000/...) -- so emgr
+# client back to itself (CDN_BASE_URL = http://emgr:3000/...) -- so emgr
 # pays the cost of *serving* the derivative bytes on top of *producing*
 # them. `emgr_s3` 301-redirects the client to MinIO instead
 # (CDN_BASE_URL = http://minio:9000/...) -- emgr never touches the response
@@ -29,47 +29,39 @@
 # in a two-way emgr-vs-imgproxy comparison and may well favour S3. See
 # README.md's "Three engines, one asymmetry" section.
 #
-# Non-obvious wiring: both `emgr` and `emgr_s3` are started with
-# `network_mode: "service:origin"` -- each shares the `origin` container's
-# network namespace instead of getting its own. This is NOT a
-# benchmark-only hack; it is the same pattern the project's own internal
-# load tester (`src/bin/benchmark.rs`, see its
-# `ALLOW_LOOPBACK_SOURCE_ADDRESSES` usage) already uses, made necessary by
-# `src/services/image/source_guard.rs`: that SSRF guard unconditionally
-# blocks every RFC1918 address (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-# with NO override -- and a plain docker-compose bridge network address for
-# a sibling "origin" container is always in one of those ranges. The
-# guard's one sanctioned escape hatch is
-# `ALLOW_LOOPBACK_SOURCE_ADDRESSES=true` plus reaching the origin at
-# 127.0.0.1, which requires sharing a network namespace with it. `imgproxy`
-# has no equivalent restriction and reaches `origin` normally, over the
-# regular `bench` bridge network, by service name.
+# Normal bridge networking (GH #57): `emgr` and `emgr_s3` sit on the same
+# `bench` bridge network as `origin`, `minio` and `imgproxy`, reached by
+# service name, exactly like `imgproxy` reaches `origin`. This used to
+# require a `network_mode: "service:origin"` + `ALLOW_LOOPBACK_SOURCE_ADDRESSES=true`
+# workaround: `src/services/image/source_guard.rs`'s SSRF guard blocked
+# every RFC1918 address (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) with no
+# override, and a docker-compose bridge network address is always in one of
+# those ranges -- so `emgr`/`emgr_s3` had to share `origin`'s network
+# namespace and reach it over 127.0.0.1 (loopback, not RFC1918) instead.
+# #57 gave `ALLOWED_SOURCES` the authority to lift that block for a
+# specific, operator-named host without touching loopback/link-local (see
+# that module's doc comment) -- `ALLOWED_SOURCES: http://origin/` below is
+# exactly that: it names `origin` as the one internal host each engine is
+# allowed to fetch source images from, on the ordinary bridge network,
+# with no shared-namespace trick required.
 #
-# MinIO does NOT need this treatment. The SSRF guard
+# MinIO never needed the workaround in the first place. The SSRF guard
 # (`src/services/image/source_guard.rs`) sits in front of the *source image
 # fetch* path only (`src/services/image/handler.rs`'s `fetch_validated`,
 # which is what calls into `source_guard`) -- it is never consulted by the
 # storage layer (`src/services/storage/s3_handler.rs`'s `MinIOStorage`,
 # which talks to MinIO purely through the `aws-sdk-s3` client, never
-# through `reqwest`/`source_guard`). So `emgr_s3` reaches `minio` as a
-# normal peer on the `bench` bridge network, by service name -- exactly
-# like `imgproxy` reaches `origin` -- with no loopback tricks and no
-# ALLOW_LOOPBACK_SOURCE_ADDRESSES involvement for that leg. The RFC1918
-# guard only had to be worked around for the origin-fetch leg, not the
-# storage leg.
+# through `reqwest`/`source_guard`). So `emgr_s3` has always reached
+# `minio` as a normal peer on the `bench` bridge network, by service name.
 #
-# Since `emgr` and `emgr_s3` both share `origin`'s network namespace, they
-# cannot both bind the same port there -- `emgr` listens on 3000, `emgr_s3`
-# on 3001, both published for debugging via `origin`'s own `ports:` list
-# below (a container in `network_mode: "service:X"` cannot publish its own
-# ports -- only `X` can).
-#
-# Consequence worth knowing before you read timings: emgr's (both flavours)
-# requests to the origin traverse a shared loopback interface, while
-# imgproxy's traverse a normal container-to-container bridge hop. Both are
-# "local, no internet" and both are sub-millisecond compared to
-# decode/resize/encode cost, but they are not bit-for-bit the same network
-# path. See README.md.
+# Each engine now gets its own container identity and its own published
+# debug port (`emgr` on 3000/18081, `emgr_s3` on 3001/18087, both under
+# their own `ports:` below) rather than borrowing `origin`'s. Each also has
+# a real Docker `HEALTHCHECK` again (inherited from the image, see
+# `Dockerfile`'s `base_deploy` stage) now that it isn't hidden behind
+# `origin`'s own health status -- `driver/run.sh` polls it the same way it
+# already does for `origin`/`minio`/`imgproxy`, instead of the bespoke
+# curl-loop the shared-namespace setup used to need.
 
 x-engine-resources: &engine_limits
   cpus: "2"
@@ -94,14 +86,12 @@ services:
           memory: 256m
     ports:
       # Host-published for manual debugging only (curl from the host). The
-      # load driver never uses these -- it talks to `origin`/`imgproxy` by
-      # service name on the `bench` network.
+      # load driver never uses these -- it talks to every service by name
+      # on the `bench` network. `emgr`/`emgr_s3` publish their own debug
+      # ports under their own service blocks below now (#57) -- they used
+      # to be tunneled through this container's port list back when they
+      # shared its network namespace.
       - "18080:80" # nginx corpus
-      - "18081:3000" # emgr (local_fs), reachable here because it shares
-      # this container's network namespace (see the header comment above)
-      # -- not because nginx itself listens on 3000.
-      - "18087:3001" # emgr_s3, same reasoning, different port because it
-      # shares this same namespace alongside `emgr` and can't reuse 3000.
     healthcheck:
       # 127.0.0.1, NOT localhost: /etc/hosts maps localhost to both 127.0.0.1
       # and ::1, wget tries the IPv6 address first, and nginx binds IPv4 only
@@ -137,9 +127,10 @@ services:
 
   # emgr on the local_fs backend: stores derivatives on a docker volume and
   # 301-redirects the client back to itself to serve them (CDN_BASE_URL
-  # below points at `origin:3000`, i.e. this very container). See the
-  # header comment's "THE POINT OF THE THREE-WAY SPLIT" section -- this is
-  # the flavour that pays for serving bytes it already produced.
+  # below points at `emgr:3000`, i.e. this very container, by its own
+  # service name). See the header comment's "THE POINT OF THE THREE-WAY
+  # SPLIT" section -- this is the flavour that pays for serving bytes it
+  # already produced.
   emgr:
     build:
       context: ..
@@ -147,11 +138,11 @@ services:
       # No OTel: keeps this comparison to image-processing cost, not
       # instrumentation overhead imgproxy doesn't pay either.
       target: fs_deploy
-    # Shares `origin`'s network namespace -- see the header comment. This
-    # also means emgr's own port 3000 is reachable at `origin:3000` /
-    # `localhost:18081`, NOT at an `emgr:3000` DNS name (this container has
-    # no network identity of its own to publish a hostname for).
-    network_mode: "service:origin"
+    networks:
+      - bench
+    ports:
+      # Host-published for manual debugging only, same as `origin`/`imgproxy`.
+      - "18081:3000"
     depends_on:
       origin:
         condition: service_healthy
@@ -167,16 +158,17 @@ services:
       LOCAL_FS_STORAGE_PATH: /app/data/images
       HOST: 0.0.0.0
       PORT: "3000"
-      # Points back at emgr's own shared-namespace address so the load
-      # driver's 301 redirect-follow (see driver/k6-script.js) resolves
-      # without leaving the compose network.
-      CDN_BASE_URL: http://origin:3000/api/images/files
+      # Points back at emgr's own service name so the load driver's 301
+      # redirect-follow (see driver/k6-script.js) resolves without leaving
+      # the compose network.
+      CDN_BASE_URL: http://emgr:3000/api/images/files
       ENABLE_HTTP2: "false" # origin speaks plain HTTP/1.1
-      # The origin is only reachable at 127.0.0.1 from inside this shared
-      # namespace -- this is the documented, sanctioned opt-in
-      # (src/services/image/source_guard.rs), not a weakened guard: RFC1918
-      # ranges stay blocked regardless of this flag.
-      ALLOW_LOOPBACK_SOURCE_ADDRESSES: "true"
+      # #57: names `origin` as the one internal host this engine is
+      # allowed to fetch source images from, lifting the private-range
+      # block (`origin`'s bridge-network address is RFC1918) for exactly
+      # that host - not a general SSRF-guard weakening. See
+      # `src/services/image/source_guard.rs`'s module doc comment.
+      ALLOWED_SOURCES: "http://origin:80/"
       # emgr fails closed at startup without a signing key (#27), so this
       # opt-out is mandatory, not incidental. Mirrors imgproxy running with
       # IMGPROXY_KEY/SALT unset and an `insecure` signature segment: both
@@ -292,14 +284,11 @@ services:
       dockerfile: Dockerfile
       # No OTel, matching `emgr` (local_fs) and imgproxy.
       target: s3_deploy
-    # Shares `origin`'s network namespace, same reasoning as `emgr` (local_fs)
-    # -- the SSRF guard's loopback escape hatch is what lets this container
-    # fetch source images from `origin` at all. See the header comment's
-    # "MinIO does NOT need this treatment" section: this sharing is ONLY
-    # for the source-fetch leg (reqwest -> source_guard), not for reaching
-    # MinIO, which this container talks to over the normal `bench` network
-    # via the S3 SDK (a path source_guard never sees).
-    network_mode: "service:origin"
+    networks:
+      - bench
+    ports:
+      # Host-published for manual debugging only, same as the other services.
+      - "18087:3001"
     depends_on:
       origin:
         condition: service_healthy
@@ -318,19 +307,21 @@ services:
       MINIO_BUCKET: emgr-bench
       MINIO_REGION: us-east-1
       HOST: 0.0.0.0
-      # Different port from `emgr` (local_fs)'s 3000 -- both share
-      # `origin`'s network namespace and can't both bind 3000.
+      # Different port from `emgr` (local_fs)'s 3000, kept distinct purely
+      # so both engines' debug ports are unambiguous - each container has
+      # its own network identity now (#57), so this is no longer required
+      # to avoid a port clash.
       PORT: "3001"
       # THE architectural distinction this three-way benchmark exists to
       # measure: this points at MinIO, NOT at `emgr_s3` itself (contrast
-      # `emgr` (local_fs)'s CDN_BASE_URL, which points back at `origin:3000`
+      # `emgr` (local_fs)'s CDN_BASE_URL, which points back at `emgr:3000`
       # -- itself). The bucket is public (see `minio_init` above), so this
       # redirect resolves with no signing.
       CDN_BASE_URL: http://minio:9000/emgr-bench
       ENABLE_HTTP2: "false" # origin speaks plain HTTP/1.1
       # Same sanctioned opt-in as `emgr` (local_fs) -- see the header
       # comment. Only affects the source-image-fetch leg.
-      ALLOW_LOOPBACK_SOURCE_ADDRESSES: "true"
+      ALLOWED_SOURCES: "http://origin:80/"
       # emgr fails closed at startup without a signing key (#27); mirrors
       # `emgr` (local_fs) and imgproxy's own signature-skipping setup.
       ALLOW_UNSIGNED_REQUESTS: "true"

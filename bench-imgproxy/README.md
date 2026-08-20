@@ -216,7 +216,7 @@ This is the reason `emgr_s3` and `minio` exist in this harness at all, not
 just an incidental third data point.
 
 `emgr` (local_fs) stores each derivative on a docker volume and points
-`CDN_BASE_URL` **back at itself**: `http://origin:3000/api/images/files`
+`CDN_BASE_URL` **back at itself**: `http://emgr:3000/api/images/files`
 (see `compose.yaml`'s `emgr` service). When the client follows the 301
 redirect a successful resize response produces, it lands back on the exact
 same emgr process that just computed the derivative -- so emgr pays the
@@ -248,57 +248,59 @@ level and comparing is for. See item 7 in "Fairness controls" above for
 the one confound this three-way split does *not* isolate: `minio`'s own
 resource cost, which is uncounted against `emgr_s3`'s budget.
 
-## The `network_mode: "service:origin"` wiring -- read this before trusting the "cold cache" numbers
+## Normal bridge networking (GH #57) -- and the workaround it replaced
 
-`emgr`'s SSRF source guard (`src/services/image/source_guard.rs`)
-**unconditionally blocks every RFC1918 address** (`10.0.0.0/8`,
-`172.16.0.0/12`, `192.168.0.0/16`) with **no override** -- this was verified
-by reading the guard's source directly, not assumed. A plain docker-compose
-bridge network address for a sibling `origin` container is always in one of
-those ranges, so emgr **cannot** fetch from a normal same-network origin
-container at all. The guard's only sanctioned escape hatch is
-`ALLOW_LOOPBACK_SOURCE_ADDRESSES=true` plus reaching the origin at
-`127.0.0.1` -- which is exactly the pattern the project's own internal load
-tester already uses (`src/bin/benchmark.rs`, `ALLOW_LOOPBACK_SOURCE_ADDRESSES`
-usage, binding its test server to `127.0.0.1`).
+All three engines now sit on the same `bench` bridge network as `origin`,
+`minio` and each other, each with its own container identity, reached by
+service name -- `emgr` fetches source images from `origin` at
+`http://origin:80`, exactly like `imgproxy` always has.
 
-To get emgr onto that loopback path, both `emgr` and `emgr_s3` are started
-with `network_mode: "service:origin"` in `compose.yaml`: each shares the
-`origin` container's network namespace entirely, rather than getting its
-own. From either emgr's own perspective it then reaches nginx at
-`127.0.0.1:80` (loopback, allowed via the flag above); `emgr`'s port 3000
-and `emgr_s3`'s port 3001 both become reachable externally at
-`origin:3000` / `origin:3001` (there is no separate `emgr:3000` or
-`emgr_s3:3001` DNS name -- neither container has a network identity of its
-own to publish one for). `imgproxy` has no such restriction and reaches
-`origin` normally, as a regular peer on the `bench` bridge network, by
-service name.
+That wasn't always true. `emgr`'s SSRF source guard
+(`src/services/image/source_guard.rs`) used to block every RFC1918 address
+(`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) **unconditionally, with
+no override** -- and a plain docker-compose bridge network address for a
+sibling `origin` container is always in one of those ranges, so emgr could
+not fetch from a normal same-network origin container at all
+([GH #57](https://github.com/vaam-store/image-resizer/issues/57)). The
+workaround this harness used before #57 landed: `network_mode:
+"service:origin"` on both `emgr` and `emgr_s3` (sharing `origin`'s network
+namespace entirely, reaching it over `127.0.0.1` -- loopback, not
+RFC1918 -- via `ALLOW_LOOPBACK_SOURCE_ADDRESSES=true`), with neither
+container able to publish its own service name or its own Docker
+`HEALTHCHECK` status as a result.
 
-**MinIO does NOT need this treatment, and this was verified rather than
-assumed.** The SSRF guard sits in front of exactly one code path: the
-*source image fetch* (`src/services/image/handler.rs`, which calls into
+#57 fixed the actual guard instead: an explicit `ALLOWED_SOURCES` match is
+now authoritative for the private-range block, scoped to exactly the host
+named -- see that module's doc comment for the full design rationale
+(notably, why this is a named-host allowlist and not a blanket
+`ALLOW_PRIVATE_SOURCE_ADDRESSES` toggle). `compose.yaml` now sets
+`ALLOWED_SOURCES: http://origin:80/` on both `emgr` and `emgr_s3`, which is
+all that's needed to make `origin`'s ordinary bridge-network address
+(RFC1918) reachable -- no shared network namespace, no loopback, no
+`ALLOW_LOOPBACK_SOURCE_ADDRESSES` involved. Loopback and link-local are
+untouched by this and still blocked by default, same as ever.
+
+**MinIO never needed either the workaround or the fix, and this was
+verified rather than assumed.** The SSRF guard sits in front of exactly
+one code path: the *source image fetch*
+(`src/services/image/handler.rs`, which calls into
 `source_guard::validate_scheme`/`is_allowed_source`/
 `resolve_validated_addr` before ever issuing a `reqwest` request). The
 storage layer is a completely separate code path --
 `src/services/storage/s3_handler.rs`'s `MinIOStorage` talks to MinIO
 exclusively through the `aws-sdk-s3` client, which never calls into
-`source_guard` at all. So `emgr_s3` reaches `minio` as an ordinary peer on
-the `bench` bridge network, by service name (`http://minio:9000`), exactly
-like `imgproxy` reaches `origin` -- no loopback trick, no
-`ALLOW_LOOPBACK_SOURCE_ADDRESSES` involvement, because that flag only ever
-widens the source-fetch guard, and the guard was never in this leg's way
-to begin with.
+`source_guard` at all. `emgr_s3` has always reached `minio` as an ordinary
+peer on the `bench` bridge network, by service name
+(`http://minio:9000`).
 
-**Consequence:** both emgr flavours' requests to the origin traverse a
-shared loopback interface; imgproxy's traverse a normal
-container-to-container bridge hop; `emgr_s3`'s requests to MinIO **also**
-traverse a normal bridge hop, same as imgproxy's to origin. All of these
-are "local, no internet" and all are sub-millisecond compared to
-decode/resize/encode cost at any of this corpus's resolutions, so this is
-very unlikely to be a meaningful confound -- but it is not a bit-for-bit
-identical network path across all three engines, and you should know that
-before reading the last fraction of a millisecond into any latency
-comparison.
+**Consequence for numbers you read here:** every engine's source-image
+fetch and (for `emgr_s3`) derivative-store traffic now traverses the same
+kind of hop -- a normal container-to-container bridge hop on `bench` --
+rather than two emgr flavours using a shared loopback interface while
+imgproxy used a bridge hop. This removes the one network-path asymmetry
+older runs of this harness had; numbers from before #57 landed were
+produced under the loopback-vs-bridge split described above and are not
+directly comparable on that dimension.
 
 ## Scenarios
 

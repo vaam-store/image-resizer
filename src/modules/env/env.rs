@@ -98,7 +98,17 @@ pub struct EnvConfig {
     /// Comma-separated allowlist of source URL prefixes. When set, only
     /// source URLs matching at least one prefix are fetched. Unset (the
     /// default) allows any http(s) URL, subject to the private-range guard.
-    /// imgproxy equivalent: `IMGPROXY_ALLOWED_SOURCES`.
+    ///
+    /// A match here is also authoritative for the private-IP-range block
+    /// (RFC1918/CGNAT/IPv6 ULA) - #57: an operator explicitly naming a
+    /// source (a Kubernetes Service ClusterIP, an internal MinIO, a
+    /// private CDN shield) makes that specific host reachable even though
+    /// it resolves to a private address, without weakening the guard for
+    /// anything else. Loopback and link-local are unaffected by this -
+    /// they keep their own separate opt-in flags below, so the cloud
+    /// metadata endpoint stays hard to reach even from an allowlisted
+    /// origin's redirect. Re-checked on every redirect hop, not just the
+    /// original URL. imgproxy equivalent: `IMGPROXY_ALLOWED_SOURCES`.
     #[envconfig(from = "ALLOWED_SOURCES")]
     pub allowed_sources: Option<String>,
 

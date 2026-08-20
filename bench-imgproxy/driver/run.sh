@@ -34,8 +34,15 @@ fi
 echo "==> Building and starting origin + minio (+ bucket init) + imgproxy + emgr + emgr_s3"
 docker compose up -d --build origin volume_init minio minio_init imgproxy emgr emgr_s3
 
-echo "==> Waiting for origin, minio and imgproxy healthchecks"
-for svc in origin minio imgproxy; do
+echo "==> Waiting for origin, minio, imgproxy, emgr and emgr_s3 healthchecks"
+# #57: emgr/emgr_s3 are on the normal `bench` bridge network now (see
+# compose.yaml's header comment), each with its own container identity and
+# its own Docker HEALTHCHECK (inherited from the image, Dockerfile's
+# `base_deploy` stage) -- so they're polled here exactly like
+# origin/minio/imgproxy always were. This used to need a separate
+# curl-against-a-tunneled-port loop back when they shared `origin`'s
+# network namespace and had no health status of their own visible here.
+for svc in origin minio imgproxy emgr emgr_s3; do
   cid="$(docker compose ps -q "$svc")"
   for _ in $(seq 1 60); do
     status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo starting)"
@@ -68,45 +75,24 @@ if [ "${exit_code:-}" != "0" ]; then
 fi
 echo "    minio_init: done"
 
-# emgr/emgr_s3 have no HEALTHCHECK visible to `docker inspect` in the same
-# way once network_mode: service:origin is in play (their healthchecks
-# still run in-container, but poll each's actual HTTP endpoint directly
-# here too, since that's what the driver will hit).
-for target in "emgr:18081" "emgr_s3:18087"; do
-  svc="${target%%:*}"
-  port="${target##*:}"
-  echo "==> Waiting for $svc to answer on http://localhost:${port}/health"
-  for _ in $(seq 1 60); do
-    if curl -sf "http://localhost:${port}/health" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 2
-  done
-  if ! curl -sf "http://localhost:${port}/health" >/dev/null 2>&1; then
-    echo "!! $svc did not answer on :${port}/health -- check 'docker compose logs $svc'" >&2
-    exit 1
-  fi
-  echo "    $svc: healthy"
-done
-
 engine_base_url() {
+  # #57: all three engines have their own service identity on the `bench`
+  # bridge network now - no more tunneling emgr/emgr_s3 through `origin`'s
+  # port list.
   case "$1" in
-    emgr) echo "http://origin:3000" ;;
-    emgr_s3) echo "http://origin:3001" ;;
+    emgr) echo "http://emgr:3000" ;;
+    emgr_s3) echo "http://emgr_s3:3001" ;;
     imgproxy) echo "http://imgproxy:8080" ;;
   esac
 }
 
 origin_source_base_url() {
-  # See compose.yaml's header comment: both emgr flavours must reach the
-  # origin over loopback (shared network namespace +
-  # ALLOW_LOOPBACK_SOURCE_ADDRESSES), imgproxy reaches it over the normal
-  # bridge network by service name.
-  case "$1" in
-    emgr) echo "http://127.0.0.1:80" ;;
-    emgr_s3) echo "http://127.0.0.1:80" ;;
-    imgproxy) echo "http://origin:80" ;;
-  esac
+  # All three engines reach `origin` the same way now - the normal bridge
+  # network, by service name. `emgr`/`emgr_s3` are authorized to do so via
+  # ALLOWED_SOURCES=http://origin:80/ in compose.yaml (#57), which lifts
+  # the private-range block for that one named host instead of requiring
+  # the old shared-network-namespace/loopback workaround.
+  echo "http://origin:80"
 }
 
 for engine in $ENGINES; do
