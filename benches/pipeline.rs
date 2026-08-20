@@ -10,7 +10,7 @@ mod fixtures;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use emgr::models::params::ImageFormat as ApiImageFormat;
-use emgr::models::params::ResizeQuery;
+use emgr::models::params::{ResizeQuery, ResizeType};
 use emgr::services::image::handler::ImageService;
 
 fn query(width: Option<u32>, height: Option<u32>, format: ApiImageFormat) -> ResizeQuery {
@@ -18,6 +18,7 @@ fn query(width: Option<u32>, height: Option<u32>, format: ApiImageFormat) -> Res
         url: "https://images.example.com/photo.jpg".to_string(),
         width,
         height,
+        resize_type: ResizeType::Fit,
         format,
         blur_sigma: None,
         grayscale: None,

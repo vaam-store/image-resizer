@@ -1,16 +1,22 @@
 use super::UrlParseError;
+use crate::models::params::ResizeType;
 
 /// The set of processing options this service understands, parsed from
 /// their `/`-delimited `code:arg1:arg2` path segments. Mirrors imgproxy's
 /// own short option codes (`rs`, `q`, `bl`, `g`, `el`) so a client library
 /// written for imgproxy's URL format produces something this parser accepts
-/// for the capability set #53 keeps: width, height, blur, grayscale,
-/// enlarge, quality (format comes from the trailing `.{extension}` instead
-/// - see [`super::source`]).
+/// for the capability set #53 keeps: width, height, resize type, blur,
+/// grayscale, enlarge, quality (format comes from the trailing
+/// `.{extension}` instead - see [`super::source`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcessingOptions {
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// `rs`'s `{type}` slot (#59) - see [`ResizeType`]. Defaults to
+    /// `ResizeType::default()` (`Fit`) when no `rs` segment is present at
+    /// all, which is harmless since `width`/`height` are then both `None`
+    /// too and no resize happens regardless of type.
+    pub resize_type: ResizeType,
     pub blur_sigma: Option<f32>,
     pub grayscale: Option<bool>,
     pub enlarge: Option<bool>,
@@ -36,15 +42,20 @@ impl ProcessingOptions {
             let args: Vec<&str> = parts.collect();
 
             match code {
-                // rs:{type}:{width}:{height} - `type` (`fill`/`fit`/...) is
-                // accepted for imgproxy URL compatibility but doesn't change
-                // resize behaviour today: `ImageService::process_image_blocking_with_limits`
-                // (src/services/image/handler.rs, owned by another agent)
-                // already derives fit-vs-fill purely from whether width
-                // and/or height are present. `0` means "not set", mirroring
+                // rs:{type}:{width}:{height} - `type` (`fit`/`fill`/`force`/
+                // `auto`, imgproxy's resizing type) is carried through to
+                // `ResizeQuery::resize_type` and drives which of
+                // `resize`/`resize_to_fill`/`resize_exact` the resize
+                // pipeline (`ImageService::process_image_blocking_with_limits`,
+                // src/services/image/handler.rs) uses once both width and
+                // height are present (#59). An unrecognised type is
+                // rejected with `UrlParseError::InvalidOptionValue` (400)
+                // rather than silently falling back to a different one.
+                // `0` for width/height means "not set", mirroring
                 // imgproxy's own `rs`/`resize` convention.
                 "rs" => {
-                    let [_kind, width, height] = require_args::<3>(&args, segment)?;
+                    let [kind, width, height] = require_args::<3>(&args, segment)?;
+                    opts.resize_type = parse_resize_type(kind, segment)?;
                     opts.width = parse_dimension(width, segment)?;
                     opts.height = parse_dimension(height, segment)?;
                 }
@@ -113,6 +124,21 @@ fn parse_float(raw: &str, segment: &str) -> Result<f32, UrlParseError> {
     })
 }
 
+/// Parses `rs`'s `{type}` slot into a [`ResizeType`] (#59). Delegates to
+/// `ResizeType::from_str` (which already treats an empty string as "use the
+/// default") and re-wraps its `Err(String)` as the same
+/// `UrlParseError::InvalidOptionValue` every other malformed `rs` argument
+/// produces, so an unsupported type is rejected with 400 exactly like an
+/// unparseable width/height rather than silently substituting a different
+/// resize behaviour.
+fn parse_resize_type(raw: &str, segment: &str) -> Result<ResizeType, UrlParseError> {
+    raw.parse()
+        .map_err(|reason| UrlParseError::InvalidOptionValue {
+            option: segment.to_string(),
+            reason,
+        })
+}
+
 fn parse_bool(raw: &str, segment: &str) -> Result<bool, UrlParseError> {
     match raw {
         "true" | "1" => Ok(true),
@@ -133,6 +159,33 @@ mod tests {
         let opts = ProcessingOptions::parse(&["rs:fill:300:300"]).unwrap();
         assert_eq!(opts.width, Some(300));
         assert_eq!(opts.height, Some(300));
+        assert_eq!(opts.resize_type, ResizeType::Fill);
+    }
+
+    #[test]
+    fn parses_every_resize_type() {
+        for (token, expected) in [
+            ("fit", ResizeType::Fit),
+            ("fill", ResizeType::Fill),
+            ("force", ResizeType::Force),
+            ("auto", ResizeType::Auto),
+        ] {
+            let segment = format!("rs:{token}:300:300");
+            let opts = ProcessingOptions::parse(&[&segment]).unwrap();
+            assert_eq!(opts.resize_type, expected, "type token {token:?}");
+        }
+    }
+
+    #[test]
+    fn empty_resize_type_slot_defaults_to_fit() {
+        let opts = ProcessingOptions::parse(&["rs::300:300"]).unwrap();
+        assert_eq!(opts.resize_type, ResizeType::Fit);
+    }
+
+    #[test]
+    fn unknown_resize_type_is_rejected_with_400_shaped_error() {
+        let err = ProcessingOptions::parse(&["rs:crop:300:300"]).unwrap_err();
+        assert!(matches!(err, UrlParseError::InvalidOptionValue { .. }));
     }
 
     #[test]
@@ -198,6 +251,7 @@ mod tests {
                 .unwrap();
         assert_eq!(opts.width, Some(300));
         assert_eq!(opts.height, Some(300));
+        assert_eq!(opts.resize_type, ResizeType::Fill);
         assert_eq!(opts.quality, Some(80));
         assert_eq!(opts.blur_sigma, Some(5.0));
         assert_eq!(opts.grayscale, Some(true));

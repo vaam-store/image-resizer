@@ -14,8 +14,18 @@ use sha2::{Digest, Sha256};
 /// `enlarge=true`/`enlarge=false` requests for the same other parameters
 /// even after the field started being read from `ResizeQuery`, since bytes
 /// already written to storage under those v2 keys wouldn't be reinterpreted
-/// just because the code changed.
-const CACHE_KEY_VERSION: u8 = 3;
+/// just because the code changed. v4 adds `resize_type` (#59): before #59,
+/// every `width`+`height` request was resized identically (always `fill`)
+/// regardless of the `rs:{type}:...` token in the URL, so `resize_type`
+/// didn't need to be part of the key - two requests differing only in that
+/// token produced byte-identical output. Now that `fit`/`fill`/`force`/
+/// `auto` each produce different output for the same width/height, a v3 key
+/// (which never hashed the type) would serve a `fit` request the `fill`
+/// output cached under the same width/height/etc, or vice versa - exactly
+/// the kind of stale, wrong-shape response #59 exists to eliminate. Every
+/// key computed under v3 must therefore be invalidated by this bump, same
+/// as the v2 -> v3 transition for `enlarge`.
+const CACHE_KEY_VERSION: u8 = 4;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -56,6 +66,14 @@ impl CacheService {
             Some(height) => Self::update_field(&mut hasher, height.to_string().as_bytes()),
             None => Self::update_field(&mut hasher, b"None"),
         }
+
+        // `resize_type` (#59) changes the resize pipeline's output whenever
+        // both `width` and `height` are present - `fit`/`fill`/`force`/
+        // `auto` each produce visibly different bytes for the same box - so
+        // it must be part of the key like every other output-affecting
+        // field (see the v4 `CACHE_KEY_VERSION` note above). Always-present
+        // (not `Option<ResizeType>`), so no "None" bucket is needed here.
+        Self::update_field(&mut hasher, params.resize_type.to_string().as_bytes());
 
         Self::update_field(
             &mut hasher,
@@ -117,7 +135,7 @@ mod tests {
     // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is now
     // hand-written in `src/models/params.rs`. Mechanical import change
     // only - no logic here changed.
-    use crate::models::params::ImageFormat;
+    use crate::models::params::{ImageFormat, ResizeType};
     use std::collections::HashSet;
 
     fn cache_service() -> CacheService {
@@ -152,6 +170,7 @@ mod tests {
             url: url.to_string(),
             width,
             height,
+            resize_type: ResizeType::Fit,
             format,
             blur_sigma,
             grayscale,
@@ -302,6 +321,47 @@ mod tests {
         assert_ne!(
             cache.generate_key(&base(true)),
             cache.generate_key(&base(false))
+        );
+    }
+
+    /// #59 (v4 bump): before #59, `fit`/`fill`/`force`/`auto` were parsed
+    /// but ignored, so every width+height request resized identically and
+    /// `resize_type` didn't need to be part of the key. Now that each type
+    /// produces different output bytes for the same width/height, every
+    /// pairwise-distinct type must also produce a distinct cache key -
+    /// otherwise a `fit` request could be served a `fill`-shaped cached
+    /// response (or vice versa), silently resurrecting the #59 bug via a
+    /// stale cache instead of an unversioned key.
+    #[test]
+    fn resize_type_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |resize_type: ResizeType| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type,
+            format: ImageFormat::Png,
+            blur_sigma: None,
+            grayscale: None,
+            enlarge: false,
+            quality: None,
+        };
+
+        let keys: HashSet<String> = [
+            ResizeType::Fit,
+            ResizeType::Fill,
+            ResizeType::Force,
+            ResizeType::Auto,
+        ]
+        .into_iter()
+        .map(|kind| cache.generate_key(&base(kind)))
+        .collect();
+
+        assert_eq!(
+            keys.len(),
+            4,
+            "each resize type must produce a distinct cache key"
         );
     }
 

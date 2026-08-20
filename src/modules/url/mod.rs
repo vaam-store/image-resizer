@@ -108,6 +108,7 @@ impl ParsedRequest {
             url: self.source.url,
             width: self.options.width,
             height: self.options.height,
+            resize_type: self.options.resize_type,
             format: self.source.format,
             blur_sigma: self.options.blur_sigma,
             grayscale: self.options.grayscale,
@@ -158,6 +159,7 @@ mod tests {
         assert_eq!(query.url, "https://example.com/img.jpg");
         assert_eq!(query.width, Some(300));
         assert_eq!(query.height, Some(300));
+        assert_eq!(query.resize_type, crate::models::params::ResizeType::Fill);
         assert_eq!(query.quality, Some(80));
         assert_eq!(query.blur_sigma, Some(5.0));
         assert_eq!(query.grayscale, Some(true));
@@ -174,6 +176,10 @@ mod tests {
 
         assert_eq!(query.width, None);
         assert_eq!(query.height, None);
+        assert_eq!(
+            query.resize_type,
+            crate::models::params::ResizeType::default()
+        );
         assert_eq!(query.quality, None);
         assert_eq!(query.blur_sigma, None);
         assert_eq!(query.grayscale, None);

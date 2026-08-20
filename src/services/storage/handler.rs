@@ -396,7 +396,7 @@ mod tests {
     // #53: `gen_server` (OpenAPI codegen) was deleted; `ImageFormat` is now
     // hand-written in `src/models/params.rs`. Mechanical import change
     // only - no logic here changed.
-    use crate::models::params::ImageFormat;
+    use crate::models::params::{ImageFormat, ResizeType};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Owns a per-test local_fs storage directory under the OS temp dir and
@@ -462,6 +462,7 @@ mod tests {
             url: "https://example.com/img.png".to_string(),
             width: Some(100),
             height: Some(100),
+            resize_type: ResizeType::Fit,
             format: ImageFormat::Png,
             blur_sigma: None,
             grayscale: None,

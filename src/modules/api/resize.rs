@@ -265,6 +265,7 @@ mod tests {
             url,
             width: Some(4),
             height: Some(4),
+            resize_type: crate::models::params::ResizeType::Fit,
             format: ImageFormat::Png,
             blur_sigma: None,
             grayscale: None,
@@ -390,6 +391,26 @@ mod tests {
     async fn malformed_grammar_is_bad_request_not_forbidden() {
         let (api_service, _storage, _dir) = build_test_api_service(signing_allow_unsigned());
         let raw_path = "/unsigned/not-a-valid-source-without-extension".to_string();
+
+        let response = resize_handler(
+            State(Arc::new(api_service)),
+            raw_path.parse::<Uri>().expect("valid uri"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// #59: an `rs:{type}:...` segment naming a resize type this crate
+    /// doesn't understand must be rejected with `400` end-to-end through
+    /// the real HTTP handler, never silently substituted for a supported
+    /// type (which is what happened before #59 - the type was parsed and
+    /// then discarded).
+    #[tokio::test]
+    async fn unknown_resize_type_is_bad_request() {
+        let (api_service, _storage, _dir) = build_test_api_service(signing_allow_unsigned());
+        let encoded = URL_SAFE_NO_PAD.encode(b"https://example.com/img.jpg" as &[u8]);
+        let raw_path = format!("/unsigned/rs:crop:800:600/{encoded}.jpg");
 
         let response = resize_handler(
             State(Arc::new(api_service)),

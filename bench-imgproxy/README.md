@@ -174,14 +174,19 @@ useful to anyone. Concretely:
    verification, which keeps the comparison about image processing rather
    than HMAC throughput.
 
-5. **Same resize semantics.** The driver always requests `rt:fill` from
-   imgproxy (crop to exactly WxH) because emgr **ignores the requested
-   resize type and always crops to fill** regardless of what `rs:` mode is
-   asked for (#59) -- `rt:fill` matches what emgr actually does on both
-   flavours, so imgproxy isn't asked to do 33% more work (a `fit` request
-   on a 16:9 source returns fewer pixels than a `fill` request at the same
-   WxH) for a differently-composed image. Revert to `rt:fit` once #59 makes
-   emgr honour the requested type.
+5. **Same resize semantics.** The driver requests `rt:fit` from imgproxy
+   and `rs:fit:{w}:{h}` from emgr -- both engines fit the source inside
+   WxH, preserving aspect ratio, and produce the same output dimensions
+   for a given source. This used to be `rt:fill` on the imgproxy side as a
+   stopgap: emgr's `rs:{type}:...` parser accepted the resize type but
+   silently discarded it and always cropped to exactly WxH regardless of
+   what was asked (#59), so asking imgproxy for the honestly-requested
+   `fit` made it return fewer pixels (e.g. 800x450 for a 16:9 source at
+   800x600) than emgr's always-fill 800x600 -- 33% more work on emgr's
+   side, and a differently-composed image, for what was supposed to be an
+   identical operation. #59 fixed emgr to honour `fit`/`fill`/`force`/
+   `auto` for real, so the driver now asks both engines for `fit` and gets
+   an apples-to-apples comparison.
 
 6. **No upscaling requested of any engine.** emgr currently refuses to
    upscale outright (`src/models/params.rs`'s `enlarge` field has no query
