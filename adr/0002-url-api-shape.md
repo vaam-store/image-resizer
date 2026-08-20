@@ -215,3 +215,25 @@ Reasoning:
   "unpinned/drifting" and "constrains status codes" objections both weaken — but neither
   addresses the URL-shape limitation (OpenAPI can't express imgproxy's path grammar), which is
   the deciding factor independent of the codegen-quality objections.
+
+## Amendment 2026-08-20: the `g:` option collision (#73)
+
+`g:` was already in use for **grayscale** when the imgproxy-compatible grammar landed, but in
+imgproxy `g:` is **gravity** — grayscale there is a filter, not a top-level option. The two
+cannot both own the prefix.
+
+**Decision: `g:` stays grayscale; gravity is `gr:`.** Taken by the repository owner on
+2026-08-20, in preference to reassigning `g:` to gravity and moving grayscale to `gs:`.
+
+**Consequence, stated plainly so it is not rediscovered later:** `emgr` is *not* drop-in for an
+imgproxy URL that uses gravity. Such a URL does not error — it is silently misread, because
+`g:ce` parses as a valid grayscale option rather than centre gravity. Gravity is among the most
+commonly used imgproxy processing options, so the "swap your base URL" adoption story recorded
+above under Consequences is correspondingly narrower than that section implies: it holds for
+resize/quality/format/crop URLs, not for gravity ones.
+
+**What would change this decision:** it becomes materially more expensive with every published
+`emgr` URL that uses `g:`. Today the grammar has no external users and the swap would cost only
+a `CACHE_KEY_VERSION` bump; that is the cheapest this change will ever be. If drop-in gravity
+compatibility later proves to be a real adoption blocker, revisiting means a genuine breaking
+change to already-published URLs.
