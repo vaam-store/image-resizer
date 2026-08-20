@@ -1,0 +1,20 @@
+emgr
+Copyright (c) 2025 Stephane SEGNING LAMBOU
+
+Licensed under the MIT License. See LICENSE.
+
+--------------------------------------------------------------------------
+Third-party notices
+--------------------------------------------------------------------------
+
+This software is based in part on the work of the Independent JPEG Group.
+
+emgr links mozjpeg (via mozjpeg-sys), which vendors libjpeg-turbo and
+Independent JPEG Group code, distributed under the IJG, Zlib and
+BSD-3-Clause licences. It is used for DCT-scaled JPEG decoding.
+
+emgr also links libwebp (via the `webp` crate, BSD-3-Clause) for lossy WebP
+encoding.
+
+Full licence texts ship with those crates and are reproduced in the
+dependency tree under ~/.cargo/registry.

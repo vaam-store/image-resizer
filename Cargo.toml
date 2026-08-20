@@ -62,7 +62,7 @@ tower-http = { version = "0.6", features = ["compression-full", "cors"] }
 tokio = { version = "1", features = ["full"] }
 
 reqwest = { version = "0.12", features = ["json", "stream", "http2", "gzip"] } # Optimized HTTP client
-image = { version = "0.25", features = ["jpeg", "png", "webp"] } # Core image processing with specific formats
+image = { version = "0.25", features = ["jpeg", "png", "webp", "avif", "gif"] } # avif for #49; gif for animation groundwork
 num_cpus = "1.16" # CPU detection for optimal thread pool sizing
 bytes = "1.5" # Efficient byte handling
 futures = "0.3" # Stream processing utilities
@@ -107,6 +107,7 @@ hmac = "0.12"
 subtle = "2.6"
 base64 = "0.22"
 fast_image_resize = { version = "6.1", features = ["image"] }
+mozjpeg = "0.10"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
