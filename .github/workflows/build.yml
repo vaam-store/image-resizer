@@ -94,6 +94,108 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-buildx-${{ matrix.flavor }}-
 
+      # #62: build.yml built and pushed every image variant without ever
+      # running one. The s3/s3_otel images shipped for an unknown period
+      # unable to start at all (builder glibc 2.41 vs distroless runtime
+      # glibc 2.36 - "GLIBC_2.38 not found") and CI stayed green throughout,
+      # because a build-only pipeline structurally cannot catch a dynamic-
+      # linking failure that only surfaces at process start. This step
+      # loads the image locally (instead of pushing) and actually runs it
+      # *before* the real "Build and push" step below, so a binary that
+      # can't start blocks the push instead of shipping.
+      #
+      # `docker/build-push-action` can only `load` a single-platform image
+      # (buildx has no concept of loading a multi-arch manifest into the
+      # local docker daemon), so this can only ever prove the host runner's
+      # own architecture - linux/amd64, since this job runs on
+      # `ubuntu-latest` - actually starts. The linux/arm64 image pushed
+      # below is built via QEMU emulation and is NOT exercised by this
+      # smoke test: an arm64-only linking/codegen problem would still ship
+      # undetected. Running this on a real arm64 runner too is future work,
+      # not done here to keep this fast.
+      - name: Build image for smoke test (host arch only, not pushed)
+        uses: docker/build-push-action@v6
+        if: github.event_name != 'pull_request'
+        with:
+          context: .
+          file: "Dockerfile"
+          push: false
+          load: true
+          target: ${{ matrix.docker_target }}
+          tags: emgr-smoketest:${{ matrix.flavor }}
+          platforms: linux/amd64
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+
+      # What "runs" means here, deliberately chosen over the cheaper option:
+      # running with no config at all also "works" in the sense that emgr
+      # correctly refuses to start (signed URLs are the default since #27),
+      # so asserting on that specific startup error's text would already
+      # distinguish a healthy refusal from a linker crash. But that only
+      # proves the binary reaches its first config check - it says nothing
+      # about whether the HTTP server, router, and storage backend
+      # construction (the S3 client included, for the s3/s3_otel variants)
+      # actually work, and it's brittle: it breaks the moment that error
+      # string's wording changes for unrelated reasons.
+      #
+      # Instead this gives the container a minimal *valid* config
+      # (ALLOW_UNSIGNED_REQUESTS=true opts out of #27's signing requirement)
+      # and asserts it reaches a healthy /health. This needs no mock S3/
+      # MinIO service even for the s3/s3_otel variants: every MINIO_* env
+      # var has a working default (src/modules/env/env.rs) and constructing
+      # the S3 client is local-only, no network call
+      # (src/services/storage/s3_handler.rs::new_minio, and its own test
+      # `new_minio_succeeds_with_typical_inputs_and_makes_no_network_call`).
+      # So the full setup cost is one env var, and the assertion proves the
+      # entire startup path instead of just the first line of it.
+      - name: Smoke test image (asserts the binary actually starts and serves)
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+
+          image="emgr-smoketest:${{ matrix.flavor }}"
+          container="emgr-smoketest-${{ matrix.flavor }}"
+
+          docker rm -f "$container" >/dev/null 2>&1 || true
+          docker run -d --name "$container" -p 3000:3000 \
+            -e ALLOW_UNSIGNED_REQUESTS=true \
+            "$image"
+
+          cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          status=""
+          for _ in $(seq 1 30); do
+            if ! docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null | grep -q true; then
+              echo "::error::${image} exited before becoming healthy - the binary likely failed to start (e.g. a dynamic linker error). Container logs:"
+              docker logs "$container" || true
+              exit 1
+            fi
+
+            status=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3000/health" || echo "000")
+            if [ "$status" = "200" ]; then
+              break
+            fi
+            status=""
+            sleep 1
+          done
+
+          if [ -z "$status" ]; then
+            echo "::error::${image} never returned a healthy /health within the timeout. Container logs:"
+            docker logs "$container" || true
+            exit 1
+          fi
+
+          echo "${image}: emgr started, linked, and served a healthy /health response."
+
+          # The healthcheck binary (src/bin/healthcheck.rs) is a separate
+          # build target baked into every variant's image
+          # (HEALTHCHECK_BUILDER stage in the Dockerfile) and is just as
+          # unproven by a build-only pipeline as emgr itself - exec it
+          # against the now-healthy running container and require exit 0.
+          docker exec "$container" /app/healthcheck
+          echo "${image}: healthcheck binary exited 0 against the running server."
+
       - name: Build and push
         uses: docker/build-push-action@v6
         if: github.event_name != 'pull_request'
