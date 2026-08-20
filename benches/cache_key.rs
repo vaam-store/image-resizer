@@ -3,7 +3,7 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use emgr::models::params::ImageFormat as ApiImageFormat;
-use emgr::models::params::ResizeQuery;
+use emgr::models::params::{ResizeQuery, ResizeType};
 use emgr::services::cache::handler::CacheServiceBuilder;
 
 fn bench_cache_key(c: &mut Criterion) {
@@ -16,6 +16,7 @@ fn bench_cache_key(c: &mut Criterion) {
         url: "https://images.example.com/some/deep/path/photo.jpg?query=1&other=2".to_string(),
         width: Some(800),
         height: Some(600),
+        resize_type: ResizeType::Fit,
         format: ApiImageFormat::Webp,
         blur_sigma: Some(1.5),
         grayscale: Some(false),

@@ -347,7 +347,7 @@ mod tests {
     use crate::services::storage::core::StorageBackend;
     use crate::services::storage::handler::StorageServiceBuilder;
     // #53: mechanical import change, same reasoning as the top-of-file one.
-    use crate::models::params::ImageFormat;
+    use crate::models::params::{ImageFormat, ResizeType};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -491,6 +491,7 @@ mod tests {
             url,
             width: Some(2),
             height: Some(2),
+            resize_type: ResizeType::Fit,
             format: ImageFormat::Png,
             blur_sigma: None,
             grayscale: None,
@@ -566,6 +567,7 @@ mod tests {
             url: dead_url,
             width: Some(2),
             height: Some(2),
+            resize_type: ResizeType::Fit,
             format: ImageFormat::Png,
             blur_sigma: None,
             grayscale: None,

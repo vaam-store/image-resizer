@@ -129,18 +129,21 @@ const urlBuilders = {
   // imgproxy: /{signature}/{options}/plain/{source}. "insecure" as the
   // signature segment because IMGPROXY_KEY/IMGPROXY_SALT are unset in
   // compose.yaml (imgproxy's documented way to disable signing).
-  // rt:fit matches emgr's own only resize behavior (no crop mode exposed
-  // in emgr's current API), so both engines are asked to do the same
-  // "fit within WxH, preserve aspect ratio" operation.
+  // rt:fit matches emgr's `rs:fit:{w}:{h}` above, so both engines are
+  // asked to do the same "fit within WxH, preserve aspect ratio"
+  // operation and produce the same output dimensions for a given source.
+  //
+  // This was `rt:fill` for a while: before #59, emgr parsed the `rs`
+  // segment's type token but silently ignored it and always cropped to
+  // exact WxH (GH #59) - asking imgproxy for `fit` got 800x450 for a 16:9
+  // source while emgr returned 800x600, 33% more pixels of work and a
+  // differently-composed image, which made the comparison invalid. `fill`
+  // was a stopgap to match what emgr actually did. #59 fixed emgr to
+  // honour `fit`/`fill`/`force`/`auto` for real, so this reverts to the
+  // originally-intended `rt:fit` now that both engines actually perform
+  // the same operation.
   imgproxy(sourceUrl, w, h, format) {
-    // rt:fill, NOT rt:fit — because emgr IGNORES the resize type and always
-    // crops to exact WxH when both dimensions are given (GH #59). Asking
-    // imgproxy for `fit` made it return 800x450 for a 16:9 source while emgr
-    // returned 800x600: 33% more pixels of work on emgr's side, and a
-    // differently-composed image. That is not the same operation, so the
-    // comparison was invalid. `fill` matches what emgr actually does.
-    // Revert to rt:fit once #59 makes emgr honour the type.
-    const options = `w:${w}/h:${h}/rt:fill/f:${format}`;
+    const options = `w:${w}/h:${h}/rt:fit/f:${format}`;
     return `${ENGINE_BASE_URL}/insecure/${options}/plain/${imgproxyPlainEncode(sourceUrl)}`;
   },
 };

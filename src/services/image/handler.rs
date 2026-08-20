@@ -1,5 +1,5 @@
 use crate::config::performance::PerformanceConfig;
-use crate::models::params::ResizeQuery;
+use crate::models::params::{ResizeQuery, ResizeType};
 use crate::services::image::source_guard;
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -407,19 +407,52 @@ impl ImageService {
             _ => FilterType::Lanczos3,
         };
 
-        // Resize image with optimized logic
+        // Resize image with optimized logic. `effective_width`/
+        // `effective_height` are already capped to the source resolution
+        // per axis unless `enlarge` is set (above), and every branch below
+        // - `resize` (fit), `resize_to_fill` (fill/auto-as-fill),
+        // `resize_exact` (force) - only ever shrinks each axis to at most
+        // its capped target, so none of them can upscale past the source:
+        // the #36 guard holds for every resize type, not just fill.
         let img = match (effective_width, effective_height) {
             (Some(w), None) => img.resize(w, u32::MAX, filter),
             (None, Some(h)) => img.resize(u32::MAX, h, filter),
-            // `resize_to_fill` already crops to exactly `w x h` internally
-            // (verified against image-0.25.10's
-            // `DynamicImage::resize_to_fill`, `image-0.25.10/src/images/dynimage.rs:943-962`,
-            // which calls `.crop(...)` on the scaled image before
-            // returning), so the dimensions-equality check and manual
-            // `crop_imm` fallback that used to live here were dead code
-            // (#36): the `else` branch could never run, since the `if`
-            // condition was always true.
-            (Some(w), Some(h)) => img.resize_to_fill(w, h, filter),
+            (Some(w), Some(h)) => match params.resize_type {
+                // Fit inside the box, preserving aspect ratio - neither
+                // output dimension exceeds `w`/`h`. This is also what a
+                // lone width or height already did above, so `Fit` (the
+                // default, see `ResizeType`) keeps that existing behaviour
+                // consistent once both dimensions are given (#59).
+                ResizeType::Fit => img.resize(w, h, filter),
+                // Cover the box, preserving aspect ratio, then crop the
+                // overflow. `resize_to_fill` already crops to exactly
+                // `w x h` internally (verified against image-0.25.10's
+                // `DynamicImage::resize_to_fill`,
+                // `image-0.25.10/src/images/dynimage.rs:943-962`, which
+                // calls `.crop(...)` on the scaled image before
+                // returning), so no separate manual crop step is needed
+                // here (#36).
+                ResizeType::Fill => img.resize_to_fill(w, h, filter),
+                // Stretch to exactly `w x h`, ignoring aspect ratio.
+                ResizeType::Force => img.resize_exact(w, h, filter),
+                // imgproxy's documented `auto` rule
+                // (https://docs.imgproxy.net/usage/processing#resizing-type):
+                // "if both source and resulting dimensions have the same
+                // orientation (portrait or landscape), imgproxy will use
+                // `fill`. Otherwise, it will use `fit`." A box is treated
+                // as landscape-or-square when width >= height and portrait
+                // otherwise, applied identically to the source and the
+                // requested box so the comparison is consistent.
+                ResizeType::Auto => {
+                    let src_landscape = src_width >= src_height;
+                    let dst_landscape = w >= h;
+                    if src_landscape == dst_landscape {
+                        img.resize_to_fill(w, h, filter)
+                    } else {
+                        img.resize(w, h, filter)
+                    }
+                }
+            },
             (None, None) => img,
         };
 
@@ -675,10 +708,19 @@ mod tests {
     use crate::models::params::ImageFormat as ApiImageFormat;
 
     fn query(width: Option<u32>, height: Option<u32>) -> ResizeQuery {
+        query_with_type(width, height, ResizeType::Fit)
+    }
+
+    fn query_with_type(
+        width: Option<u32>,
+        height: Option<u32>,
+        resize_type: ResizeType,
+    ) -> ResizeQuery {
         ResizeQuery {
             url: "https://images.example.com/photo.jpg".to_string(),
             width,
             height,
+            resize_type,
             format: ApiImageFormat::Jpg,
             blur_sigma: None,
             grayscale: None,
@@ -805,6 +847,229 @@ mod tests {
             (200, 200),
             "enlarge=true should honor the requested (larger than source) output size"
         );
+    }
+
+    /// #59: `fit` scales to fit *inside* the box, preserving aspect ratio -
+    /// neither output dimension exceeds the requested one. 1920x1080
+    /// (16:9) fitted into 800x600 is width-constrained
+    /// (800/1920 < 600/1080), so the result is 800x450, not 800x600 -
+    /// exactly the case #59's bug report measured against imgproxy
+    /// (`rs:fit:800:600` was silently cropped to 800x600 before this fix).
+    #[test]
+    fn fit_scales_to_fit_inside_the_box_preserving_aspect_ratio() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let params = query_with_type(Some(800), Some(600), ResizeType::Fit);
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        assert_eq!(decoded.dimensions(), (800, 450));
+    }
+
+    /// #59: `fill` scales to *cover* the box, preserving aspect ratio, then
+    /// crops the overflow - output is always exactly the requested box.
+    /// This was (and remains) the crate's pre-#59 always-on behaviour for
+    /// `(Some(w), Some(h))`.
+    #[test]
+    fn fill_crops_to_exactly_the_requested_box() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let params = query_with_type(Some(800), Some(600), ResizeType::Fill);
+
+        let (output, _content_type) =
+            ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                .expect("processing should succeed");
+
+        let decoded = image::load_from_memory(&output).expect("output should decode");
+        assert_eq!(decoded.dimensions(), (800, 600));
+    }
+
+    /// #59: `force` stretches to exactly the requested box, ignoring
+    /// aspect ratio entirely - same output *dimensions* as `fill` for this
+    /// box, but different pixel content (uniform stretch vs. crop), so the
+    /// encoded bytes must differ even though both decode to 800x600.
+    #[test]
+    fn force_stretches_ignoring_aspect_ratio_and_differs_from_fill() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let fill_params = query_with_type(Some(800), Some(600), ResizeType::Fill);
+        let force_params = query_with_type(Some(800), Some(600), ResizeType::Force);
+
+        let (fill_output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &fill_params, &config)
+                .expect("fill processing should succeed");
+        let (force_output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &force_params, &config)
+                .expect("force processing should succeed");
+
+        assert_eq!(
+            image::load_from_memory(&fill_output)
+                .expect("fill output should decode")
+                .dimensions(),
+            (800, 600)
+        );
+        assert_eq!(
+            image::load_from_memory(&force_output)
+                .expect("force output should decode")
+                .dimensions(),
+            (800, 600)
+        );
+        assert_ne!(
+            fill_output, force_output,
+            "force (uniform stretch) must produce different bytes than fill (crop), \
+             even though both decode to the same 800x600 dimensions"
+        );
+    }
+
+    /// #59: the same four resize types through a portrait (9:16) source
+    /// rather than the landscape fixture above, guarding against an
+    /// implementation that only handles the width-constrained axis
+    /// correctly. `auto` here takes the `fill` path because both the
+    /// 1080x1920 source and the 600x800 box are portrait (same
+    /// orientation) - see
+    /// <https://docs.imgproxy.net/usage/processing#resizing-type>.
+    #[test]
+    fn portrait_source_through_every_resize_type() {
+        let bytes = fixtures::photo_like_sized(1080, 1920, ImageFormat::Jpeg); // portrait 9:16
+        let config = PerformanceConfig::default();
+
+        let process = |resize_type: ResizeType| {
+            let params = query_with_type(Some(600), Some(800), resize_type);
+            let (output, _content_type) =
+                ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                    .unwrap_or_else(|e| panic!("{resize_type:?} processing should succeed: {e}"));
+            image::load_from_memory(&output)
+                .expect("output should decode")
+                .dimensions()
+        };
+
+        assert_eq!(
+            process(ResizeType::Fit),
+            (450, 800),
+            "fit: height-constrained fit into 600x800"
+        );
+        assert_eq!(
+            process(ResizeType::Fill),
+            (600, 800),
+            "fill: crop to exactly the box"
+        );
+        assert_eq!(
+            process(ResizeType::Force),
+            (600, 800),
+            "force: stretch to exactly the box"
+        );
+        assert_eq!(
+            process(ResizeType::Auto),
+            (600, 800),
+            "auto: same orientation as source -> fill"
+        );
+    }
+
+    /// #59: imgproxy's documented `auto` rule - "if both source and
+    /// resulting dimensions have the same orientation (portrait or
+    /// landscape), imgproxy will use `fill`. Otherwise, it will use
+    /// `fit`." (<https://docs.imgproxy.net/usage/processing#resizing-type>).
+    /// Both branches, proven against the same landscape source: a
+    /// landscape box (matching orientation) takes the `fill` path; a
+    /// portrait box (mismatched orientation) takes the `fit` path.
+    #[test]
+    fn auto_uses_fill_or_fit_depending_on_matching_orientation() {
+        let bytes = fixtures::photo_like(); // 1920x1080, landscape
+        let config = PerformanceConfig::default();
+
+        // Landscape box, same orientation as the source -> fill (crop to
+        // exactly the box).
+        let same_orientation = query_with_type(Some(800), Some(600), ResizeType::Auto);
+        let (output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &same_orientation, &config)
+                .expect("processing should succeed");
+        assert_eq!(
+            image::load_from_memory(&output)
+                .expect("output should decode")
+                .dimensions(),
+            (800, 600),
+            "auto with matching (landscape) orientation should behave like fill"
+        );
+
+        // Portrait box, mismatched orientation -> fit (scale to fit
+        // inside, no crop).
+        let mismatched_orientation = query_with_type(Some(480), Some(800), ResizeType::Auto);
+        let (output, _) = ImageService::process_image_blocking_with_limits(
+            &bytes,
+            &mismatched_orientation,
+            &config,
+        )
+        .expect("processing should succeed");
+        assert_eq!(
+            image::load_from_memory(&output)
+                .expect("output should decode")
+                .dimensions(),
+            (480, 270),
+            "auto with mismatched orientation should behave like fit"
+        );
+    }
+
+    /// #59: a lone width or height must keep resizing aspect-ratio-
+    /// preserving exactly as before #59, regardless of `resize_type` - the
+    /// type only matters once both dimensions are present.
+    #[test]
+    fn single_dimension_resize_is_unaffected_by_resize_type() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+
+        for resize_type in [
+            ResizeType::Fit,
+            ResizeType::Fill,
+            ResizeType::Force,
+            ResizeType::Auto,
+        ] {
+            let params = query_with_type(Some(800), None, resize_type);
+            let (output, _) =
+                ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                    .unwrap_or_else(|e| panic!("{resize_type:?} should succeed: {e}"));
+            let dims = image::load_from_memory(&output)
+                .expect("output should decode")
+                .dimensions();
+            assert_eq!(
+                dims,
+                (800, 450),
+                "width-only resize with type {resize_type:?}"
+            );
+        }
+    }
+
+    /// #59/#36: the upscale guard must hold for every resize type, not
+    /// just the historical always-fill behaviour - each per-axis effective
+    /// dimension is capped at the source's own regardless of which resize
+    /// type ultimately consumes it, so none of them can enlarge past the
+    /// source unless `enlarge` is set.
+    #[test]
+    fn upscale_refused_by_default_for_every_resize_type() {
+        let bytes = fixtures::tiny(); // 64x64
+        let config = PerformanceConfig::default();
+
+        for resize_type in [
+            ResizeType::Fit,
+            ResizeType::Fill,
+            ResizeType::Force,
+            ResizeType::Auto,
+        ] {
+            let params = query_with_type(Some(1000), Some(1000), resize_type);
+            let (output, _) =
+                ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+                    .unwrap_or_else(|e| panic!("{resize_type:?} should succeed: {e}"));
+            let (width, height) = image::load_from_memory(&output)
+                .expect("output should decode")
+                .dimensions();
+            assert!(
+                width <= fixtures::TINY_SIZE && height <= fixtures::TINY_SIZE,
+                "{resize_type:?}: expected output capped at the {0}x{0} source, got {width}x{height}",
+                fixtures::TINY_SIZE
+            );
+        }
     }
 
     /// #30: with the processing semaphore fully saturated (zero permits),
