@@ -28,6 +28,11 @@ pub struct ApiService {
     /// unrestricted.
     #[builder(default = "AllowedOptions::unrestricted()")]
     pub allowed_options: AllowedOptions,
+    /// `/metrics` authentication (#77). Gated behind `otel` like the
+    /// endpoint it protects - see `crate::modules::metrics_auth`.
+    #[cfg(feature = "otel")]
+    #[builder(default = "crate::modules::metrics_auth::MetricsAuthConfig::default()")]
+    pub metrics_auth: crate::modules::metrics_auth::MetricsAuthConfig,
 }
 
 impl ApiService {
@@ -37,6 +42,15 @@ impl ApiService {
         // borrow, so it must run first (fails closed at startup per #27 if
         // signing isn't configured and wasn't explicitly opted out of).
         let signing = SigningConfig::from_env(&config)?;
+
+        // `/metrics` authentication (#77) - fails closed at startup exactly
+        // like `signing` above, and for the same reason: a deployment with
+        // neither a real token nor an explicit opt-out could never tell
+        // "forgot to configure this" apart from "meant to leave it open".
+        // Gated behind `otel` since that's the only build `/metrics` is
+        // ever mounted in (`src/modules/router/router.rs`).
+        #[cfg(feature = "otel")]
+        let metrics_auth = crate::modules::metrics_auth::MetricsAuthConfig::from_env(&config)?;
 
         // Presets (#52) - fails closed at startup (mirrors `signing` above)
         // rather than deferring a broken `PRESETS` value to the first
@@ -100,12 +114,17 @@ impl ApiService {
             ResizeService::with_config(storage_service, cache_service, performance_config)?;
 
         // Create API service
-        let api_service = ApiServiceBuilder::default()
+        let mut api_service_builder = ApiServiceBuilder::default();
+        api_service_builder
             .resize_service(resize_service)
             .signing(signing)
             .presets(presets)
-            .allowed_options(allowed_options)
-            .build()?;
+            .allowed_options(allowed_options);
+
+        #[cfg(feature = "otel")]
+        api_service_builder.metrics_auth(metrics_auth);
+
+        let api_service = api_service_builder.build()?;
 
         Ok(api_service)
     }

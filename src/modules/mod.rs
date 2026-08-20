@@ -1,5 +1,7 @@
 pub mod api;
 pub mod env;
+#[cfg(feature = "otel")]
+pub mod metrics_auth;
 pub mod negotiation;
 pub mod router;
 pub mod signing;

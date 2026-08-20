@@ -425,6 +425,10 @@ mod tests {
             watermark_url: None,
             presets: None,
             allowed_processing_options: None,
+            #[cfg(feature = "otel")]
+            metrics_auth_token: None,
+            #[cfg(feature = "otel")]
+            allow_unauthenticated_metrics: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
@@ -502,6 +506,10 @@ mod tests {
             watermark_url: Some("https://cdn.example.com/logo.png".to_string()),
             presets: None,
             allowed_processing_options: None,
+            #[cfg(feature = "otel")]
+            metrics_auth_token: None,
+            #[cfg(feature = "otel")]
+            allow_unauthenticated_metrics: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
