@@ -302,3 +302,118 @@ makes it obvious that merely constructing a `Compress` selects it.
 Note `encode/jpeg` is not directly comparable to the older tables above —
 this row is `encode/jpeg_baseline`, renamed when the progressive/subsampling
 variants were added alongside it.
+
+## Post-#67 baseline — `main` @ `e65144a` (2026-08-21)
+
+Full re-measurement of both layers after #67 routed full-size JPEG decode
+through mozjpeg. Same command/profile/machine as the sections above
+(darwin/arm64). The two layers were run **sequentially, never concurrently** —
+criterion measures single-threaded codec timings while the k6 harness runs
+three engines plus a load generator, and letting them contend would corrupt
+both sets of numbers invisibly.
+
+### Layer 1 — criterion
+
+| Bench | Value |
+|---|---:|
+| cache_key/generate_key | 1.65 µs |
+| decode/jpeg 640×360 | 820 µs |
+| decode/jpeg 1280×720 | 3.24 ms |
+| decode/jpeg 1920×1080 | 7.20 ms |
+| decode/png 1920×1080 | 14.18 ms |
+| decode/webp 1920×1080 | 24.70 ms |
+| encode/jpeg_baseline | 933 µs |
+| encode/jpeg_444 | 1.27 ms |
+| encode/jpeg_progressive | 17.81 ms |
+| encode/jpeg_444_progressive | 24.44 ms |
+| encode/png | 1.71 ms |
+| encode/webp | 24.26 ms |
+| resize_fir/downscale triangle | 1.15 ms |
+| resize_fir/downscale lanczos3 | 3.43 ms |
+| pipeline photo_like → thumbnail_jpg | 6.17 ms |
+| pipeline flat → resize_png | 8.64 ms |
+| pipeline alpha → resize_webp | 5.42 ms |
+| pipeline photo_4k → large_downscale_thumbnail_jpg | 19.65 ms |
+
+**#67 recovered most of the inherited `zune-jpeg` regression.** 640×360 is back
+to 820 µs against the pre-bump 825 µs, and 1280×720 to 3.24 ms against 3.06 ms.
+1080p reaches 7.20 ms against the original 6.78 ms — roughly 80% of the gap
+closed, with the remainder inside the run-to-run spread of these fixtures.
+
+Two rows that mislead if read without this note:
+
+- **`resize/*` (17.01 ms lanczos3) is not a regression.** It deliberately still
+  calls the old `image`-crate kernel, kept as a stable reference. The shipped
+  path is `resize_fir/*` at 3.43 ms.
+- **`encode/jpeg` became `encode/jpeg_baseline`** when #76 added the progressive
+  variants, so it is not a like-for-like row against the oldest tables. The
+  comparison still holds — both measure the default non-progressive path.
+
+Progressive costs 17.81 ms against baseline's 933 µs, ~19×. That is the
+`JCP_MAX_COMPRESSION` profile, charged only to requests that ask for it.
+
+### Layer 2 — three-way end-to-end
+
+Medians of 3 runs per engine per scenario, 2 VUs, 30 s, 36 combos. **Every one
+of the 18 runs verified `outcome_non2xx`, `outcome_timeout` and
+`outcome_conn_error` all zero.** Figures are per delivered image
+(`iteration_duration`), not per HTTP request — see `bench-imgproxy/README.md`
+for why the per-request view is not comparable across these engines.
+
+**Cold cache**
+
+| engine | p50 | p90 | p99 | images/s | req/image |
+|---|---:|---:|---:|---:|---:|
+| imgproxy | 20.50 | 64.54 | 130.92 | 64.51 | 1.00 |
+| emgr local_fs | 66.82 | 154.36 | 303.57 | 23.56 | 2.00 |
+| emgr s3 | 68.92 | 149.59 | 306.00 | 23.39 | 2.00 |
+
+Gap vs imgproxy — local_fs: p50 **3.26×**, p90 2.39×, p99 2.32×, throughput
+2.74×. s3: p50 3.36×, p90 2.32×, p99 2.34×, throughput 2.76×.
+
+**Warm cache**
+
+| engine | p50 | p90 | p99 | images/s |
+|---|---:|---:|---:|---:|
+| imgproxy | 20.10 | 63.20 | 129.39 | 64.94 |
+| emgr local_fs | **0.39** | **0.50** | **0.77** | **4851.95** |
+| emgr s3 | 0.60 | 0.82 | 1.51 | 3020.46 |
+
+Warm is not a processing comparison: imgproxy has no result cache and
+reprocesses every request.
+
+### #67 moved the cold numbers, against expectation — worth recording why
+
+| Cold, per image | pre-#67 | post-#67 |
+|---|---:|---:|
+| emgr p50 | 75.81 ms | **66.82 ms** (−11.9%) |
+| emgr images/s | 21.72 | **23.56** (+8.5%) |
+| gap vs imgproxy, p50 | 3.65× | **3.26×** |
+
+This was predicted *not* to move, on the reasoning that the harness requests
+resizes and so already used the DCT-scaled mozjpeg path from #63 stage 2. That
+reasoning was wrong, and the error is instructive: **DCT scaling only engages
+when the reduction is ≥2×.** Against the harness's sizes
+(`300x300,640x480,1200x800`) and fixtures (800×600, 1920×1080, 3840×2160),
+three JPEG combos reduce by less than 2× and therefore fell to `scale_num == 8`
+— the old `zune-jpeg` path — the whole time:
+
+- `photo_800x600` → `1200x800` with `el:0`: no resize at all
+- `photo_800x600` → `640x480`: 1.25× down; a 1/2 decode lands below target
+- `photo_1080p` → `1200x800`: 1.6× down; same
+
+Mid-range reductions between 1× and 2× are the gap stage 2 structurally could
+not cover, and they are common in real traffic. "The harness downscales" was
+not the same claim as "the harness downscales enough."
+
+**Warm was predicted to be unchanged, and was** (0.40 → 0.39 ms): a warm hit
+short-circuits to a 301 before any decode runs, so no decoder change can reach
+it. Recorded because the prediction was falsifiable — movement there would have
+meant the warm path was doing decode work it should not.
+
+### Where the remaining cold gap lives
+
+3.26× is not codec cost. emgr's 66.82 ms is process → write to storage → 301 →
+client re-fetches; the same architecture is why warm costs 0.39 ms. The cold
+penalty cannot be removed without giving up the warm win, so which one matters
+is set by production cache-miss rate — a number neither benchmark measures.
