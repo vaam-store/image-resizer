@@ -192,4 +192,20 @@ pub struct EnvConfig {
     /// equivalent: `IMGPROXY_ALLOWED_PROCESSING_OPTIONS`.
     #[envconfig(from = "ALLOWED_PROCESSING_OPTIONS")]
     pub allowed_processing_options: Option<String>,
+
+    // Progressive JPEG / chroma subsampling deployment defaults (#76)
+    /// Deployment-wide default for whether JPEG output is encoded
+    /// progressively when a request's own `jpgo:{progressive}:...` segment
+    /// doesn't say - see `ResizeQuery::jpeg_progressive`. imgproxy
+    /// equivalent: `IMGPROXY_JPEG_PROGRESSIVE`.
+    #[envconfig(from = "JPEG_PROGRESSIVE")]
+    pub jpeg_progressive: Option<bool>,
+
+    /// Deployment-wide default for whether JPEG output keeps full-
+    /// resolution (4:4:4) chroma when a request's own
+    /// `jpgo:{progressive}:{no_subsample}` segment doesn't say - see
+    /// `ResizeQuery::jpeg_no_subsampling`. imgproxy equivalent:
+    /// `IMGPROXY_JPEG_NO_SUBSAMPLING`.
+    #[envconfig(from = "JPEG_NO_SUBSAMPLING")]
+    pub jpeg_no_subsampling: Option<bool>,
 }

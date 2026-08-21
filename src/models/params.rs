@@ -303,6 +303,48 @@ pub struct ResizeQuery {
     /// same as every other format-specific option in this struct.
     pub webp_lossless: Option<bool>,
 
+    // --- #76 additions start: progressive JPEG, chroma subsampling, and
+    // max_bytes. Kept as one contiguous block, mirroring the matching block
+    // in `src/services/cache/handler.rs`'s `generate_key` and
+    // `src/modules/url/options.rs`'s `ProcessingOptions`, so the three stay
+    // easy to cross-reference.
+    /// Encode JPEG output progressively instead of baseline sequential
+    /// (imgproxy's `jpeg_options`/`jpgo:{progressive}:...` option's first
+    /// slot, <https://docs.imgproxy.net/usage/processing#jpeg-options> -
+    /// only the `progressive`/`no_subsample` slots are implemented here,
+    /// see [`crate::modules::url::options::ProcessingOptions::jpeg_progressive`]
+    /// for why). `None` means "use this deployment's configured default"
+    /// (`PerformanceConfig::jpeg_progressive_default`, `JPEG_PROGRESSIVE`
+    /// env var - imgproxy's `IMGPROXY_JPEG_PROGRESSIVE`), resolved in
+    /// `ImageService::encode_single_image`. Meaningless for non-JPEG
+    /// output, same as every other format-specific option on this struct.
+    pub jpeg_progressive: Option<bool>,
+
+    /// Encode JPEG chroma at full resolution (4:4:4) instead of this
+    /// crate's default 4:2:2 (`jpgo:{progressive}:{no_subsample}`'s second
+    /// slot; imgproxy's `IMGPROXY_JPEG_NO_SUBSAMPLING`). `None` means "use
+    /// this deployment's configured default"
+    /// (`PerformanceConfig::jpeg_no_subsampling_default`,
+    /// `JPEG_NO_SUBSAMPLING` env var), same resolution point as
+    /// `jpeg_progressive` above. Meaningless for non-JPEG output.
+    pub jpeg_no_subsampling: Option<bool>,
+
+    /// Maximum encoded output size in bytes (imgproxy's `max_bytes`/
+    /// `mb:{bytes}` option). `None`/`Some(0)`-normalised-to-`None` (`mb`'s
+    /// URL parser follows the same "0 means unset" convention as
+    /// `width`/`height`) means no budget - the encoder just uses whatever
+    /// quality was otherwise resolved. When set, `ImageService` iteratively
+    /// lowers quality (bounded search - see
+    /// `ImageService::encode_with_max_bytes`) until the output fits, or the
+    /// search budget is exhausted, matching imgproxy's own documented
+    /// best-effort behaviour ("automatically degrades the quality... until
+    /// the image size is under the specified amount of bytes"). Only
+    /// applied to JPEG output - see `encode_single_image`'s JPEG branch for
+    /// the cost reasoning (measured against `benches/encode.rs`) behind
+    /// excluding every other format.
+    pub max_bytes: Option<u64>,
+    // --- #76 additions end.
+
     /// Background colour, as an `[R, G, B]` triple (imgproxy's
     /// `background`/`bg:{R}:{G}:{B}` or `bg:{hex}` processing option, #34).
     /// `None` means "use the default" - `ImageService` (`src/services/image/handler.rs`)
@@ -512,6 +554,9 @@ impl Default for ResizeQuery {
             jpeg_quality: None,
             webp_quality: None,
             webp_lossless: None,
+            jpeg_progressive: None,
+            jpeg_no_subsampling: None,
+            max_bytes: None,
             background: None,
             autorotate: true,
             crop: None,

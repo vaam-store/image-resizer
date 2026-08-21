@@ -195,6 +195,15 @@ impl ParsedRequest {
             jpeg_quality: self.options.jpeg_quality,
             webp_quality: self.options.webp_quality,
             webp_lossless: self.options.webp_lossless,
+            // #76: progressive JPEG, chroma subsampling, max_bytes. `None`
+            // for `jpeg_progressive`/`jpeg_no_subsampling` is resolved
+            // against this deployment's configured default later
+            // (`ImageService::encode_single_image`) - not here, since a
+            // `ParsedRequest` has no `PerformanceConfig` to resolve
+            // against.
+            jpeg_progressive: self.options.jpeg_progressive,
+            jpeg_no_subsampling: self.options.jpeg_no_subsampling,
+            max_bytes: self.options.max_bytes,
             background: self.options.background,
             autorotate: self.options.autorotate.unwrap_or(true),
             crop: self.options.crop,
@@ -417,6 +426,34 @@ mod tests {
         assert_eq!(wm.y_offset, 20.0);
         assert_eq!(wm.scale, 0.3);
         assert_eq!(wm.url, None);
+    }
+
+    /// #76: `jpgo`/`mb` round-trip through `into_resize_query` unresolved
+    /// (`jpeg_progressive`/`jpeg_no_subsampling` stay `Option<bool>` -
+    /// deployment-default resolution happens later, in
+    /// `ImageService::encode_single_image`, not here) - same "does the
+    /// wiring actually reach `ResizeQuery`" check every other option gets
+    /// its own dedicated test for.
+    #[test]
+    fn jpeg_options_and_max_bytes_round_trip_into_resize_query() {
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/jpgo:1:1/mb:20000/{encoded}.jpg");
+        let query = split(&path).unwrap().parse().unwrap().into_resize_query();
+
+        assert_eq!(query.jpeg_progressive, Some(true));
+        assert_eq!(query.jpeg_no_subsampling, Some(true));
+        assert_eq!(query.max_bytes, Some(20000));
+    }
+
+    #[test]
+    fn jpeg_options_and_max_bytes_default_to_none_when_absent() {
+        let encoded = b64("https://example.com/img.jpg");
+        let path = format!("/SIG/{encoded}.jpg");
+        let query = split(&path).unwrap().parse().unwrap().into_resize_query();
+
+        assert_eq!(query.jpeg_progressive, None);
+        assert_eq!(query.jpeg_no_subsampling, None);
+        assert_eq!(query.max_bytes, None);
     }
 
     #[test]

@@ -37,6 +37,22 @@ pub struct ProcessingOptions {
     /// `webpo`'s parsed `compression` slot (#35) - see
     /// [`crate::models::params::ResizeQuery::webp_lossless`].
     pub webp_lossless: Option<bool>,
+
+    // --- #76 additions start: progressive JPEG, chroma subsampling,
+    // max_bytes. Kept contiguous, mirroring the matching block in
+    // `crate::models::params::ResizeQuery` and `generate_key`
+    // (`src/services/cache/handler.rs`).
+    /// `jpgo`'s parsed `progressive` slot (#76) - see
+    /// [`crate::models::params::ResizeQuery::jpeg_progressive`].
+    pub jpeg_progressive: Option<bool>,
+    /// `jpgo`'s parsed `no_subsample` slot (#76) - see
+    /// [`crate::models::params::ResizeQuery::jpeg_no_subsampling`].
+    pub jpeg_no_subsampling: Option<bool>,
+    /// `mb`'s parsed `{bytes}` argument (#76) - see
+    /// [`crate::models::params::ResizeQuery::max_bytes`].
+    pub max_bytes: Option<u64>,
+    // --- #76 additions end.
+
     /// `bg`'s parsed `[R, G, B]` triple (#34) - see
     /// [`crate::models::params::ResizeQuery::background`] for how it's
     /// consumed.
@@ -144,6 +160,9 @@ impl Default for ProcessingOptions {
             jpeg_quality: None,
             webp_quality: None,
             webp_lossless: None,
+            jpeg_progressive: None,
+            jpeg_no_subsampling: None,
+            max_bytes: None,
             background: None,
             autorotate: None,
             crop: None,
@@ -293,6 +312,60 @@ impl ProcessingOptions {
                             });
                         }
                     });
+                }
+                // jpgo:{progressive}:{no_subsample} - a deliberately partial
+                // implementation of imgproxy's `jpeg_options`/`jpgo:
+                // {progressive}:{no_subsample}:{trellis_quant}:
+                // {overshoot_deringing}:{optimize_scans}:{quant_table}`
+                // option (#76,
+                // <https://docs.imgproxy.net/usage/processing#jpeg-options>).
+                // Only the first two slots are implemented - `mozjpeg::Compress`
+                // (this crate's only route to progressive/subsampling
+                // control, see `ImageService::encode_jpeg`) has no direct
+                // equivalent of imgproxy's trellis-quantization/overshoot-
+                // deringing/quant-table knobs, so accepting and silently
+                // ignoring those slots would be a worse trap than rejecting
+                // them outright - same reasoning as `webpo`'s partial
+                // implementation just above. Each of the two implemented
+                // slots may be omitted (a shorter segment) or left blank
+                // (`jpgo:1:`) to keep its own default - "use this
+                // deployment's configured default"
+                // (`ResizeQuery::jpeg_progressive`/`jpeg_no_subsampling`),
+                // the same "empty positional argument means use the
+                // default" convention `fl`'s arguments already use.
+                "jpgo" => {
+                    if args.is_empty() || args.len() > 2 {
+                        return Err(UrlParseError::InvalidOptionValue {
+                            option: segment.to_string(),
+                            reason: "expected 1 or 2 arguments: progressive[:no_subsample] \
+                                     (trellis_quant/overshoot_deringing/optimize_scans/\
+                                     quant_table are not supported)"
+                                .to_string(),
+                        });
+                    }
+                    if let Some(progressive) = args.first().filter(|s| !s.is_empty()) {
+                        opts.jpeg_progressive = Some(parse_bool(progressive, segment)?);
+                    }
+                    if let Some(no_subsample) = args.get(1).filter(|s| !s.is_empty()) {
+                        opts.jpeg_no_subsampling = Some(parse_bool(no_subsample, segment)?);
+                    }
+                }
+                // mb:{bytes} - imgproxy's `max_bytes`/`mb` option (#76,
+                // <https://docs.imgproxy.net/usage/processing#max-bytes>).
+                // `0` means "not set", the same convention `rs`'s
+                // width/height slots already use - matches imgproxy's own
+                // documented default of `0` ("no limit"). Only ever
+                // consumed for JPEG output - see
+                // `ImageService::encode_single_image`'s JPEG branch for why
+                // every other format is excluded (cost, or no continuous
+                // quality axis to search over).
+                "mb" => {
+                    let [value] = require_args::<1>(&args, segment)?;
+                    let bytes: u64 = value.parse().map_err(|_| UrlParseError::InvalidOptionValue {
+                        option: segment.to_string(),
+                        reason: format!("{value:?} is not a valid unsigned integer"),
+                    })?;
+                    opts.max_bytes = if bytes == 0 { None } else { Some(bytes) };
                 }
                 "bl" => {
                     let [value] = require_args::<1>(&args, segment)?;
@@ -1085,6 +1158,77 @@ mod tests {
         // than silently ignoring the other two (see the `webpo` match arm's
         // doc comment).
         assert!(ProcessingOptions::parse(&["webpo:lossless::4"]).is_err());
+    }
+
+    // ---- #76: jpgo (progressive/no_subsample), mb (max_bytes) ----
+
+    #[test]
+    fn parses_jpeg_options_progressive_only() {
+        let opts = ProcessingOptions::parse(&["jpgo:1"]).unwrap();
+        assert_eq!(opts.jpeg_progressive, Some(true));
+        assert_eq!(opts.jpeg_no_subsampling, None);
+    }
+
+    #[test]
+    fn parses_jpeg_options_both_slots() {
+        let opts = ProcessingOptions::parse(&["jpgo:1:1"]).unwrap();
+        assert_eq!(opts.jpeg_progressive, Some(true));
+        assert_eq!(opts.jpeg_no_subsampling, Some(true));
+
+        let opts = ProcessingOptions::parse(&["jpgo:0:0"]).unwrap();
+        assert_eq!(opts.jpeg_progressive, Some(false));
+        assert_eq!(opts.jpeg_no_subsampling, Some(false));
+    }
+
+    #[test]
+    fn jpeg_options_empty_slot_keeps_default() {
+        // `jpgo:1:` leaves `no_subsample` at "use the deployment default"
+        // (`None`), same "empty positional argument" convention `fl` uses.
+        let opts = ProcessingOptions::parse(&["jpgo:1:"]).unwrap();
+        assert_eq!(opts.jpeg_progressive, Some(true));
+        assert_eq!(opts.jpeg_no_subsampling, None);
+    }
+
+    #[test]
+    fn jpeg_options_defaults_to_none_when_absent() {
+        let opts = ProcessingOptions::parse(&[]).unwrap();
+        assert_eq!(opts.jpeg_progressive, None);
+        assert_eq!(opts.jpeg_no_subsampling, None);
+    }
+
+    #[test]
+    fn jpeg_options_rejects_empty_and_too_many_arguments() {
+        assert!(ProcessingOptions::parse(&["jpgo"]).is_err());
+        // imgproxy's own 6-slot grammar - this crate only implements the
+        // first two (progressive, no_subsample), and rejects rather than
+        // silently ignoring trellis_quant/overshoot_deringing/
+        // optimize_scans/quant_table (see the `jpgo` match arm's doc
+        // comment).
+        assert!(ProcessingOptions::parse(&["jpgo:1:1:1"]).is_err());
+    }
+
+    #[test]
+    fn parses_max_bytes() {
+        let opts = ProcessingOptions::parse(&["mb:20000"]).unwrap();
+        assert_eq!(opts.max_bytes, Some(20000));
+    }
+
+    #[test]
+    fn max_bytes_zero_means_unset() {
+        let opts = ProcessingOptions::parse(&["mb:0"]).unwrap();
+        assert_eq!(opts.max_bytes, None);
+    }
+
+    #[test]
+    fn max_bytes_defaults_to_none_when_absent() {
+        let opts = ProcessingOptions::parse(&[]).unwrap();
+        assert_eq!(opts.max_bytes, None);
+    }
+
+    #[test]
+    fn max_bytes_rejects_non_integer() {
+        assert!(ProcessingOptions::parse(&["mb:not-a-number"]).is_err());
+        assert!(ProcessingOptions::parse(&["mb:-1"]).is_err());
     }
 
     #[test]
