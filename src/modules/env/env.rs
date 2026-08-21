@@ -192,4 +192,27 @@ pub struct EnvConfig {
     /// equivalent: `IMGPROXY_ALLOWED_PROCESSING_OPTIONS`.
     #[envconfig(from = "ALLOWED_PROCESSING_OPTIONS")]
     pub allowed_processing_options: Option<String>,
+
+    // /metrics authentication (#77, #27 leftover). Gated behind `otel`
+    // like the other Observability variables above - `/metrics` itself is
+    // only ever mounted (`src/modules/router/router.rs`) and only ever
+    // has anything to serve (`prometheus::gather`) when the binary is
+    // built with `--features otel`, so a build without it has no
+    // endpoint to protect and no reason to demand this at startup.
+    /// Bearer token required on every `/metrics` request. Required unless
+    /// `ALLOW_UNAUTHENTICATED_METRICS=true` - matching how `SIGNING_KEY`/
+    /// `SIGNING_SALT` are required unless `ALLOW_UNSIGNED_REQUESTS=true`
+    /// (`src/modules/signing/config.rs`). See
+    /// `src/modules/metrics_auth/config.rs`.
+    #[cfg(feature = "otel")]
+    #[envconfig(from = "METRICS_AUTH_TOKEN")]
+    pub metrics_auth_token: Option<String>,
+
+    /// Opt-in escape hatch: when `true`, `/metrics` is served without
+    /// requiring a bearer token. Default `false` - requiring a token is
+    /// the default, this only ever widens the unauthenticated-access
+    /// escape path (never weakens verification of a real token).
+    #[cfg(feature = "otel")]
+    #[envconfig(from = "ALLOW_UNAUTHENTICATED_METRICS")]
+    pub allow_unauthenticated_metrics: Option<bool>,
 }

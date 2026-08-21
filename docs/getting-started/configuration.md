@@ -137,6 +137,41 @@ these to the bundled Jaeger instance.
 | `OTLP_METRIC_ENDPOINT` | OTLP HTTP endpoint for metrics. | `http://localhost:4318/v1/metrics` |
 | `OTLP_SERVICE_NAME` | Service name reported in traces/metrics. | `rust-app-example` |
 
+### `/metrics` and `/health` authentication
+
+Added under [GH #77](https://github.com/vaam-store/image-resizer/issues/77),
+a leftover from #27's stated scope. `/metrics` is a Prometheus endpoint -
+it exposes request rates, cache hit ratios, error counts and latency
+histograms, which is precise reconnaissance for an attacker probing for
+expensive requests. Mirroring `SIGNING_KEY`/`SIGNING_SALT`
+(see [Signed URLs](#signed-urls) above), requiring a token is the
+default, not opt-in: with neither `METRICS_AUTH_TOKEN` configured nor
+`ALLOW_UNAUTHENTICATED_METRICS=true` set, the process refuses to start
+rather than silently serving traffic telemetry to anyone who asks. This
+only applies to builds with `--features otel` - a build without it never
+mounts `/metrics` at all, so there is nothing to protect and no startup
+check to satisfy.
+
+| Variable | Description | Default |
+|---|---|---|
+| `METRICS_AUTH_TOKEN` | Bearer token `/metrics` requires via `Authorization: Bearer <token>`. Compared in constant time. Required unless `ALLOW_UNAUTHENTICATED_METRICS=true`. Configure the same value in your Prometheus scraper's `authorization` scrape config. | _unset_ |
+| `ALLOW_UNAUTHENTICATED_METRICS` | Opt-in escape hatch: when `true`, `/metrics` is served without requiring a token at all. Does not weaken verification of a real token - it only ever widens the unauthenticated-access escape path. | `false` |
+
+A request with a missing or invalid token gets `401 Unauthorized` with a
+`WWW-Authenticate: Bearer` header, not `403` - unlike signed-URL
+rejection, there's a real credential the caller can supply on a retry.
+
+`/health` is left unauthenticated on purpose, not by oversight: it is the
+target of Kubernetes liveness/readiness/startup probes
+(`helm/serverless/templates/knative-service.yaml`), which hit it directly
+over HTTP and have no practical way to carry a bearer token. It also only
+ever returns the literal string `OK` - none of the traffic/cache/latency
+detail `/metrics` exposes - so the risk the two endpoints present isn't
+comparable. If `/health` ever needs restricting, do it at the network
+layer (an ingress rule or `NetworkPolicy` scoped to the cluster's own
+probe traffic), not with application-layer auth that would break the
+probes it exists to serve.
+
 ## Example `.env` file
 
 See [`.env.example`](https://github.com/vaam-store/image-resizer/blob/main/.env.example)

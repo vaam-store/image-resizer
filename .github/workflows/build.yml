@@ -157,8 +157,47 @@ jobs:
           container="emgr-smoketest-${{ matrix.flavor }}"
 
           docker rm -f "$container" >/dev/null 2>&1 || true
+
+          # otel flavours serve /metrics, which fails closed at startup
+          # unless a token or an explicit opt-out is configured (GH #77,
+          # same shape as ALLOW_UNSIGNED_REQUESTS below). Assert that
+          # refusal here rather than only configuring around it: this is the
+          # one place the property is checked against a real image rather
+          # than a unit test, and it is exactly how this smoke test caught
+          # the change in the first place.
+          case "${{ matrix.flavor }}" in
+            *otel*)
+              # `timeout` matters: if the fail-closed check ever regresses,
+              # this container starts and serves indefinitely, which would
+              # hang the job rather than fail it. 30s is far longer than a
+              # refusing binary needs (it exits in well under a second) and
+              # far shorter than a stuck job. `|| rc=$?` rather than a bare
+              # call because `set -e` is on and a non-zero exit is the
+              # EXPECTED result here.
+              rc=0
+              timeout 30 docker run --rm -e ALLOW_UNSIGNED_REQUESTS=true \
+                "$image" >/tmp/failclosed.log 2>&1 || rc=$?
+
+              if [ "$rc" -eq 0 ]; then
+                echo "::error::${image} started with neither METRICS_AUTH_TOKEN nor ALLOW_UNAUTHENTICATED_METRICS set - /metrics fail-closed startup check (GH #77) is not working."
+                exit 1
+              fi
+              if [ "$rc" -eq 124 ]; then
+                echo "::error::${image} was still running after 30s with neither var set - it did not fail closed (GH #77)."
+                exit 1
+              fi
+              if ! grep -q 'METRICS_AUTH_TOKEN must be set' /tmp/failclosed.log; then
+                echo "::error::${image} refused to start, but not with the expected METRICS_AUTH_TOKEN error - the startup failure has a different cause. Output:"
+                cat /tmp/failclosed.log || true
+                exit 1
+              fi
+              echo "ok: ${image} fails closed on /metrics auth as expected"
+              ;;
+          esac
+
           docker run -d --name "$container" -p 3000:3000 \
             -e ALLOW_UNSIGNED_REQUESTS=true \
+            -e ALLOW_UNAUTHENTICATED_METRICS=true \
             "$image"
 
           cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
