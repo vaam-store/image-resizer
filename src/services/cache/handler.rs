@@ -86,6 +86,30 @@ use sha2::{Digest, Sha256};
 /// the second, independent reason this bump is required rather than merely
 /// tidy: without it, existing entries would keep being served from the old
 /// encoder indefinitely.
+/// **Deliberately NOT bumped for #67** (full-size JPEG decode routed
+/// through mozjpeg instead of zune-jpeg). That change does alter output
+/// bytes for every non-downscaling JPEG request, which is the same
+/// property that justified half of the v9 bump - so the omission is a
+/// decision, not an oversight, and the reasoning is recorded here rather
+/// than left for someone to re-derive:
+///
+/// - It adds no new hashed field, so there is no collision hazard. Nothing
+///   can be served the wrong image; the only effect is that an entry
+///   cached before the change holds bytes from the previous decoder.
+/// - Those bytes are perceptually identical, measured rather than assumed:
+///   DSSIM <= 0.000014 across 36 real-photo fixtures, max per-channel
+///   difference 3/255 - the same order as the `fast_image_resize` kernel
+///   swap this project already accepted as imperceptible.
+/// - A bump invalidates *every* cached entry in *every* format, forcing a
+///   full reprocessing storm on the next request for each. With AVIF
+///   encode measured up to 986 ms (`adr/0004`), that cost is real and
+///   falls entirely on the cold path this project is already 3.65x behind
+///   imgproxy on.
+///
+/// Flushing the whole cache to correct an invisible rounding difference is
+/// a worse trade than letting old entries age out naturally. If a future
+/// change to this path is *perceptible*, that calculus flips and it should
+/// bump.
 const CACHE_KEY_VERSION: u8 = 9;
 
 #[derive(Clone, Builder)]
