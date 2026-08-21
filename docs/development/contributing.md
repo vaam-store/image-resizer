@@ -1,64 +1,94 @@
 # Contributing
 
-Thank you for considering contributing to the Image Resize Service!
+Thank you for considering contributing to `emgr`!
 
-## How to Contribute
+## How to contribute
 
-We welcome contributions in various forms:
+- **Bug reports**: open an issue on GitHub.
+- **Feature requests**: open an issue to discuss it first.
+- **Code contributions**: pull requests are welcome.
+- **Documentation improvements**: if you find a gap or an error, open an
+  issue or a pull request.
 
-- **Bug Reports**: If you find a bug, please open an issue on GitHub.
-- **Feature Requests**: If you have an idea for a new feature, please open an issue to discuss it.
-- **Code Contributions**: Pull requests are welcome!
-- **Documentation Improvements**: If you find any gaps or errors in the documentation, please let us know or submit a pull request.
+## Development setup
 
-## Development Setup
+See [Installation](../getting-started/installation.md) for cloning the
+repository, picking a Cargo feature set (there is no default storage
+backend - `local_fs`/`s3`/`in_memory`, plus `otel` optionally), and the two
+environment variables the service requires before it will start
+(`SIGNING_KEY`/`SIGNING_SALT` or `ALLOW_UNSIGNED_REQUESTS`, and, on `otel`
+builds, `METRICS_AUTH_TOKEN` or `ALLOW_UNAUTHENTICATED_METRICS`).
 
-Please refer to the [Installation](../getting-started/installation.md) guide for setting up your local development environment.
+## Code style
 
-## Code Style
+This project follows standard Rust formatting - run `cargo fmt` before
+submitting a pull request. There's no repo-specific `rustfmt.toml`, so
+`rustfmt`'s defaults apply.
 
-This project follows standard Rust coding conventions. Please run `cargo fmt` to format your code before submitting a pull request.
-
-We also use Clippy for linting:
+Clippy is checked in CI (`.github/workflows/ci.yml`'s `clippy` job), run
+against a single representative feature set:
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --features local_fs --all-targets -- -D warnings
 ```
 
-Refer to the `.clippy.toml` file for specific Clippy configurations.
+That job is currently `continue-on-error: true` (non-blocking) while an
+existing warning backlog (`dead_code`, `collapsible_if`,
+`manual_saturating_arithmetic`, doc-list-item indentation, and a few
+others - run it locally to see the current set) gets cleared - see the
+job's own comment in `ci.yml` for the tracked issue. Still run it locally
+and avoid adding to the backlog; `.clippy.toml` sets stricter-than-default
+`too-many-arguments-threshold` and `cognitive-complexity-threshold`
+because this service decodes attacker-supplied image bytes, and an
+accidental panic in a request path is a denial-of-service primitive - keep
+the bar low enough for new `unwrap()`s to stand out in review.
 
-## Commit Messages
+`cargo-deny` (advisories, licenses, bans, sources - see `deny.toml`) also
+runs in CI and *is* blocking:
 
-Please follow the [Conventional Commits](https://www.conventionalcommits.org/) specification for your commit messages. This helps in automating changelog generation and versioning.
+```bash
+cargo deny check
+```
+
+## Commit messages
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat:`, `fix:`, `perf:`, `docs:`, `chore:`, ...) - this is what the
+project's own history already uses, and it keeps `git log --oneline`
+skimmable for changelog reconstruction.
 
 Example:
 
 ```
-feat: Add support for WEBP output format
+feat: add support for WEBP output format
 
 This commit introduces the ability to output images in WEBP format.
 - Added WEBP encoding option.
 - Updated API documentation.
 ```
 
-## Pull Request Process
+## Pull request process
 
-1.  **Fork the repository** and create your branch from `main`.
-2.  **Make your changes**.
-3.  **Add tests** for your changes.
-4.  **Ensure all tests pass**: `cargo test`.
-5.  **Format your code**: `cargo fmt`.
-6.  **Lint your code**: `cargo clippy`.
-7.  **Commit your changes** using conventional commit messages.
-8.  **Push your branch** to your fork.
-9.  **Open a pull request** to the `main` branch of the original repository.
-
-Please provide a clear description of your changes in the pull request.
-
-## Testing
-
-Refer to the [Testing](./testing.md) guide for more details on how to run and write tests.
+1. **Fork the repository** and create your branch from `main`.
+2. **Make your changes.**
+3. **Add tests** for your changes - see [Testing](testing.md) for the
+   project's actual test patterns (real backends over mocks, tests
+   co-located in `#[cfg(test)]` modules or in `tests/`).
+4. **If you add a new environment variable**, document it in
+   [Configuration](../getting-started/configuration.md) - CI's
+   `docs-env-drift` job (`.github/scripts/check_env_docs.py`) fails the
+   build if `src/modules/env/env.rs` and that page drift apart in either
+   direction.
+5. **Run the relevant test matrix locally** - at minimum the feature set
+   you touched; CI runs all three of `local_fs`, `s3`, and `local_fs,otel`
+   separately (see [Testing](testing.md)).
+6. **Format and lint**: `cargo fmt`, `cargo clippy --features local_fs --all-targets -- -D warnings`, `cargo deny check`.
+7. **Commit** using Conventional Commits.
+8. **Push your branch** to your fork.
+9. **Open a pull request** against `main`, with a clear description of
+   what changed and why.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the [LICENSE](../about/license.md) file.
+By contributing, you agree that your contributions will be licensed under
+the project's [MIT license](../about/license.md).
