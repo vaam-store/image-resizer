@@ -2709,12 +2709,16 @@ impl ImageService {
     }
 
     /// Decodes `image_bytes`, enforcing every guard `decode_with_image_crate`
-    /// carries, with one addition (#63 stage 2): for JPEG, tries a DCT-scaled
-    /// decode through mozjpeg/libjpeg-turbo first, which can decode directly
-    /// at a fraction of the source resolution instead of always decoding
-    /// full-size and discarding most of the data during resize - see
-    /// `decode_jpeg_scaled`'s doc comment for the measured win. PNG and WebP
-    /// are untouched, always going straight to `decode_with_image_crate`.
+    /// carries, with one addition (#63 stage 2, extended by #67): for JPEG,
+    /// tries a decode through mozjpeg/libjpeg-turbo first - DCT-scaled when
+    /// a resize makes a smaller decode safe (decoding directly at a
+    /// fraction of the source resolution instead of always decoding
+    /// full-size and discarding most of the data during resize), full-size
+    /// otherwise. #67 measured mozjpeg's full-size decode ~1.5x faster than
+    /// the `image`-crate/zune-jpeg path too, not just the scaled case #63
+    /// stage 2 covered - see `decode_jpeg_scaled`'s doc comment for the
+    /// measured win either way. PNG and WebP are untouched, always going
+    /// straight to `decode_with_image_crate`.
     ///
     /// If the mozjpeg path fails for any reason - including a caught panic,
     /// see `mozjpeg_decode` - this falls back to `decode_with_image_crate`
@@ -2817,16 +2821,14 @@ impl ImageService {
     ///   repeated here.)
     /// - #33's EXIF orientation and ICC profile are read off it too.
     ///
-    /// If `select_jpeg_dct_scale` decides no DCT reduction is safe/useful
-    /// for this request (`scale_num == 8`), this decoder is then reused
-    /// directly for the actual pixel decode - the exact same
-    /// `image::DynamicImage::from_decoder` call `decode_with_image_crate`
-    /// makes - rather than opening mozjpeg for zero benefit and risking a
-    /// gratuitous pixel-value difference from a second decoder's rounding.
-    /// Only when a real DCT scale is chosen does this drop the `image`-crate
-    /// decoder and hand off to mozjpeg. See `select_jpeg_dct_scale` for how
-    /// the scale factor itself is chosen - the "never decode smaller than
-    /// the target" requirement lives there.
+    /// Every JPEG decode - DCT-scaled or not - hands off to mozjpeg for the
+    /// actual pixel decode (#67): `scale_num == 8` just means
+    /// `mozjpeg_decode` is called with no DCT reduction, rather than the
+    /// `image`-crate/zune-jpeg decoder being reused for that case as it was
+    /// before #67. See the retired-rationale comment at the `drop(decoder)`
+    /// call site below for why, and `select_jpeg_dct_scale` for how the
+    /// scale factor itself is chosen - the "never decode smaller than the
+    /// target" requirement lives there.
     fn decode_jpeg_scaled(
         image_bytes: &[u8],
         max_src_resolution_mp: u64,
@@ -2910,22 +2912,43 @@ impl ImageService {
             raw_target_height,
         );
 
-        // `scale_num == 8` means no DCT reduction is safe/useful for this
-        // request (either no resize was requested at all, or the requested
-        // output is close enough to source resolution that even the
-        // gentlest 1/2 scale would decode below target) - mozjpeg would buy
-        // nothing here, so decode through the already-open `image`-crate
-        // decoder instead of opening a second decoder over the same bytes.
-        // This also keeps output byte-for-byte identical to
-        // `decode_with_image_crate` for every request that isn't actually
-        // downscaling, rather than introducing a second JPEG decoder's
-        // slightly different IDCT/chroma-upsampling rounding into a path
-        // that was never going to benefit from mozjpeg anyway.
-        if scale_num == 8 {
-            let img =
-                image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
-            return Ok((img, orientation, icc_profile));
-        }
+        // RETIRED (#67), keeping the history because the reasoning was
+        // real, not a mistake: this used to special-case `scale_num == 8`
+        // (no DCT reduction is safe/useful for this request - either no
+        // resize was requested at all, or the requested output is close
+        // enough to source resolution that even the gentlest 1/2 scale
+        // would decode below target) by reusing the already-open
+        // `image`-crate decoder instead of opening mozjpeg, on the theory
+        // that mozjpeg would buy nothing for a full-size decode and that
+        // doing so kept output byte-for-byte identical to
+        // `decode_with_image_crate` rather than introducing a second JPEG
+        // decoder's rounding into a path that was never going to benefit.
+        //
+        // Both premises turned out wrong once actually measured (#67, not
+        // assumed): `image` 0.25.10 pulled in `zune-jpeg` 0.5.x, whose
+        // generic `ZByteReaderTrait` redesign made the per-byte
+        // end-of-stream check in its Huffman bit-refill loop fallible
+        // (`reader.eof()?`) where 0.4.x's was an infallible, immutable
+        // `bool` - a real cost paid on every byte of entropy-coded data,
+        // even for zune-jpeg's own in-memory reader. Measured on 36 real
+        // photographs (24-image Kodak corpus + 3 picsum.photos sources x 4
+        // resolutions, 640x360 through 3840x2160 - not the synthetic
+        // gradient-plus-noise fixture `benches/fixtures.rs` uses elsewhere,
+        // per the same reasoning `adr/0003`/`adr/0004` document), mozjpeg's
+        // full-size (`scale(8)`) decode is consistently ~1.5x faster than
+        // the `image`-crate path across every resolution bucket - see this
+        // change's own report for the full table. "Byte-for-byte identical"
+        // was also never a real requirement, just a convenient side effect
+        // of the old code path: mozjpeg's IDCT/chroma-upsampling rounding
+        // differs from zune-jpeg's by at most 3/255 per channel across that
+        // same 36-photo corpus, DSSIM median 0.0000081 / max 0.0000140 -
+        // imperceptible by the same DSSIM bar this project already accepts
+        // elsewhere (the `fast_image_resize` kernel swap at
+        // 0.0000047-0.0000093 and the alpha-fringe fix at 0.0000035, both
+        // in `.bench-baseline/BASELINE.md`'s "Current baseline" section).
+        // Every JPEG decode now goes through the one decoder instead of two
+        // decoders whose selection depended on whether the request
+        // happened to downscale.
         drop(decoder);
 
         let img = Self::mozjpeg_decode(image_bytes, scale_num)?;
@@ -3056,7 +3079,12 @@ impl ImageService {
     /// process. `AssertUnwindSafe` is sound here: `image_bytes` is a shared
     /// `&[u8]` with no interior mutability to leave torn, and `scale_num` is
     /// `Copy`.
-    fn mozjpeg_decode(image_bytes: &[u8], scale_num: u8) -> Result<DynamicImage> {
+    ///
+    /// `pub` (like `encode_webp`/`encode_jpeg` above) so `benches/decode.rs`
+    /// can benchmark the exact path production uses for JPEG (#67) instead
+    /// of the raw `image::load_from_memory_with_format` call that used to
+    /// be representative but, after #67, only reflects PNG/WebP.
+    pub fn mozjpeg_decode(image_bytes: &[u8], scale_num: u8) -> Result<DynamicImage> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::mozjpeg_decode_inner(image_bytes, scale_num)
         }))
@@ -4877,10 +4905,23 @@ mod tests {
     }
 
     /// Lossless WebP (`webp_lossless: Some(true)`) must round-trip the
-    /// source pixels exactly - no resize/blur/grayscale filter applied, and
-    /// a source with no alpha channel so the #34/#60 flatten/normalise
-    /// stage is a no-op, isolating this to purely the encoder's own
-    /// lossless-ness.
+    /// pixels the pipeline actually decoded exactly - no resize/blur/
+    /// grayscale filter applied, and a source with no alpha channel so the
+    /// #34/#60 flatten/normalise stage is a no-op, isolating this to purely
+    /// the encoder's own lossless-ness.
+    ///
+    /// The reference decode must go through the same decoder the pipeline
+    /// uses for this request (#67): `query(None, None)` requests no
+    /// resize, so `decode_jpeg_scaled` picks `scale_num == 8` and decodes
+    /// through `mozjpeg_decode`, not `image::load_from_memory`'s
+    /// zune-jpeg path (that stopped being true once #67 retired the old
+    /// scale_num == 8 special case - see `decode_jpeg_scaled`'s
+    /// retired-rationale comment). The two decoders differ by up to 3/255
+    /// per channel on real photographs - imperceptible, but enough to trip
+    /// a byte-identity assertion if the reference decode used the *other*
+    /// decoder than the one the pipeline actually ran. This test cares
+    /// about the WebP encoder's losslessness, not about which JPEG decoder
+    /// is faster, so `original` is decoded the same way the pipeline does.
     #[test]
     fn webp_lossless_round_trips_byte_identical_pixels() {
         let bytes = fixtures::photo_like(); // 1920x1080, no alpha channel
@@ -4895,7 +4936,7 @@ mod tests {
             ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
                 .expect("processing should succeed");
 
-        let original = image::load_from_memory(&bytes)
+        let original = ImageService::mozjpeg_decode(&bytes, 8)
             .expect("source should decode")
             .to_rgba8();
         let decoded = image::load_from_memory(&output)
@@ -4906,7 +4947,7 @@ mod tests {
         assert_eq!(
             decoded.as_raw(),
             original.as_raw(),
-            "lossless webp round-trip must be byte-identical to the source pixels"
+            "lossless webp round-trip must be byte-identical to the pixels the pipeline decoded"
         );
     }
 
