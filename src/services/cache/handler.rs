@@ -69,7 +69,24 @@ use sha2::{Digest, Sha256};
 /// changes the resize pipeline's output bytes, so two requests differing
 /// only in one of them must not collide onto a v7 key that never hashed
 /// it.
-const CACHE_KEY_VERSION: u8 = 8;
+///
+/// v9 covers #76 (`jpeg_progressive`, `jpeg_no_subsampling`, `max_bytes`).
+/// All three change the encoder's output bytes directly - progressive
+/// rewrites the scan structure, subsampling changes chroma resolution, and
+/// `max_bytes` re-encodes at a lower quality until the result fits - so two
+/// requests differing only in one of them must not collide onto a v8 key
+/// that never hashed it.
+///
+/// #76 additionally re-routes JPEG encoding through `mozjpeg` at its
+/// `JCP_FASTEST` profile, replacing `image::codecs::jpeg::JpegEncoder`.
+/// That changes the produced bytes for *every* JPEG request, including ones
+/// using no new option at all - the output is perceptually equivalent
+/// (measured, not assumed) but not byte-identical. A cached v8 entry is
+/// therefore stale in a way no new hashed field would express, which is
+/// the second, independent reason this bump is required rather than merely
+/// tidy: without it, existing entries would keep being served from the old
+/// encoder indefinitely.
+const CACHE_KEY_VERSION: u8 = 9;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -163,6 +180,35 @@ impl CacheService {
 
         match params.webp_lossless {
             Some(lossless) => Self::update_field(&mut hasher, lossless.to_string().as_bytes()),
+            None => Self::update_field(&mut hasher, b"None"),
+        }
+
+        // #76: `jpeg_progressive`/`jpeg_no_subsampling`/`max_bytes` all
+        // change the JPEG encoder's output bytes directly
+        // (`ImageService::encode_jpeg`/`encode_with_max_bytes`,
+        // `src/services/image/handler.rs`) - progressive vs baseline scan
+        // structure, 4:2:2 vs 4:4:4 chroma sampling, and the quality a
+        // `max_bytes` budget search actually lands on are all part of what
+        // gets encoded, exactly like `quality`/`jpeg_quality` above. Two
+        // requests differing only in one of these three must not collide
+        // onto the same cache key - covered by the v9 `CACHE_KEY_VERSION`
+        // bump (see that constant's own doc comment).
+        match params.jpeg_progressive {
+            Some(progressive) => {
+                Self::update_field(&mut hasher, progressive.to_string().as_bytes())
+            }
+            None => Self::update_field(&mut hasher, b"None"),
+        }
+
+        match params.jpeg_no_subsampling {
+            Some(no_subsampling) => {
+                Self::update_field(&mut hasher, no_subsampling.to_string().as_bytes())
+            }
+            None => Self::update_field(&mut hasher, b"None"),
+        }
+
+        match params.max_bytes {
+            Some(max_bytes) => Self::update_field(&mut hasher, max_bytes.to_string().as_bytes()),
             None => Self::update_field(&mut hasher, b"None"),
         }
 
@@ -667,6 +713,94 @@ mod tests {
             keys.len(),
             3,
             "each distinct webp_lossless value (including unset) must produce a distinct cache key"
+        );
+    }
+
+    /// #76: `jpeg_progressive` changes the JPEG encoder's scan structure
+    /// (`ImageService::encode_jpeg`'s `set_progressive_mode` call), so a
+    /// progressive and a baseline request for otherwise-identical
+    /// parameters must not collide onto the same cache key.
+    #[test]
+    fn jpeg_progressive_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |jpeg_progressive: Option<bool>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            jpeg_progressive,
+            ..Default::default()
+        };
+
+        let keys: HashSet<String> = [None, Some(false), Some(true)]
+            .into_iter()
+            .map(|p| cache.generate_key(&base(p)))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            3,
+            "each distinct jpeg_progressive value (including unset) must produce a distinct cache key"
+        );
+    }
+
+    /// #76: `jpeg_no_subsampling` changes the JPEG encoder's chroma
+    /// sampling (4:2:2 vs 4:4:4), so it must be part of the key like
+    /// `jpeg_progressive` above.
+    #[test]
+    fn jpeg_no_subsampling_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |jpeg_no_subsampling: Option<bool>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            jpeg_no_subsampling,
+            ..Default::default()
+        };
+
+        let keys: HashSet<String> = [None, Some(false), Some(true)]
+            .into_iter()
+            .map(|s| cache.generate_key(&base(s)))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            3,
+            "each distinct jpeg_no_subsampling value (including unset) must produce a distinct cache key"
+        );
+    }
+
+    /// #76: `max_bytes` changes whichever quality `encode_with_max_bytes`'s
+    /// search actually lands on, so distinct budgets (and "no budget" -
+    /// `None`) must not collide.
+    #[test]
+    fn max_bytes_produces_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |max_bytes: Option<u64>| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            max_bytes,
+            ..Default::default()
+        };
+
+        let keys: HashSet<String> = [None, Some(10_000), Some(20_000)]
+            .into_iter()
+            .map(|b| cache.generate_key(&base(b)))
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            3,
+            "each distinct max_bytes value (including unset) must produce a distinct cache key"
         );
     }
 

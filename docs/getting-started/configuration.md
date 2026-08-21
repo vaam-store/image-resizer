@@ -105,6 +105,21 @@ See the [API reference](../user-guide/api-reference.md) for the `wm:`/`wmu:`,
 | `PRESETS` | Preset definitions: comma-separated `{name}={options}` entries, `{options}` itself `/`-separated processing-option segments - e.g. `thumbnail=rs:fill:300:300/q:80,default=el:1`. A preset named `default` is special: it is prepended ahead of every request's own segments automatically, even when the request never names a preset at all. A preset's own definition cannot contain a `pr:` segment (presets don't recurse). imgproxy: *IMGPROXY_PRESETS*. | _unset_ |
 | `ALLOWED_PROCESSING_OPTIONS` | Comma-separated allowlist of processing-option short codes (e.g. `rs,q,pr`) permitted directly in a request URL. Unset/blank means unrestricted. Restricts what a request can do directly - it does **not** apply to options used *inside* a preset's own definition, which is what lets an operator hand out a restricted set of presets while forbidding the raw options they're built from. imgproxy: *IMGPROXY_ALLOWED_PROCESSING_OPTIONS*. | _unset_ (unrestricted) |
 
+## JPEG encoding
+
+Added under [GH #76](https://github.com/vaam-store/image-resizer/issues/76).
+JPEG output is encoded via `mozjpeg`/libjpeg-turbo rather than the `image`
+crate's own encoder, which has no progressive-mode switch and hardcodes
+4:2:2 chroma subsampling. See the [API reference](../user-guide/api-reference.md)
+for the `jpgo:{progressive}:{no_subsample}` and `mb:{bytes}` request-option
+syntax these variables set the deployment-wide default for - a request's
+own `jpgo:` segment always overrides these when present.
+
+| Variable | Description | Default |
+|---|---|---|
+| `JPEG_PROGRESSIVE` | Encode JPEG output progressively (multi-scan) instead of baseline sequential when a request doesn't set `jpgo:`'s `progressive` slot itself. Progressive JPEGs render incrementally and are often, but not always, smaller - see this change's own benchmark report rather than assuming a size win on every image. imgproxy: *IMGPROXY_JPEG_PROGRESSIVE*. | `false` |
+| `JPEG_NO_SUBSAMPLING` | Encode JPEG chroma at full resolution (4:4:4) instead of this crate's default 4:2:2 when a request doesn't set `jpgo:`'s `no_subsample` slot itself. 4:4:4 preserves colour detail on saturated edges (screenshots, logos, text on colour) at the cost of a larger file. imgproxy: *IMGPROXY_JPEG_NO_SUBSAMPLING*. | `false` |
+
 ## Performance tuning
 
 `PERFORMANCE_PROFILE` selects a preset (see

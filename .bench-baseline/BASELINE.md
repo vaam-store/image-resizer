@@ -254,3 +254,51 @@ any code change:
    important architectural advantage for emgr, but not evidence that emgr
    processes images faster. **The cold numbers above are the processing
    comparison, and emgr loses those 3.65x (local_fs) / 3.56x (s3).**
+
+## JPEG encoder cutover — `feat/jpeg-encoder-options` (#76, 2026-08-21)
+
+#76 needed progressive-JPEG and chroma-subsampling control, which
+`image::codecs::jpeg::JpegEncoder` cannot express — its entire public API is
+`new`, `new_with_quality`, `set_pixel_density`, `encode`, `encode_image`,
+with 4:2:2 hardcoded. JPEG encoding therefore moved to `mozjpeg::Compress`
+(already a dependency since #63 stage 2). Same command/profile/machine as
+the sections above.
+
+| Bench | Before (`image` crate) | mozjpeg default profile | mozjpeg `JCP_FASTEST` (shipped) |
+|---|---:|---:|---:|
+| `encode/jpeg` | 3.07 ms | 9.61 ms | **0.95 ms** |
+| `pipeline photo_like → thumbnail_jpg` | 6.32 ms | 7.35 ms | **6.03 ms** |
+
+**The middle column is the trap, and it nearly shipped.** `mozjpeg::Compress::new`
+defaults to the `JCP_MAX_COMPRESSION` profile, whose `jpeg_set_defaults` sets
+`trellis_quant = (compress_profile == JCP_MAX_COMPRESSION)` — independent of
+the progressive toggle, so even non-progressive encodes paid full trellis
+cost. That is a +16% pipeline regression on the most common output format, in
+exchange for options most requests never use, and it would have failed the
+regression gate.
+
+Measured on the Kodak corpus at DSSIM-matched quality (the method in
+`adr/0003`), which is what settled it:
+
+| Encoder | Size | Time | Mean DSSIM @ nominal q75 |
+|---|---:|---:|---:|
+| `image` crate | 1.00× | 1.00× | 0.001678 |
+| mozjpeg `JCP_MAX_COMPRESSION` | 0.88× | 3–8× slower | 0.002236 |
+| mozjpeg `JCP_FASTEST` | 0.95× | 3–4× faster | 0.001787 |
+
+`JCP_FASTEST` beats the old encoder on size *and* speed simultaneously, and
+scores better DSSIM than the max-compression profile at the same nominal
+quality — trellis trades fidelity for size at a fixed quality knob, so
+dropping it does not make output worse. The extra ~7 percentage points of
+compression was not worth 3–8× CPU on every request; explicitly-requested
+progressive output still gets the full profile, because that cost is opted
+into.
+
+**Trap worth recording, alongside the three already in this file:** "mozjpeg
+compresses better than libjpeg" is true and was still the wrong default. The
+claim is about the max-compression profile, and nothing in the crate's API
+makes it obvious that merely constructing a `Compress` selects it.
+
+Note `encode/jpeg` is not directly comparable to the older tables above —
+this row is `encode/jpeg_baseline`, renamed when the progressive/subsampling
+variants were added alongside it.

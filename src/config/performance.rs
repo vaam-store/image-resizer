@@ -65,6 +65,16 @@ pub struct PerformanceConfig {
     /// `ImageService::process_image`. Fetched through the same SSRF guard
     /// as any other source URL.
     pub watermark_url: Option<String>,
+    /// Deployment-wide default for `ResizeQuery::jpeg_progressive` when a
+    /// request's own `jpgo:` segment doesn't set the `progressive` slot
+    /// (#76). `false` (baseline sequential JPEG, matching this crate's
+    /// pre-#76 behaviour) unless `JPEG_PROGRESSIVE` says otherwise.
+    pub jpeg_progressive_default: bool,
+    /// Deployment-wide default for `ResizeQuery::jpeg_no_subsampling` when
+    /// a request's own `jpgo:` segment doesn't set the `no_subsample` slot
+    /// (#76). `false` (4:2:2 chroma, matching this crate's pre-#76
+    /// behaviour) unless `JPEG_NO_SUBSAMPLING` says otherwise.
+    pub jpeg_no_subsampling_default: bool,
 }
 
 impl Default for PerformanceConfig {
@@ -87,6 +97,8 @@ impl Default for PerformanceConfig {
             max_output_height: 4096,
             max_animation_frames: 512,
             watermark_url: None,
+            jpeg_progressive_default: false,
+            jpeg_no_subsampling_default: false,
         }
     }
 }
@@ -112,6 +124,8 @@ impl PerformanceConfig {
             max_output_height: 4096,
             max_animation_frames: 512,
             watermark_url: None,
+            jpeg_progressive_default: false,
+            jpeg_no_subsampling_default: false,
         }
     }
 
@@ -135,6 +149,8 @@ impl PerformanceConfig {
             max_output_height: 4096,
             max_animation_frames: 512,
             watermark_url: None,
+            jpeg_progressive_default: false,
+            jpeg_no_subsampling_default: false,
         }
     }
 
@@ -158,6 +174,8 @@ impl PerformanceConfig {
             max_output_height: 2048,
             max_animation_frames: 128, // tighter than the 512 default, same reasoning as the resolution/size caps above
             watermark_url: None,
+            jpeg_progressive_default: false,
+            jpeg_no_subsampling_default: false,
         }
     }
 
@@ -254,6 +272,14 @@ impl PerformanceConfig {
         if let Some(ref watermark_url) = env_config.watermark_url {
             config.watermark_url = Some(watermark_url.clone());
         }
+
+        if let Some(jpeg_progressive) = env_config.jpeg_progressive {
+            config.jpeg_progressive_default = jpeg_progressive;
+        }
+
+        if let Some(jpeg_no_subsampling) = env_config.jpeg_no_subsampling {
+            config.jpeg_no_subsampling_default = jpeg_no_subsampling;
+        }
     }
 
     /// Parses `ALLOWED_SOURCES`'s comma-separated-prefixes shape (imgproxy's
@@ -318,6 +344,8 @@ impl From<&EnvConfig> for PerformanceConfig {
             max_output_height: env_config.max_output_height.unwrap_or(4096),
             max_animation_frames: env_config.max_animation_frames.unwrap_or(512),
             watermark_url: env_config.watermark_url.clone(),
+            jpeg_progressive_default: env_config.jpeg_progressive.unwrap_or(false),
+            jpeg_no_subsampling_default: env_config.jpeg_no_subsampling.unwrap_or(false),
         }
     }
 }
@@ -425,6 +453,8 @@ mod tests {
             watermark_url: None,
             presets: None,
             allowed_processing_options: None,
+            jpeg_progressive: None,
+            jpeg_no_subsampling: None,
             #[cfg(feature = "otel")]
             metrics_auth_token: None,
             #[cfg(feature = "otel")]
@@ -450,6 +480,8 @@ mod tests {
         assert_eq!(perf_config.max_output_height, 4096);
         assert_eq!(perf_config.max_animation_frames, 512);
         assert_eq!(perf_config.watermark_url, None);
+        assert_eq!(perf_config.jpeg_progressive_default, false);
+        assert_eq!(perf_config.jpeg_no_subsampling_default, false);
     }
 
     #[test]
@@ -506,6 +538,8 @@ mod tests {
             watermark_url: Some("https://cdn.example.com/logo.png".to_string()),
             presets: None,
             allowed_processing_options: None,
+            jpeg_progressive: Some(true),
+            jpeg_no_subsampling: Some(true),
             #[cfg(feature = "otel")]
             metrics_auth_token: None,
             #[cfg(feature = "otel")]
@@ -540,6 +574,8 @@ mod tests {
             perf_config.watermark_url,
             Some("https://cdn.example.com/logo.png".to_string())
         );
+        assert_eq!(perf_config.jpeg_progressive_default, true);
+        assert_eq!(perf_config.jpeg_no_subsampling_default, true);
     }
 
     #[test]

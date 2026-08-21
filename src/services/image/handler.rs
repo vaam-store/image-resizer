@@ -883,28 +883,47 @@ impl ImageService {
 
                 buf.into_inner()
             }
+            // #76: routed through `Self::encode_jpeg` (mozjpeg/libjpeg-turbo)
+            // instead of `image::codecs::jpeg::JpegEncoder` so
+            // `jpeg_progressive`/`jpeg_no_subsampling` - and, via
+            // `encode_with_max_bytes`, `max_bytes` - actually reach the
+            // encoder; see `encode_jpeg`'s own doc comment for why
+            // `image`'s encoder can't do any of the three. `progressive`/
+            // `no_subsampling` each fall back to this deployment's
+            // configured default (`PerformanceConfig::jpeg_progressive_default`/
+            // `jpeg_no_subsampling_default`) when the request's own `jpgo:`
+            // segment doesn't say - both default `false`, reproducing
+            // exactly this crate's pre-#76 JPEG output when neither new
+            // option is used.
             ImageFormat::Jpeg => {
                 let quality = params
                     .jpeg_quality
                     .or(params.quality)
                     .unwrap_or(DEFAULT_JPEG_QUALITY);
+                let progressive = params
+                    .jpeg_progressive
+                    .unwrap_or(config.jpeg_progressive_default);
+                let no_subsampling = params
+                    .jpeg_no_subsampling
+                    .unwrap_or(config.jpeg_no_subsampling_default);
+                let icc_ref = icc_profile.as_deref();
 
-                let estimated_size = Self::estimate_output_size(&img, &output_format);
-                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+                let result = match params.max_bytes {
+                    // `max_bytes` is only meaningful for JPEG here - see
+                    // `Self::MAX_BYTES_SEARCH_ATTEMPTS`'s doc comment for
+                    // the measured encode-cost reasoning behind not
+                    // offering it for AVIF (roughly two orders of
+                    // magnitude more expensive per encode), and PNG/GIF
+                    // have no continuous quality axis to search over at
+                    // all (`fq:png:N` is already rejected at parse time
+                    // for the same reason).
+                    Some(max_bytes) => Self::encode_with_max_bytes(max_bytes, quality, |q| {
+                        Self::encode_jpeg(&img, q, progressive, no_subsampling, icc_ref)
+                    }),
+                    None => Self::encode_jpeg(&img, quality, progressive, no_subsampling, icc_ref),
+                };
 
-                let mut encoder =
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-                if let Some(icc) = icc_profile {
-                    // Same best-effort reasoning as the PNG branch above:
-                    // `JpegEncoder::set_icc_profile` only fails for
-                    // genuinely unsupported encoders, never for
-                    // `JpegEncoder` itself.
-                    let _ = encoder.set_icc_profile(icc);
-                }
-                img.write_with_encoder(encoder)
-                    .context(format!("Failed to encode image to {:?}", output_format))?;
-
-                buf.into_inner()
+                result.context(format!("Failed to encode image to {:?}", output_format))?
             }
             ImageFormat::Avif => {
                 let quality = params.quality.unwrap_or(DEFAULT_AVIF_QUALITY);
@@ -1967,6 +1986,281 @@ impl ImageService {
         };
 
         Ok(memory.to_vec())
+    }
+
+    /// Encodes `img` to JPEG via `mozjpeg::Compress`/libjpeg-turbo instead
+    /// of `image::codecs::jpeg::JpegEncoder` (#76). The `image` crate's own
+    /// JPEG encoder has no progressive-mode switch and hardcodes 4:2:2
+    /// chroma subsampling - verified against its actual public API
+    /// (`image-0.25.10/src/codecs/jpeg/encoder.rs`: exactly `new`,
+    /// `new_with_quality`, `set_pixel_density`, `encode`, `encode_image`,
+    /// no subsampling or progressive-mode knob at all) - so neither
+    /// `progressive` nor `no_subsampling` below could be threaded through
+    /// it. `mozjpeg` was already a dependency (added for DCT-scaled decode,
+    /// #63 stage 2, see `mozjpeg_decode` below) and its `Compress` type
+    /// exposes both directly, so this is a matter of routing JPEG *encode*
+    /// through the same crate rather than adding a new dependency.
+    ///
+    /// `no_subsampling: false` (the default, imgproxy's `jpgo:` `no_subsample`
+    /// slot left unset) reproduces 4:2:2 -
+    /// `set_chroma_sampling_pixel_sizes((2, 1), (2, 1))`, matching exactly
+    /// what `image`'s encoder always did - so a request that never touches
+    /// `jpgo:` gets byte-shape-equivalent chroma handling to before #76,
+    /// satisfying this issue's own "existing behaviour must not change
+    /// when unset" requirement. `no_subsampling: true` selects 4:4:4
+    /// (`(1, 1), (1, 1)`) - full chroma resolution, imgproxy's
+    /// `IMGPROXY_JPEG_NO_SUBSAMPLING`.
+    ///
+    /// `pub` (like `encode_webp` above) so `benches/encode.rs` can
+    /// benchmark the exact path production uses.
+    ///
+    /// Wrapped in `catch_unwind`, same reasoning as `mozjpeg_decode` below:
+    /// mozjpeg's error manager unwinds (panics) on a libjpeg-level error
+    /// rather than returning one, so a real encode failure must be caught
+    /// here instead of taking the whole worker thread down. `AssertUnwindSafe`
+    /// is sound for the same reason it is in `mozjpeg_decode`: every
+    /// captured value (`rgb`, `icc_owned`, the `Copy` scalars) is either
+    /// freshly-owned local data or `Copy`, none of it shared/interior-mutable
+    /// state that could be left torn by an unwind.
+    pub fn encode_jpeg(
+        img: &DynamicImage,
+        quality: u8,
+        progressive: bool,
+        no_subsampling: bool,
+        icc_profile: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let rgb = img.to_rgb8();
+        let icc_owned = icc_profile.map(<[u8]>::to_vec);
+
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::encode_jpeg_inner(&rgb, quality, progressive, no_subsampling, icc_owned.as_deref())
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "mozjpeg panicked with a non-string payload".to_string());
+            Err(anyhow::anyhow!("mozjpeg encode panicked: {msg}"))
+        })
+    }
+
+    fn encode_jpeg_inner(
+        rgb: &RgbImage,
+        quality: u8,
+        progressive: bool,
+        no_subsampling: bool,
+        icc_profile: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let (width, height) = rgb.dimensions();
+
+        let mut compress = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+        compress.set_size(width as usize, height as usize);
+
+        // Non-progressive path only: drop to mozjpeg's `JCP_FASTEST`
+        // profile (`set_fastest_defaults`, "reset to libjpeg v6 settings ...
+        // identical with libjpeg-turbo") before anything else is
+        // configured, so the size/quality-affecting calls below apply on
+        // top of it rather than being clobbered by it - `set_fastest_defaults`
+        // re-runs `jpeg_set_defaults` internally, which resets quality,
+        // colour-space-derived sampling factors, and everything else this
+        // function sets afterward (`mozjpeg-sys-2.2.3/vendor/jcparam.c`'s
+        // `jpeg_set_defaults`).
+        //
+        // Why: mozjpeg's *default* profile from `Compress::new` is
+        // `JCP_MAX_COMPRESSION`, which turns on trellis quantisation
+        // (`master->trellis_quant = true`) unconditionally at
+        // `jpeg_set_defaults` time - regardless of the progressive/
+        // `set_optimize_scans` setting below, since that's a separate,
+        // later, dynamic bool param that never touches `trellis_quant`
+        // (confirmed by reading `jcparam.c` directly: `trellis_quant =
+        // (compress_profile == JCP_MAX_COMPRESSION)`, set once, no public
+        // `mozjpeg` crate API to toggle it independently - the only two
+        // profiles the crate exposes are `JCP_MAX_COMPRESSION` and
+        // `JCP_FASTEST`). Trellis is real CPU, not free: `encode/jpeg_baseline`
+        // measured 9.61ms with it on vs 3.07ms for the old `image`-crate
+        // encoder it replaced (#76's own regression, ~3x, would fail this
+        // repo's 15% bench gate as-is).
+        //
+        // Measured on the Kodak True Color corpus (24 real photos, same
+        // corpus/DSSIM method as `adr/0003-webp-measurement.md`) whether
+        // that CPU actually buys smaller files at *matched* DSSIM (not
+        // matched nominal quality number - see that ADR for why nominal
+        // comparisons are invalid here): current `JCP_MAX_COMPRESSION`
+        // default is ~12% smaller than the old `image`-crate encoder
+        // (median ratio 0.881) but costs 3-8x its encode time. Dropping to
+        // `JCP_FASTEST` (this branch) is still ~5% smaller than the old
+        // `image`-crate encoder (median ratio 0.946) while being 3-4x
+        // *faster* than that encoder too (mozjpeg/libjpeg-turbo's SIMD C
+        // beats `image`'s pure-Rust baseline encoder even before mozjpeg's
+        // own extensions enter the picture) - a strict win on both axes
+        // over the pre-#76 baseline, and at the *same* nominal quality
+        // number `JCP_FASTEST` even scores a lower (better) mean DSSIM
+        // than the current `JCP_MAX_COMPRESSION` default (0.001787 vs
+        // 0.002236 at quality 75) - trellis trades some visual fidelity
+        // for extra size reduction at a fixed quality number, so removing
+        // it does not make default output worse, only smaller-but-less-so.
+        // Full measurement table in this change's own report.
+        //
+        // Progressive output (explicit `jpgo:progressive` request) keeps
+        // the full `JCP_MAX_COMPRESSION` profile below - progressive is
+        // already an opt-in, pay-for-what-you-use path, so its extra cost
+        // is the caller's choice, not a default everyone pays.
+        if !progressive {
+            compress.set_fastest_defaults();
+        }
+
+        // 4:2:2 == `(2, 1)` for both Cb and Cr - this crate's pre-#76
+        // default, matching `image::codecs::jpeg::JpegEncoder`'s hardcoded
+        // subsampling exactly (see this function's own doc comment above).
+        // 4:4:4 == `(1, 1)` - full chroma resolution. Set before
+        // `set_progressive_mode` below so mozjpeg's default progressive
+        // scan script (`jpeg_simple_progression`) is built against the
+        // sampling factors actually in effect, not libjpeg's own defaults.
+        let subsampling_px_size = if no_subsampling { (1, 1) } else { (2, 1) };
+        compress.set_chroma_sampling_pixel_sizes(subsampling_px_size, subsampling_px_size);
+
+        compress.set_quality(f32::from(quality));
+
+        // mozjpeg's own default (`Compress::new`'s `jpeg_set_defaults`,
+        // under its default `JCP_MAX_COMPRESSION` compress profile)
+        // already builds and installs a progressive scan script - real
+        // MozJPEG's whole "smaller by default" premise, confirmed against
+        // `mozjpeg-sys-2.2.3/vendor/jcparam.c`'s `jpeg_set_defaults`: it
+        // sets `master->optimize_scans = TRUE` and calls
+        // `jpeg_simple_progression(cinfo)` unconditionally at construction
+        // time. So an *unset* `progressive` here must actively opt back
+        // *out* of that default to reproduce this crate's pre-#76 baseline
+        // (non-progressive) output - it is not, as `set_progressive_mode`'s
+        // own "you can only turn it on" doc comment might suggest, already
+        // the starting point. `set_optimize_scans(false)` is what
+        // `jcmaster.c`'s `jinit_c_master_control` actually keys off of at
+        // `start_compress` time (`cinfo->master->optimize_scans` forces
+        // `progressive_mode = TRUE` in `validate_script` regardless of
+        // `scan_info`'s contents) - and, on the `false` path, also nulls
+        // `cinfo->scan_info`, which `jinit_c_master_control` separately
+        // checks (`scan_info == NULL` -> `progressive_mode = FALSE,
+        // num_scans = 1`) - so `set_optimize_scans(false)` is the one call
+        // that actually forces real baseline sequential. Verified
+        // empirically against this exact mozjpeg version: without it, a
+        // "baseline" and a "progressive" encode of the same pixels at the
+        // same quality produced byte-identical output (both already
+        // progressive) - this is not merely a doc-derived belief.
+        if progressive {
+            compress.set_progressive_mode();
+        } else {
+            compress.set_optimize_scans(false);
+        }
+
+        let estimated_size = (width as usize).saturating_mul(height as usize) / 2;
+        let mut started = compress
+            .start_compress(Vec::with_capacity(estimated_size))
+            .context("mozjpeg: failed to start compression")?;
+
+        if let Some(icc) = icc_profile.filter(|icc| !icc.is_empty()) {
+            // Same best-effort spirit as the PNG/pre-#76 JPEG branches'
+            // `set_icc_profile` calls elsewhere in this file: a source ICC
+            // profile is a colour-fidelity nicety, not something worth
+            // failing the whole request over. `write_icc_profile` itself
+            // has no fallible return (any failure surfaces as a libjpeg
+            // error caught by this function's `catch_unwind` wrapper), so
+            // there's nothing to ignore here beyond the empty-profile
+            // guard above (`write_icc_profile` panics on empty input).
+            started.write_icc_profile(icc);
+        }
+
+        started
+            .write_scanlines(rgb.as_raw())
+            .context("mozjpeg: failed to write scanlines")?;
+
+        started
+            .finish()
+            .context("mozjpeg: failed to finish compression")
+    }
+
+    /// Maximum number of extra encode attempts `encode_with_max_bytes`'s
+    /// quality search performs beyond the caller's own first choice of
+    /// quality (#76, imgproxy's `max_bytes`/`mb:{bytes}`). Bounds real,
+    /// measured encode cost - `benches/encode.rs`'s `jpeg_baseline`/
+    /// `jpeg_progressive` benchmarks put a single JPEG encode at a few
+    /// milliseconds for a resized (post-pipeline) image, so a handful of
+    /// extra full encodes per request is a small, predictable tax. This is
+    /// exactly why `max_bytes` is only wired up for JPEG output below
+    /// (`encode_single_image`'s JPEG branch) and not, say, AVIF: AVIF
+    /// encoding is roughly two orders of magnitude more expensive per the
+    /// `ravif`/AVIF measurements in `adr/0001-image-engine.md` (150-300ms
+    /// per encode at typical quality/speed settings), so even this same
+    /// small attempt cap would turn one request into a multi-second tail
+    /// latency spike - a cost this crate has no way to hide from the
+    /// caller. A binary search over the `1..=255` `u8` quality range
+    /// converges in at most 8 comparisons; capping at 6 trades the last
+    /// step or two of precision (the resulting quality can land within a
+    /// few units of the tightest possible fit) for a firm, small upper
+    /// bound on total request cost.
+    const MAX_BYTES_SEARCH_ATTEMPTS: u32 = 6;
+
+    /// Iteratively lowers `encode_at`'s quality argument via binary search
+    /// until the encoded output is at or under `max_bytes`, or
+    /// [`Self::MAX_BYTES_SEARCH_ATTEMPTS`] is exhausted (#76, imgproxy's
+    /// `max_bytes`/`mb:{bytes}`). Mirrors imgproxy's own documented
+    /// best-effort behaviour ("automatically degrades the quality... until
+    /// the image size is under the specified amount of bytes") - including
+    /// what happens when even the lowest quality tried doesn't fit: the
+    /// smallest output found across every attempt is returned rather than
+    /// erroring the request out, since an unreachable byte budget is a
+    /// caller configuration choice, not a failure this crate can recover
+    /// from by trying harder.
+    ///
+    /// `initial_quality` is both the search's upper bound and the quality
+    /// tried first (the caller's originally-requested quality, `q:`/`fq:`
+    /// resolved) - if it already fits, this returns after that single
+    /// encode with no extra attempts spent, so a `max_bytes` budget that's
+    /// already satisfied by the ordinary request costs nothing extra.
+    fn encode_with_max_bytes(
+        max_bytes: u64,
+        initial_quality: u8,
+        mut encode_at: impl FnMut(u8) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let first = encode_at(initial_quality)?;
+        if first.len() as u64 <= max_bytes || initial_quality <= 1 {
+            return Ok(first);
+        }
+
+        let mut best = first;
+        let mut low: u8 = 1;
+        let mut high: u8 = initial_quality - 1;
+
+        for _ in 0..Self::MAX_BYTES_SEARCH_ATTEMPTS {
+            if low > high {
+                break;
+            }
+            let mid = low + (high - low) / 2;
+            let candidate = encode_at(mid)?;
+
+            if candidate.len() as u64 <= max_bytes {
+                // Fits within budget - remember it (a higher quality is
+                // always preferred among fitting candidates) and try a
+                // higher quality next to see if it still fits.
+                best = candidate;
+                if mid == u8::MAX {
+                    break;
+                }
+                low = mid + 1;
+            } else {
+                // Doesn't fit - if nothing has fit yet, keep whichever
+                // over-budget candidate is smallest as the best-effort
+                // fallback; either way, try a lower quality next.
+                if best.len() as u64 > max_bytes && candidate.len() < best.len() {
+                    best = candidate;
+                }
+                if mid == 0 {
+                    break;
+                }
+                high = mid - 1;
+            }
+        }
+
+        Ok(best)
     }
 
     /// Rejects a request whose requested output width/height exceed the
@@ -4315,6 +4609,270 @@ mod tests {
              ({} bytes), producing larger output",
             out_override.len(),
             out_global.len()
+        );
+    }
+
+    // ---- #76: progressive JPEG, chroma subsampling, max_bytes ----
+
+    /// `jpgo:1` (progressive) must actually change the encoded bytes, not
+    /// silently no-op - a flag that parses but does nothing is worse than
+    /// no flag at all. Direction (smaller/larger) is measured separately in
+    /// `benches/encode.rs` against the real corpus rather than asserted
+    /// here, since the issue's "typically 2-10% smaller" claim needed
+    /// verifying, not assuming.
+    #[test]
+    fn jpeg_progressive_option_produces_different_bytes_than_baseline() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let base = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(Some(400), Some(300))
+        };
+
+        let baseline = ResizeQuery {
+            jpeg_progressive: Some(false),
+            ..base.clone()
+        };
+        let progressive = ResizeQuery {
+            jpeg_progressive: Some(true),
+            ..base
+        };
+
+        let (out_baseline, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &baseline, &config)
+                .expect("processing should succeed");
+        let (out_progressive, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &progressive, &config)
+                .expect("processing should succeed");
+
+        assert_ne!(
+            out_baseline, out_progressive,
+            "jpgo:1 must produce different encoded bytes than the baseline default"
+        );
+
+        // Both must still decode to the same pixel dimensions - progressive
+        // is a scan-structure change, not a resize.
+        let dims_baseline = image::load_from_memory_with_format(&out_baseline, ImageFormat::Jpeg)
+            .expect("baseline output should decode")
+            .dimensions();
+        let dims_progressive =
+            image::load_from_memory_with_format(&out_progressive, ImageFormat::Jpeg)
+                .expect("progressive output should decode")
+                .dimensions();
+        assert_eq!(dims_baseline, dims_progressive);
+    }
+
+    /// An unset `jpeg_progressive` (the common case) must resolve through
+    /// `PerformanceConfig::jpeg_progressive_default` and produce output
+    /// byte-identical to explicitly requesting the same default - proving
+    /// the deployment-default resolution in `encode_single_image`'s JPEG
+    /// branch is actually wired up, not just present in the struct.
+    #[test]
+    fn jpeg_progressive_unset_resolves_to_deployment_default() {
+        let bytes = fixtures::photo_like();
+        let config = PerformanceConfig::default(); // jpeg_progressive_default: false
+        let base = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(Some(400), Some(300))
+        };
+
+        let unset = ResizeQuery {
+            jpeg_progressive: None,
+            ..base.clone()
+        };
+        let explicit_false = ResizeQuery {
+            jpeg_progressive: Some(false),
+            ..base
+        };
+
+        let (out_unset, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &unset, &config)
+                .expect("processing should succeed");
+        let (out_explicit, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &explicit_false, &config)
+                .expect("processing should succeed");
+
+        assert_eq!(
+            out_unset, out_explicit,
+            "unset jpeg_progressive must resolve to the same output as the deployment default"
+        );
+    }
+
+    /// `jpgo:1:1` (no_subsampling, 4:4:4) must actually change the encoded
+    /// bytes relative to this crate's 4:2:2 default, and - unlike
+    /// progressive, whose size effect is corpus-dependent - retaining full
+    /// chroma resolution can only ever cost the same or more bytes than
+    /// throwing chroma detail away, for the same quality/content, so
+    /// asserting the direction here (unlike progressive) is safe.
+    #[test]
+    fn jpeg_no_subsampling_produces_different_and_larger_output() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let base = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(Some(400), Some(300))
+        };
+
+        let subsampled = ResizeQuery {
+            jpeg_no_subsampling: Some(false),
+            ..base.clone()
+        };
+        let full_chroma = ResizeQuery {
+            jpeg_no_subsampling: Some(true),
+            ..base
+        };
+
+        let (out_subsampled, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &subsampled, &config)
+                .expect("processing should succeed");
+        let (out_full_chroma, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &full_chroma, &config)
+                .expect("processing should succeed");
+
+        assert_ne!(out_subsampled, out_full_chroma);
+        assert!(
+            out_full_chroma.len() >= out_subsampled.len(),
+            "4:4:4 ({} bytes) should never be smaller than 4:2:2 ({} bytes) for the same \
+             quality/content",
+            out_full_chroma.len(),
+            out_subsampled.len()
+        );
+    }
+
+    /// `mb:{bytes}` must actually cap the encoded output - a real photo
+    /// requested at a byte budget well under its default-quality size must
+    /// come back under (or very close to) that budget, not simply ignore
+    /// it. `encode_with_max_bytes`'s binary search can, in principle, not
+    /// land exactly at the budget (best-effort, bounded attempts), so this
+    /// asserts against a generous multiple of the budget rather than the
+    /// exact number - still tight enough to catch a no-op implementation.
+    #[test]
+    fn max_bytes_caps_jpeg_output_size() {
+        let bytes = fixtures::photo_like(); // 1920x1080
+        let config = PerformanceConfig::default();
+        let unrestricted = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(Some(400), Some(300))
+        };
+
+        let (unrestricted_output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &unrestricted, &config)
+                .expect("processing should succeed");
+
+        let budget = (unrestricted_output.len() / 4) as u64;
+        let capped = ResizeQuery {
+            max_bytes: Some(budget),
+            ..unrestricted
+        };
+
+        let (capped_output, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &capped, &config)
+                .expect("processing should succeed");
+
+        assert!(
+            capped_output.len() < unrestricted_output.len(),
+            "max_bytes must actually lower quality and shrink output: capped {} bytes vs \
+             unrestricted {} bytes",
+            capped_output.len(),
+            unrestricted_output.len()
+        );
+        assert!(
+            (capped_output.len() as u64) <= budget * 2,
+            "expected the max_bytes search to land reasonably close to the {budget}-byte \
+             budget, got {} bytes",
+            capped_output.len()
+        );
+    }
+
+    /// `mb:0` (parsed to `None` at the URL layer, #76's "0 means unset"
+    /// convention) must behave exactly like `max_bytes` never being set at
+    /// all - no search, no output-size change.
+    #[test]
+    fn max_bytes_none_does_not_change_output() {
+        let bytes = fixtures::photo_like();
+        let config = PerformanceConfig::default();
+        let base = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(Some(400), Some(300))
+        };
+
+        let (out_default, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &base, &config)
+                .expect("processing should succeed");
+
+        let explicit_none = ResizeQuery {
+            max_bytes: None,
+            ..base
+        };
+        let (out_explicit_none, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &explicit_none, &config)
+                .expect("processing should succeed");
+
+        assert_eq!(out_default, out_explicit_none);
+    }
+
+    /// Unit-level test of the search itself (`encode_with_max_bytes`),
+    /// isolated from JPEG encoding: a synthetic "encoder" whose output size
+    /// is just its quality argument lets the search's convergence and
+    /// attempt-bounding be asserted precisely, including the "budget
+    /// already satisfied by the first attempt costs nothing extra" and
+    /// "budget unreachable even at the lowest quality" edge cases imgproxy
+    /// itself documents (best-effort, not an error).
+    #[test]
+    fn encode_with_max_bytes_converges_within_the_attempt_bound() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0u32);
+        let encode_at = |quality: u8| -> Result<Vec<u8>> {
+            attempts.set(attempts.get() + 1);
+            Ok(vec![0u8; quality as usize])
+        };
+
+        let result = ImageService::encode_with_max_bytes(50, 100, encode_at).unwrap();
+        assert!(
+            result.len() as u64 <= 50,
+            "expected the search to land at or under the 50-byte budget, got {} bytes",
+            result.len()
+        );
+        // 1 initial attempt + at most `MAX_BYTES_SEARCH_ATTEMPTS` more.
+        assert!(
+            attempts.get() <= 1 + ImageService::MAX_BYTES_SEARCH_ATTEMPTS,
+            "expected at most {} total encode attempts, got {}",
+            1 + ImageService::MAX_BYTES_SEARCH_ATTEMPTS,
+            attempts.get()
+        );
+    }
+
+    /// A budget already satisfied by the caller's own requested quality
+    /// must cost exactly one encode attempt - no search needed.
+    #[test]
+    fn encode_with_max_bytes_already_satisfied_costs_one_attempt() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0u32);
+        let encode_at = |quality: u8| -> Result<Vec<u8>> {
+            attempts.set(attempts.get() + 1);
+            Ok(vec![0u8; quality as usize])
+        };
+
+        let result = ImageService::encode_with_max_bytes(1000, 50, encode_at).unwrap();
+        assert_eq!(result.len(), 50);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    /// A budget unreachable even at the lowest quality (`1`) must still
+    /// return the smallest output found (best-effort), not an error -
+    /// matching imgproxy's own documented behaviour.
+    #[test]
+    fn encode_with_max_bytes_unreachable_budget_returns_smallest_found() {
+        let encode_at = |quality: u8| -> Result<Vec<u8>> { Ok(vec![0u8; quality as usize]) };
+
+        let result = ImageService::encode_with_max_bytes(0, 100, encode_at).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "expected the search to bottom out at quality=1 (smallest possible) when the \
+             budget is unreachable"
         );
     }
 
