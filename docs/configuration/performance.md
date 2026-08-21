@@ -1,21 +1,64 @@
 # Performance Configuration
 
-The image resize service now supports configuring performance parameters through environment variables, providing flexibility without requiring code changes.
+Every performance-relevant tunable is set through environment variables, no code changes required. This page is the knobs; for what the mechanisms behind them actually do, see [`PERFORMANCE_OPTIMIZATIONS.md`](../../PERFORMANCE_OPTIMIZATIONS.md); for measured numbers (criterion micro-benchmarks and the end-to-end comparison against imgproxy), see [`.bench-baseline/BASELINE.md`](../../.bench-baseline/BASELINE.md).
 
 ## Environment Variables
 
 ### Basic Performance Settings
 
+All read by `envconfig` in `src/modules/env/env.rs` and converted into a
+`PerformanceConfig` (`src/config/performance.rs`).
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_CONCURRENT_DOWNLOADS` | `20` | Maximum number of concurrent image downloads |
-| `MAX_CONCURRENT_PROCESSING` | CPU count | Maximum number of concurrent image processing tasks |
+| `MAX_CONCURRENT_DOWNLOADS` | `20` | Maximum number of concurrent image downloads (`download_semaphore`) |
+| `MAX_CONCURRENT_PROCESSING` | CPU count | Maximum number of concurrent decode/resize/encode tasks (`processing_semaphore`, #30) |
 | `HTTP_TIMEOUT_SECS` | `30` | HTTP client timeout in seconds |
-| `MAX_IMAGE_SIZE_MB` | `50` | Maximum image size in megabytes |
-| `CPU_THREAD_POOL_SIZE` | CPU count | Size of the CPU thread pool for image processing |
-| `ENABLE_HTTP2` | `true` | Enable HTTP/2 for downloads |
+| `MAX_IMAGE_SIZE_MB` | `50` | Maximum source image size in megabytes, enforced per downloaded chunk (#22) |
+| `CPU_THREAD_POOL_SIZE` | CPU count | Advisory only - see the note below |
+| `ENABLE_HTTP2` | `true` in code's own `Default`/preset values, but **`false`** in practice when unset - see the note below | Enable HTTP/2 for downloads |
 | `CONNECTION_POOL_SIZE` | `50` | Connection pool size per host |
 | `KEEP_ALIVE_TIMEOUT_SECS` | `60` | Keep-alive timeout for connections in seconds |
+
+> **`ENABLE_HTTP2` default discrepancy, verified against
+> `src/config/performance.rs`:** `PerformanceConfig::default()` and the
+> `high_throughput`/`low_latency` presets below all set `enable_http2:
+> true`. But the code path actually used at startup with no
+> `PERFORMANCE_PROFILE` set - the fallback arm of `impl From<&EnvConfig>
+> for PerformanceConfig` - reads `env_config.enable_http2.unwrap_or(false)`.
+> A deployment that sets neither `PERFORMANCE_PROFILE` nor `ENABLE_HTTP2`
+> therefore runs with HTTP/2 **disabled**, not enabled as every other
+> default in this file would suggest. Set `ENABLE_HTTP2=true` explicitly if
+> you want it and aren't using one of the profiles below (both of which set
+> it via their own struct literal, independent of this fallback).
+>
+> **`CPU_THREAD_POOL_SIZE` is read and stored (`PerformanceConfig::cpu_thread_pool_size`,
+> exposed via `get_cpu_thread_pool_size()`) but nothing in `src/` currently
+> calls `get_cpu_thread_pool_size()`** - CPU-bound work runs on Tokio's own
+> blocking-task pool via `spawn_blocking`, gated by `MAX_CONCURRENT_PROCESSING`'s
+> semaphore, not a separately-sized pool. Setting this variable is
+> harmless but currently has no effect; `MAX_CONCURRENT_PROCESSING` is the
+> variable that actually bounds CPU concurrency.
+
+### Router-level saturation and rate limiting
+
+A second, independent set of knobs bounds total request concurrency and
+per-IP request rate at the router (`src/modules/router/middlewares.rs`,
+#43) - separate from `MAX_CONCURRENT_PROCESSING` above, which only bounds
+the CPU-bound stage of an already-admitted request. These are read
+directly from the process environment (not via `envconfig`/`EnvConfig`),
+so `docs-env-drift` CI's `EnvConfig`-vs-`.env.example` check does not cover
+them - they are documented here instead.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_CONCURRENT_REQUESTS` | `512` | Total requests handled concurrently across all routes. Beyond this, a request is shed with `503` immediately rather than queued. |
+| `REQUEST_TIMEOUT_SECS` | `30` | Hard ceiling on end-to-end request time; a request still running past this is shed with `503`. |
+| `RATE_LIMIT_BURST` | `20` | Per-IP token-bucket burst size before rate limiting engages. |
+| `RATE_LIMIT_PERIOD_MS` | `100` | Per-IP token-bucket refill period (default: one additional request roughly every 100ms, i.e. ~10 req/s sustained per IP). |
+
+A `0` value for any of the four is treated as unset (falls back to the
+default above) rather than as a literal zero limit.
 
 ### Performance Profiles
 
@@ -101,15 +144,6 @@ export MAX_IMAGE_SIZE_MB=10
 - `CONNECTION_POOL_SIZE`: 10
 - `KEEP_ALIVE_TIMEOUT_SECS`: 30
 
-## Migration from Hardcoded Configuration
-
-Previously, performance settings were hardcoded in the application. With this update:
-
-1. **Default behavior remains the same** - if no environment variables are set, the service uses the same defaults as before
-2. **Gradual migration** - you can override individual settings without changing everything at once
-3. **Profile-based configuration** - use predefined profiles for common use cases
-4. **Fine-tuning** - combine profiles with individual overrides for optimal performance
-
 ## Monitoring and Tuning
 
 Monitor your application's performance metrics to determine optimal settings:
@@ -127,16 +161,36 @@ The included benchmark tool is now fully configurable through environment variab
 
 ### Benchmark Environment Variables
 
+Source of truth: `src/bin/benchmark.rs`'s `BenchmarkConfig`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BENCHMARK_HOST` | `localhost` | Target host for benchmark requests |
-| `BENCHMARK_PORT` | `3000` | Target port for benchmark requests |
+| `BENCHMARK_HOST` | `localhost` | Target host of the service under test |
+| `BENCHMARK_PORT` | `3000` | Target port of the service under test |
 | `BENCHMARK_CONCURRENCY_LEVELS` | `1,5,10,20,50` | Comma-separated list of concurrency levels to test |
-| `BENCHMARK_TEST_URLS` | `https://picsum.photos/...` | Comma-separated list of test image URLs |
+| `BENCHMARK_REQUESTS_PER_LEVEL` | `200` | Timed requests run at each concurrency level - the sample size percentiles (especially p99.9) are computed from |
+| `BENCHMARK_WARMUP_REQUESTS` | `10` | Requests run and discarded before each level is timed, so every level is measured warm |
+| `BENCHMARK_FIXTURE_NAMES` | `photo_like,flat,alpha,tiny` | Comma-separated list of generated fixtures (see `benches/fixtures.rs`) to rotate through as source images |
 | `BENCHMARK_RESIZE_PARAMS` | `300x300,800x,x600,1200x800` | Comma-separated list of resize parameters (format: `WIDTHxHEIGHT`) |
 | `BENCHMARK_WAIT_BETWEEN_TESTS` | `2` | Seconds to wait between different concurrency level tests |
-| `BENCHMARK_REQUEST_TIMEOUT` | `30` | Request timeout in seconds |
-| `BENCHMARK_OUTPUT_FORMAT` | `jpg` | Output image format for resize requests |
+| `BENCHMARK_REQUEST_TIMEOUT` | `60` | Per-request timeout in seconds |
+| `BENCHMARK_OUTPUT_FORMAT` | `jpg` | Output image format for resize requests (`jpg`\|`png`\|`webp`\|`avif`\|`gif`) |
+| `BENCHMARK_FIXTURE_HOST` | `127.0.0.1` | Bind address of the local fixture-serving HTTP origin the benchmark starts inside its own process |
+| `BENCHMARK_FIXTURE_PORT` | `0` (random free port) | Port for the local fixture origin above |
+| `BENCHMARK_JSON_OUTPUT` | `target/benchmark-results.json` | Path to write the machine-readable JSON report to, alongside the human-readable table |
+
+The benchmark no longer fetches source images over the network. It used to
+pull real photos from `picsum.photos` via a `BENCHMARK_TEST_URLS` variable;
+that variable is gone. Test images are now served from a tiny local axum
+server this binary starts inside its own process, using the same
+deterministic, generated fixture corpus the criterion benches use
+(`benches/fixtures.rs`) - so the "origin" the target service downloads from
+adds no internet variance to the results, and a benchmark run needs no
+network access at all. Redirects are still followed end-to-end (the target
+service's `301` to its own storage-backed URL, `reqwest`'s default policy),
+so a benchmark run against a real deployment still measures the full
+download → process → upload → redirect → re-fetch path, not just the
+redirect hop.
 
 ### Resize Parameters Format
 
@@ -170,10 +224,11 @@ export BENCHMARK_REQUEST_TIMEOUT=60
 cargo run --bin benchmark
 ```
 
-#### Custom Test Images
+#### Custom Fixtures And Output Format
 ```bash
-# Use your own test images
-export BENCHMARK_TEST_URLS="https://example.com/image1.jpg,https://example.com/image2.png,https://example.com/image3.webp"
+# Choose which generated fixtures to rotate through (see benches/fixtures.rs
+# for the full set) and a different output format
+export BENCHMARK_FIXTURE_NAMES="photo_like,alpha"
 export BENCHMARK_RESIZE_PARAMS="100x100,500x500,1000x,x800"
 export BENCHMARK_OUTPUT_FORMAT=webp
 cargo run --bin benchmark
@@ -190,12 +245,12 @@ cargo run --bin benchmark
 
 ### Benchmark Output
 
-The benchmark provides detailed performance metrics:
-- **Successful requests** - Number of successful vs total requests
-- **Total time** - Time taken for all requests at each concurrency level
-- **Requests/sec** - Throughput measurement
-- **Throughput** - Data transfer rate in MB/s
-- **Response times** - Average, minimum, and maximum response times
+For each concurrency level, the benchmark prints:
+- **Request outcomes** - counts broken down by success, non-2xx, timeout, and connection error, not a single pass/fail count
+- **Duration and throughput** - total wall-clock time for the level and the resulting requests/sec
+- **Latency percentiles (successes only)** - mean, min, max, p50, p90, p99, and p99.9, in milliseconds
+
+It also writes a machine-readable JSON report (`BENCHMARK_JSON_OUTPUT`, default `target/benchmark-results.json`) with the same data, so CI can diff runs over time.
 
 ### Integration with Performance Profiles
 
