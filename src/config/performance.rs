@@ -455,6 +455,10 @@ mod tests {
             allowed_processing_options: None,
             jpeg_progressive: None,
             jpeg_no_subsampling: None,
+            #[cfg(feature = "otel")]
+            metrics_auth_token: None,
+            #[cfg(feature = "otel")]
+            allow_unauthenticated_metrics: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);
@@ -536,6 +540,10 @@ mod tests {
             allowed_processing_options: None,
             jpeg_progressive: Some(true),
             jpeg_no_subsampling: Some(true),
+            #[cfg(feature = "otel")]
+            metrics_auth_token: None,
+            #[cfg(feature = "otel")]
+            allow_unauthenticated_metrics: None,
         };
 
         let perf_config = PerformanceConfig::from(&env_config);

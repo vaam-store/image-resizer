@@ -30,9 +30,27 @@ env:
 
 jobs:
   test:
-    name: Test (local_fs)
+    # One job per feature set. Previously this ran `local_fs` only, which
+    # meant the `s3` feature's entire test suite never ran in CI at all -
+    # that is how a completely non-starting `s3` image (GLIBC_2.38 against a
+    # Debian 12 runtime) reached a release build unnoticed. `otel` was worse
+    # than untested: it gates `/metrics`, so the auth added in GH #77 had no
+    # CI coverage whatsoever on the endpoint it protects.
+    #
+    # `--no-default-features` is deliberate. `default = []` today, so it is
+    # currently a no-op, but without it a future non-empty default would
+    # silently pull `local_fs` into the `s3` job and stop these from being
+    # the isolated feature sets they claim to be.
+    name: Test (${{ matrix.features }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - local_fs
+          - s3
+          - local_fs,otel
     steps:
       - uses: actions/checkout@v4
 
@@ -40,10 +58,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-local_fs
+          key: test-${{ matrix.features }}
 
-      - name: cargo test --features local_fs
-        run: cargo test --features local_fs --all-targets
+      - name: cargo test --no-default-features --features ${{ matrix.features }}
+        run: |
+          cargo test --no-default-features \
+            --features ${{ matrix.features }} --all-targets
 
   clippy:
     name: Clippy (non-blocking - TODO GH #46)
