@@ -2057,6 +2057,59 @@ impl ImageService {
         let mut compress = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
         compress.set_size(width as usize, height as usize);
 
+        // Non-progressive path only: drop to mozjpeg's `JCP_FASTEST`
+        // profile (`set_fastest_defaults`, "reset to libjpeg v6 settings ...
+        // identical with libjpeg-turbo") before anything else is
+        // configured, so the size/quality-affecting calls below apply on
+        // top of it rather than being clobbered by it - `set_fastest_defaults`
+        // re-runs `jpeg_set_defaults` internally, which resets quality,
+        // colour-space-derived sampling factors, and everything else this
+        // function sets afterward (`mozjpeg-sys-2.2.3/vendor/jcparam.c`'s
+        // `jpeg_set_defaults`).
+        //
+        // Why: mozjpeg's *default* profile from `Compress::new` is
+        // `JCP_MAX_COMPRESSION`, which turns on trellis quantisation
+        // (`master->trellis_quant = true`) unconditionally at
+        // `jpeg_set_defaults` time - regardless of the progressive/
+        // `set_optimize_scans` setting below, since that's a separate,
+        // later, dynamic bool param that never touches `trellis_quant`
+        // (confirmed by reading `jcparam.c` directly: `trellis_quant =
+        // (compress_profile == JCP_MAX_COMPRESSION)`, set once, no public
+        // `mozjpeg` crate API to toggle it independently - the only two
+        // profiles the crate exposes are `JCP_MAX_COMPRESSION` and
+        // `JCP_FASTEST`). Trellis is real CPU, not free: `encode/jpeg_baseline`
+        // measured 9.61ms with it on vs 3.07ms for the old `image`-crate
+        // encoder it replaced (#76's own regression, ~3x, would fail this
+        // repo's 15% bench gate as-is).
+        //
+        // Measured on the Kodak True Color corpus (24 real photos, same
+        // corpus/DSSIM method as `adr/0003-webp-measurement.md`) whether
+        // that CPU actually buys smaller files at *matched* DSSIM (not
+        // matched nominal quality number - see that ADR for why nominal
+        // comparisons are invalid here): current `JCP_MAX_COMPRESSION`
+        // default is ~12% smaller than the old `image`-crate encoder
+        // (median ratio 0.881) but costs 3-8x its encode time. Dropping to
+        // `JCP_FASTEST` (this branch) is still ~5% smaller than the old
+        // `image`-crate encoder (median ratio 0.946) while being 3-4x
+        // *faster* than that encoder too (mozjpeg/libjpeg-turbo's SIMD C
+        // beats `image`'s pure-Rust baseline encoder even before mozjpeg's
+        // own extensions enter the picture) - a strict win on both axes
+        // over the pre-#76 baseline, and at the *same* nominal quality
+        // number `JCP_FASTEST` even scores a lower (better) mean DSSIM
+        // than the current `JCP_MAX_COMPRESSION` default (0.001787 vs
+        // 0.002236 at quality 75) - trellis trades some visual fidelity
+        // for extra size reduction at a fixed quality number, so removing
+        // it does not make default output worse, only smaller-but-less-so.
+        // Full measurement table in this change's own report.
+        //
+        // Progressive output (explicit `jpgo:progressive` request) keeps
+        // the full `JCP_MAX_COMPRESSION` profile below - progressive is
+        // already an opt-in, pay-for-what-you-use path, so its extra cost
+        // is the caller's choice, not a default everyone pays.
+        if !progressive {
+            compress.set_fastest_defaults();
+        }
+
         // 4:2:2 == `(2, 1)` for both Cb and Cr - this crate's pre-#76
         // default, matching `image::codecs::jpeg::JpegEncoder`'s hardcoded
         // subsampling exactly (see this function's own doc comment above).
