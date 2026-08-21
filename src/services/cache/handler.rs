@@ -70,21 +70,23 @@ use sha2::{Digest, Sha256};
 /// only in one of them must not collide onto a v7 key that never hashed
 /// it.
 ///
-/// NOT bumped for #76 (progressive JPEG, chroma subsampling, `max_bytes`):
-/// `generate_key` below already hashes all three new fields (same
-/// output-affecting reasoning as every prior bump), but the version
-/// constant itself is deliberately left at v8 here - a concurrently-landing
-/// change may add its own hashed field around the same time, and bumping
-/// per-PR would either collide or waste a version number. Whoever
-/// integrates this leaves every v8 entry produced *without* these three
-/// fields hashed at all sitting behind a key that a post-#76 request would
-/// now compute differently anyway (the byte stream changed, even though
-/// the version byte didn't) - safe (no wrong-output serving, just an
-/// extra cache miss - see `generate_key`'s own doc comment on length-
-/// prefixed fields for why differing byte streams can't collide) but not
-/// free, so the actual version bump should still happen once, covering
-/// this and whatever else lands alongside it.
-const CACHE_KEY_VERSION: u8 = 8;
+/// v9 covers #76 (`jpeg_progressive`, `jpeg_no_subsampling`, `max_bytes`).
+/// All three change the encoder's output bytes directly - progressive
+/// rewrites the scan structure, subsampling changes chroma resolution, and
+/// `max_bytes` re-encodes at a lower quality until the result fits - so two
+/// requests differing only in one of them must not collide onto a v8 key
+/// that never hashed it.
+///
+/// #76 additionally re-routes JPEG encoding through `mozjpeg` at its
+/// `JCP_FASTEST` profile, replacing `image::codecs::jpeg::JpegEncoder`.
+/// That changes the produced bytes for *every* JPEG request, including ones
+/// using no new option at all - the output is perceptually equivalent
+/// (measured, not assumed) but not byte-identical. A cached v8 entry is
+/// therefore stale in a way no new hashed field would express, which is
+/// the second, independent reason this bump is required rather than merely
+/// tidy: without it, existing entries would keep being served from the old
+/// encoder indefinitely.
+const CACHE_KEY_VERSION: u8 = 9;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -189,11 +191,8 @@ impl CacheService {
         // `max_bytes` budget search actually lands on are all part of what
         // gets encoded, exactly like `quality`/`jpeg_quality` above. Two
         // requests differing only in one of these three must not collide
-        // onto the same cache key - added here per this change's own
-        // requirements; NOT yet covered by a `CACHE_KEY_VERSION` bump (see
-        // that constant's own doc comment - left for a single integrator
-        // bump alongside any other concurrently-landing change that also
-        // needs one, rather than each claiming its own number).
+        // onto the same cache key - covered by the v9 `CACHE_KEY_VERSION`
+        // bump (see that constant's own doc comment).
         match params.jpeg_progressive {
             Some(progressive) => {
                 Self::update_field(&mut hasher, progressive.to_string().as_bytes())
