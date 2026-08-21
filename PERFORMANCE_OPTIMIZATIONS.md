@@ -17,8 +17,17 @@ commands given.
 
 - **Connection pooling**: `reqwest::Client` reuses connections, with a
   configurable pool size per host (`connection_pool_size`, default 50).
-- **HTTP/2**: enabled by default (`enable_http2`); reqwest negotiates it via
-  ALPN when the origin supports it.
+- **HTTP/2**: configurable (`enable_http2`); reqwest negotiates it via ALPN
+  when the origin supports it. Note: `PerformanceConfig::default()` and the
+  `high_throughput`/`low_latency` presets all set this `true`, but the
+  plain (no `PERFORMANCE_PROFILE`) construction path actually used at
+  startup - `PerformanceConfig::from(&EnvConfig)`'s fallback branch,
+  `src/config/performance.rs` - defaults an unset `ENABLE_HTTP2` to
+  `false`, not `true`. A deployment that never sets `ENABLE_HTTP2` and
+  never sets `PERFORMANCE_PROFILE` therefore runs with HTTP/2 off, despite
+  every other default in this codebase agreeing on `true`. See
+  `docs/configuration/performance.md` for the same discrepancy documented
+  against the full settings table.
 - **Keep-alive / timeouts**: both configurable (`keep_alive_timeout`,
   `http_timeout`), applied per request via a client pinned to the
   already-validated `(host, addr)` pair (`ImageService::build_pinned_client`,
@@ -28,9 +37,23 @@ commands given.
 
 ## Concurrency bounds
 
-Two independent semaphores bound the two expensive stages, each shedding
-load with a distinguishable error rather than queueing unboundedly:
+Three independent bounds shed load with a distinguishable error rather than
+queue unboundedly, at three different layers of the request:
 
+- **Router-level total concurrency**: `saturation_and_timeout_middleware`
+  (`src/modules/router/middlewares.rs`, #43) wraps every route in a
+  fixed-size `tokio::sync::Semaphore` (`MAX_CONCURRENT_REQUESTS`, default
+  512) plus a `tokio::time::timeout` (`REQUEST_TIMEOUT_SECS`, default 30s).
+  A non-blocking `try_acquire_owned()` sheds with `503` the instant the
+  service is at capacity, standing in for
+  `tower::limit::ConcurrencyLimitLayer` + `tower_http::timeout::TimeoutLayer`
+  (neither `tower`'s `limit`/`load-shed` nor tower-http's `timeout` feature
+  is enabled in this workspace's `Cargo.toml`). A per-IP token-bucket rate
+  limiter (`tower_governor`, `RATE_LIMIT_BURST`/`RATE_LIMIT_PERIOD_MS`,
+  default 20 burst / 100ms refill) sits in front of it. These four
+  variables are read directly from the process environment in
+  `middlewares.rs`, not via `EnvConfig`/`envconfig` like the rest of this
+  document's variables - see `docs/configuration/performance.md`.
 - **Downloads**: `download_semaphore`, sized from `max_concurrent_downloads`
   (default 20), acquired with a blocking `.acquire()` in `download_image` -
   a download that can't get a permit right away waits for one, since a
@@ -47,6 +70,18 @@ load with a distinguishable error rather than queueing unboundedly:
   concurrent calls to `process_image`, so the real limiting factor was
   whatever ran the CPU stage.
 
+Separately from all three, **single-flight request coalescing**
+(`src/services/resize/handler.rs`, #37) means concurrent callers asking for
+the *same cache key* never multiply load in the first place: once a cache
+miss is confirmed, the first caller becomes the leader (registered in a
+`dashmap`-backed in-flight map) and does the real download/process/upload
+work; every other concurrent caller for that key subscribes to a
+`tokio::sync::broadcast` channel and receives the leader's result instead of
+running its own. An `InFlightGuard` with a `Drop` impl guarantees followers
+are unblocked (with a synthetic failure) even if the leader panics or its
+future is cancelled mid-flight, so a dead leader can never leave a follower
+waiting forever.
+
 ### Why `tokio::task::spawn_blocking`, not a custom rayon pool
 
 The CPU stage used to run on a hand-rolled `rayon::ThreadPool`
@@ -62,9 +97,11 @@ the runtime. `process_image` now moves the decode/resize/encode work onto
 `tokio::task::spawn_blocking`, gated by the `processing_semaphore` above, and
 still off the async runtime's own worker threads.
 
-`rayon` remains listed in `Cargo.toml` as a dependency (this document's
-owner does not have permission to edit `Cargo.toml` in the change that
-removed its last use) but nothing in `src/` references it any more.
+`rayon` is no longer a dependency at all - it has been removed from
+`Cargo.toml` entirely (`grep -c '^rayon' Cargo.toml` returns 0). It still
+appears, transitively, in `Cargo.lock` (pulled in by other dependencies
+unrelated to this crate's own code), but nothing in this crate's
+`Cargo.toml` or `src/` references it.
 
 ### Cancellation on caller disconnect
 
@@ -114,18 +151,71 @@ bounds *queued*, not in-flight, waste.
 
 - **Format detection** from magic bytes, avoiding a second guess-the-format
   pass when the bytes are already in hand.
-- **Filter selection**: `Triangle` for small (<=300px per side) targets,
-  `Lanczos3` otherwise - a real, measured lever (see Benchmarks below), not
-  yet configurable per request (#35).
+- **Resize** goes through [`fast_image_resize`](https://docs.rs/fast_image_resize)
+  (SIMD), not the `image` crate's own resize kernel (#63 stage 1). Filter
+  selection is unchanged in name - `Triangle` for small (<=300px per side)
+  targets, `Lanczos3` otherwise, a real, measured lever, not yet
+  configurable per request (#35) - but is now mapped onto
+  `fast_image_resize`'s own filter set (`Triangle` -> `fir::FilterType::Bilinear`,
+  `Lanczos3` -> `fir::FilterType::Lanczos3` by name) instead of the `image`
+  crate's kernel. Measured ~5x faster on a downscale for the same filter
+  (`resize_fir/downscale lanczos3`: 3.43ms vs. the old `image`-crate
+  kernel's ~17ms in `.bench-baseline/BASELINE.md`), with imperceptible
+  quality difference (DSSIM 0.0000047-0.0000093 against the old kernel's
+  output, same source).
+- **JPEG decode** goes through `mozjpeg`/libjpeg-turbo instead of the
+  `image` crate's `zune-jpeg` (#63 stage 2, extended by #67). Two paths:
+  - **DCT-scaled decode**: when the requested output is a >=2x downscale,
+    `select_jpeg_dct_scale` (`src/services/image/handler.rs`) picks the most
+    aggressive libjpeg DCT scale (`scale_num`/8, i.e. 1/2, 1/4, or 1/8) whose
+    decoded output is still >= the resize target, and decodes directly at
+    that resolution instead of decoding full-size and discarding most of the
+    data during resize. Measured 2.21x faster for a 4K source to a small
+    thumbnail (26.21ms vs 58.03ms for full decode + resize).
+  - **Full-size mozjpeg decode**, otherwise - as of #67, this replaced the
+    `image`-crate/`zune-jpeg` decode for *every* JPEG, not just the
+    DCT-scaled case: `image` 0.25.10's `zune-jpeg` 0.5.x made its Huffman
+    bit-refill EOF check fallible where 0.4.x's was an infallible `bool`, a
+    real per-byte cost; mozjpeg's full-size decode measured ~1.5x faster
+    across a 36-photo real corpus regardless of downscale ratio.
+  - Either path falls back to the `image`-crate decoder on any mozjpeg
+    failure (including a caught panic) rather than failing the request.
+- **JPEG encode** goes through `mozjpeg::Compress` instead of
+  `image::codecs::jpeg::JpegEncoder` (#76) - the `image` crate's encoder has
+  no progressive-mode switch and hardcodes 4:2:2 chroma subsampling, so
+  neither could be exposed through it. Two profiles:
+  - **`JCP_FASTEST`** (mozjpeg's `set_fastest_defaults`) for the default,
+    non-progressive path - ~5% smaller and 3-4x *faster* than the old
+    `image`-crate encoder, and scores a better mean DSSIM than mozjpeg's own
+    max-compression profile at the same nominal quality (trellis
+    quantisation trades fidelity for size, not the other way round).
+  - **`JCP_MAX_COMPRESSION`** (mozjpeg's own default profile, which turns on
+    trellis quantisation unconditionally) only for explicitly-requested
+    progressive output (`jpgo:1:...`) - ~12% smaller than the old encoder
+    but 3-8x its encode time, so it is charged only to requests that opt in.
+    Constructing a `mozjpeg::Compress` without calling
+    `set_fastest_defaults` selects this profile by default, which very
+    nearly shipped as the default for *every* JPEG encode (a +16% pipeline
+    regression) - see `.bench-baseline/BASELINE.md`'s "JPEG encoder
+    cutover" section for the full trap.
+- **WebP** goes through the [`webp`](https://docs.rs/webp) crate (real
+  libwebp) instead of the `image` crate's lossless-only WebP encoder (#32,
+  #60) - lossy and lossless static images via `webp::Encoder`, animated WebP
+  via `webp::AnimEncoder`/`AnimFrame`. See `adr/0001-image-engine.md` and
+  `adr/0003-webp-measurement.md` for why and how this was measured.
+- **AVIF** is encode-only, via `image::codecs::avif::AvifEncoder`. See
+  `adr/0004-avif-measurement.md`.
 - **Upscale guard, off by default** (#36): a request naming output
   dimensions larger than the source image is capped to the source's
   dimensions per axis unless the request opts in via `enlarge: true`
   (`ResizeQuery::enlarge`, `src/models/params.rs`), mirroring imgproxy's
   `enlarge` option. Upscaling is measurably expensive - the committed
   benchmark baseline (`.bench-baseline/BASELINE.md`) puts
-  `resize/upscale/lanczos3` at 143ms vs 17.4ms for the equivalent downscale,
-  ~8x - so leaving it unguarded let a single request against a tiny source
-  name an arbitrarily expensive output size.
+  `resize/upscale/lanczos3` at 143ms vs 17.4ms for the equivalent downscale
+  on the old `image`-crate kernel (~8x; the `fast_image_resize` upscale path
+  is faster in absolute terms but shows the same multiplier) - so leaving it
+  unguarded let a single request against a tiny source name an arbitrarily
+  expensive output size.
 - **No redundant crop**: the fixed-size ("fill") resize path used to check
   whether `resize_to_fill`'s output already matched the requested dimensions
   before conditionally cropping. `resize_to_fill` always crops to exactly
@@ -170,14 +260,20 @@ explicitly (as the Dockerfile does for the shipped binaries).
 
 ## Runtime configuration
 
-- **Tokio runtime**: `#[tokio::main(flavor = "multi_thread", worker_threads
-  = 4)]` (`src/main.rs`) - a fixed 4 async worker threads regardless of host
-  core count.
+- **Tokio runtime**: no longer built via the `#[tokio::main]` attribute
+  macro (that only accepts compile-time literals, so a fixed worker count
+  was baked in). `src/main.rs` now builds the runtime by hand with
+  `tokio::runtime::Builder::new_multi_thread().worker_threads(n)`, where `n`
+  is `TOKIO_WORKER_THREADS` if set, else `effective_cpu_count()` - the same
+  cgroup-aware CPU count used to size `max_concurrent_processing`
+  (`src/modules/utils/cgroup.rs`, #44), not `num_cpus::get()` directly, so a
+  CPU-quota-limited container sizes the runtime for its actual quota rather
+  than the host's full core count.
 - **Allocator**: `mimalloc` as the global allocator (`src/main.rs`).
 
 ## Benchmarking
 
-Reproduce the pipeline numbers below (decode + resize + optional filters +
+Reproduce the pipeline numbers (decode + resize + optional filters +
 encode, via `ImageService::process_image_blocking`, the same code path
 production traffic runs - see that function's doc comment):
 
@@ -187,37 +283,31 @@ cargo bench --features local_fs --bench pipeline -- --sample-size 20 --measureme
 
 Other benches cover the pipeline stages and cache-key hashing in isolation:
 `cargo bench --features local_fs --bench decode|resize|encode|cache_key`.
-`.bench-baseline/BASELINE.md` and `.bench-baseline/P0-COMPARISON.md` have
-the full per-filter/per-format numbers and the observation that upscaling
-runs ~8x slower than the equivalent downscale, which is what motivates the
-upscale guard above.
 
-Measured on this machine (darwin/arm64), `cargo bench --features local_fs
---bench pipeline -- --sample-size 20 --measurement-time 2 --warm-up-time 1`,
-criterion default (release) profile - not `perf`:
+This document does not embed a snapshot of those numbers - they move too
+often (five documented, code-verified changes since this document was first
+written: the `fast_image_resize` kernel swap, DCT-scaled JPEG decode, wave-2
+features, the JPEG encoder cutover, and full-size mozjpeg decode) for a
+copy pasted here to stay honest for long. **`.bench-baseline/BASELINE.md`
+is the current, single source of truth for every criterion number**,
+including the full per-filter/per-format table, the observation that
+upscaling runs ~8x slower than the equivalent downscale (what motivates the
+upscale guard above), and a running log of measurement traps this project
+has already fallen into once (stale encoder defaults, redirect-blended
+end-to-end metrics, DCT-scale threshold assumptions) so the next person
+re-running these benches doesn't repeat them.
 
-| Case | Before (#30/#31, `.bench-baseline/BASELINE.md`) | After |
-|---|---|---|
-| photo_like -> thumbnail jpg | 14.88 ms | ~15.5 ms |
-| flat -> resize png | 32.81 ms | ~33.1 ms |
-| alpha -> resize webp | 2.94 ms | ~3.0 ms |
+**End-to-end, against imgproxy**: the criterion numbers above are
+single-operation micro-benchmarks inside the Rust binary; they do not cover
+routing, source fetch, storage round trips, or the redirect hop. The full
+three-way comparison against imgproxy (`bench-imgproxy/`, a k6 harness) is
+also tracked in `.bench-baseline/BASELINE.md`, and is summarized honestly in
+the [README's Performance section](README.md#performance) - emgr is
+measurably slower than imgproxy on a cold cache (3.26x on p50) and
+measurably faster on a warm one (imgproxy has no result cache of its own),
+which is the same architectural trade-off seen from two sides, not two
+independent facts.
 
-These deltas (roughly +1% to +5%) are within the run-to-run noise this exact
-bench already showed across the P0 security-fix changes documented in
-`.bench-baseline/P0-COMPARISON.md` (deltas up to +7.5% there, symmetric in
-both directions, which is what noise looks like rather than a regression).
-That tracks: this particular bench calls
-`ImageService::process_image_blocking` directly, which does not go through
-`process_image`'s semaphore/`spawn_blocking` change or `download_image`'s
-`Bytes` change at all - #30 and #31 are concurrency and allocation changes
-on the async/download path, not changes to the decode/resize/encode
-arithmetic this bench measures. What it does exercise is the upscale-guard
-addition and the dead-crop-branch removal, both a handful of comparisons
-against an already-decoded image, consistent with a change too small to
-separate from noise here.
-
-No throughput/memory/CPU-utilization multipliers are claimed in this
-document. If you want one, produce it with a load-generation harness against
-the full `resize` HTTP path (which does exercise the semaphore and `Bytes`
-changes end-to-end) and cite the exact command and hardware, per the standard
-this document now holds itself to.
+No throughput/memory/CPU-utilization multiplier is claimed anywhere in this
+document that doesn't trace to a command and a number in
+`.bench-baseline/BASELINE.md` or `bench-imgproxy/README.md`.

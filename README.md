@@ -1,189 +1,193 @@
-# EmgR - Image Resizing Service
+# EmgR — Image Resizing Service
 
-EmgR is a high-performance image resizing service built with Rust, designed to efficiently process and deliver images in various formats and sizes. It leverages asynchronous processing with Tokio and the Axum web framework for robust and scalable performance.
+EmgR is an imgproxy-compatible, on-the-fly image resizing service written in Rust (Axum + Tokio). It fetches a source image, decodes/resizes/encodes it per an HMAC-signed URL, caches the result to a storage backend, and 301-redirects the caller to the cached bytes.
 
-## Features
+It aims to be a credible, self-hosted alternative to [imgproxy](https://imgproxy.net/) — see the [Performance](#performance) section below for an honest, measured comparison against imgproxy v4.0.13, not a marketing claim.
 
-*   **Dynamic Image Resizing**: Resize images on-the-fly via an imgproxy-compatible signed URL path, specifying source, dimensions, and output format.
-*   **Multiple Output Formats**: Supports common image formats like JPG, PNG, and WebP.
-*   **Efficient Caching**: (Implicit) Resized images are cached to ensure fast delivery for subsequent requests.
-*   **Storage Agility**: Supports multiple storage backends for resized images:
-    *   Local filesystem
-    *   AWS S3 (or S3-compatible services like MinIO)
-    *   In-memory (primarily for testing or specific use-cases)
-*   **Signed URLs**: HMAC-SHA256 request signing, matching imgproxy's scheme closely enough that a client library written for imgproxy works against this service (see [GH #27](https://github.com/vaam-store/image-resizer/issues/27)). Signing is the default, not opt-in.
-*   **Containerized**: Easily deployable using Docker and Docker Compose.
-*   **Observability**: Integrated with Jaeger for tracing via OpenTelemetry.
+## URL shape
 
-## Technology Stack
+Requests use imgproxy's signed-path grammar, not query parameters:
 
-*   **Language**: Rust (Edition 2024)
-*   **Web Framework**: Axum (hand-written router - no OpenAPI code generation, see [GH #53](https://github.com/vaam-store/image-resizer/issues/53))
-*   **Async Runtime**: Tokio
-*   **Image Processing**: `image` crate
-*   **Containerization**: Docker, Docker Compose
-*   **Tracing**: Jaeger, OpenTelemetry
-*   **Dependencies**: `reqwest` (HTTP client), `sha2`/`hmac` (hashing/signing), `envconfig` (configuration), `aws-sdk-s3` (for S3 storage).
+```
+GET /{signature}/{processing_options}/{plain|base64 source}.{extension}
+```
 
-## Getting Started
+- **`{signature}`** — base64url HMAC-SHA256 over the rest of the path, keyed by `SIGNING_KEY`/`SIGNING_SALT` — or the literal `unsigned` when `ALLOW_UNSIGNED_REQUESTS=true`. Signing is the default, not opt-in.
+- **`{processing_options}`** — zero or more `/`-delimited `code:args` segments, e.g. `rs:fill:300:300` (resize/crop), `q:80` (quality), `bl:5` (blur), `g:true` (grayscale), `el:1` (allow upscaling), `jpgo:1:0` (progressive JPEG / chroma subsampling), `wm:1` / `wmu:{base64url}` (watermark), `pr:{name}` (preset).
+- **`{source}`** — plain or base64url-encoded source image URL.
 
-These instructions will get you a copy of the project up and running on your local machine for development and testing purposes.
+Full grammar, every response code, and how to compute a signature in Python/JavaScript/bash: [API reference](docs/user-guide/api-reference.md) and [Examples](docs/user-guide/examples.md).
 
-### Prerequisites
+Design rationale for choosing this shape over query parameters or OpenAPI codegen: [ADR 0002](adr/0002-url-api-shape.md).
 
-*   Docker and Docker Compose
-*   `make` (optional, for using Makefile commands)
-*   `curl` (for testing)
+## Request flow
 
-### Installation & Running
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Router as axum router<br/>(src/modules/router/router.rs:48)
+    participant Resize as resize_handler<br/>(src/modules/api/resize.rs:23)
+    participant RS as ResizeService<br/>(src/services/resize/handler.rs:177)
+    participant Storage as StorageService
+    participant IS as ImageService<br/>(src/services/image/handler.rs)
+    participant Download as download_handler<br/>(src/modules/api/download.rs)
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://your-repository-url/emgr.git
-    cd emgr
-    ```
-    A fresh clone builds with plain `cargo build` - no Docker step needed
-    first (that used to require `make init` to run OpenAPI codegen; removed
-    under [GH #53](https://github.com/vaam-store/image-resizer/issues/53)).
+    Client->>Router: GET /{sig}/{options}/{source}.{ext}
+    Router->>Resize: route to resize_handler
+    Resize->>Resize: verify_or_reject (HMAC, resize.rs:90)<br/>403 on missing/bad signature
+    Resize->>RS: resize(query)
+    RS->>Storage: check_cache(key)
 
-2.  **Build the project images:**
-    This command builds the Docker images defined in [`compose.yaml`](compose.yaml:1).
-    ```bash
-    make build
-    ```
+    alt cache hit
+        Storage-->>RS: hit
+        RS-->>Resize: cached CDN url
+    else cache miss
+        RS->>RS: single-flight entry (handler.rs:205)<br/>dashmap keyed by cache key
+        alt this caller is leader
+            RS->>IS: download_image(url)<br/>bounded by download_semaphore (#30)
+            IS-->>RS: image bytes (Bytes, no copy)
+            RS->>IS: process_image on spawn_blocking<br/>bounded by processing_semaphore (#30)<br/>decode -> resize -> encode
+            IS-->>RS: encoded output
+            RS->>Storage: upload(key, bytes)
+            RS-->>RS: broadcast result to followers (Drop of InFlightGuard)
+        else this caller is follower
+            RS->>RS: await leader's broadcast result
+        end
+        RS-->>Resize: CDN url
+    end
 
-3.  **Start the application and dependent services (including Jaeger for tracing):**
-    This brings up the `app` service and its dependencies (like `tracking` for Jaeger). The application will be accessible on port `13001`.
-    ```bash
-    make up
-    ```
-    Alternatively, to start only the application:
-    ```bash
-    make up-app
-    ```
+    Resize-->>Client: 301 Location: /api/images/files/{key}
+    Client->>Router: GET /api/images/files/{key}
+    Router->>Download: route to download_handler (unsigned)
+    Download->>Storage: fetch bytes for key
+    Storage-->>Download: image bytes
+    Download-->>Client: 200 image bytes
+```
 
-4.  **Verify the application is running:**
-    You can check the status of the containers:
-    ```bash
-    make ps
-    # or
-    docker compose -p emgr ps
-    ```
-    View application logs:
-    ```bash
-    make logs-app
-    ```
-    Jaeger UI will be available at: `http://localhost:16686`
+Two independent semaphores shed load with a `503` rather than queue unboundedly — `download_semaphore` (`max_concurrent_downloads`, default 20) and `processing_semaphore` (`max_concurrent_processing`, default CPU count), both in `src/services/image/handler.rs` (#30). A third, separate semaphore bounds total in-flight HTTP requests at the router level (`MAX_CONCURRENT_REQUESTS`, default 512, `src/modules/router/middlewares.rs`, #43). Concurrent requests for the *same* cache key are coalesced by a single-flight leader/follower registry (`src/services/resize/handler.rs`, #37) so only one of them actually does the work — see [`PERFORMANCE_OPTIMIZATIONS.md`](PERFORMANCE_OPTIMIZATIONS.md) for the mechanics of all three.
 
-### Testing the Resize Endpoint
+Never a redirect back to the caller-supplied source ([GH #25](https://github.com/vaam-store/image-resizer/issues/25)) — the `Location` header always points at this service's own storage-backed URL.
 
-The resize endpoint takes an HMAC-signed URL path, not query parameters -
-see the [API reference](docs/user-guide/api-reference.md) for the full
-grammar and [Examples](docs/user-guide/examples.md) for how to compute a
-signature in Python/JavaScript/bash. With the placeholder
-`SIGNING_KEY=6d792d7369676e696e672d6b6579` /
-`SIGNING_SALT=6d792d73616c74` from [`.env.example`](.env.example) (never
-use these for anything real) and the service listening on `localhost:13001`:
+## Image engine
+
+- **Resize**: [`fast_image_resize`](https://docs.rs/fast_image_resize) (SIMD), not the `image` crate's own resize kernel — roughly 5x faster on a downscale (`resize_fir/downscale lanczos3`: 3.43ms vs. the `image`-crate kernel's 17ms; see [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md)).
+- **JPEG decode**: [`mozjpeg`](https://docs.rs/mozjpeg)/libjpeg-turbo, with DCT-scaled decode at 1/2, 1/4, or 1/8 resolution when the requested output is a ≥2x downscale, falling back to a full-size mozjpeg decode otherwise.
+- **JPEG encode**: `mozjpeg` at the `JCP_FASTEST` profile by default — smaller and faster than the old `image`-crate encoder on every axis measured. Explicitly-requested progressive output (`jpgo:1:...`) gets the full `JCP_MAX_COMPRESSION` profile instead, since that cost (~19x baseline) is opt-in only.
+- **WebP**: the [`webp`](https://docs.rs/webp) crate — real libwebp, lossy and lossless, plus animated WebP via `AnimEncoder`.
+- **AVIF**: encode only, via the `image` crate's `AvifEncoder`.
+- **PNG / GIF**: the `image` crate.
+
+See [ADR 0001](adr/0001-image-engine.md) (engine choice), [ADR 0003](adr/0003-webp-measurement.md) (WebP byte-size, re-measured), and [ADR 0004](adr/0004-avif-measurement.md) (AVIF byte-size/encode-time, measured) for the reasoning and data behind these choices.
+
+## Storage backends
+
+Selected via `STORAGE_TYPE` and gated by Cargo feature flags — only the backend(s) the binary was compiled with are available:
+
+| Feature | Backend | Notes |
+|---|---|---|
+| `local_fs` | Local filesystem | `LOCAL_FS_STORAGE_PATH` |
+| `s3` | S3 / MinIO-compatible | `MINIO_ENDPOINT_URL`, `MINIO_ACCESS_KEY_ID`, `MINIO_SECRET_ACCESS_KEY`, `MINIO_BUCKET`, `MINIO_REGION` |
+| `in_memory` | In-process map | Test-only — compiled only under `cfg(test)` even when this feature is on, so it is never reachable from a real running binary, not just "discouraged in production" |
+| `otel` | — | Not a storage backend: enables OpenTelemetry tracing/metrics export (Jaeger/OTLP) and mounts an authenticated `/metrics` endpoint. Independent of the three above. |
+
+## Quick start
+
+### Docker Compose
+
+```bash
+git clone https://your-repository-url/emgr.git
+cd emgr
+cp .env.example .env   # then set real SIGNING_KEY/SIGNING_SALT — see below
+make up                # or: docker compose -p emgr -f compose.yaml up -d --build
+```
+
+This builds the `app` service (the `fs_otel_deploy` Docker target — `local_fs` storage + `otel`) plus its `tracking` (Jaeger) dependency. The app listens on `13001` (see `compose.yaml`); Jaeger UI is at `http://localhost:16686`. `make help` lists every other target (`down`, `destroy`, `logs`, `ps`, ...).
+
+### Cargo
+
+```bash
+git clone https://your-repository-url/emgr.git
+cd emgr
+cargo build --features local_fs   # or: s3, or "local_fs otel", or "s3 otel"
+cargo run --features local_fs
+```
+
+A fresh clone builds directly with `cargo build` — no code-generation step, no Docker requirement first (that used to require `make init` to run OpenAPI codegen against `openapi.yaml`; both are gone, [GH #53](https://github.com/vaam-store/image-resizer/issues/53) replaced the generated router with a hand-written one). At least one of `local_fs`/`s3` must be enabled or the process has no storage backend to start with.
+
+### Try the resize endpoint
+
+With the placeholder `SIGNING_KEY=6d792d7369676e696e672d6b6579` / `SIGNING_SALT=6d792d73616c74` from [`.env.example`](.env.example) (never use these for anything real) and the service listening on `localhost:13001`:
 
 ```bash
 curl -LI 'http://localhost:13001/de7BKgwO8wFeNZWRWgp3UB9jKwOkVoYM_eMKau2ECgw/rs:fill:300:300/q:80/aHR0cHM6Ly9pbWFnZXMuZXhhbXBsZS5jb20vcGhvdG8uanBn.jpg'
 ```
 
-You should see a `301 Moved Permanently` response, with a `Location` header pointing to the resized image:
-
-```plaintext
-HTTP/1.1 301 Moved Permanently
-location: http://localhost:13001/api/images/files/your-image-hash.jpg
-vary: origin, access-control-request-method, access-control-request-headers
-access-control-allow-origin: *
-content-length: 0
-date: Sat, 31 May 2025 XX:XX:XX GMT
-
-HTTP/1.1 200 OK
-content-type: image/jpeg
-vary: origin, access-control-request-method, access-control-request-headers
-access-control-allow-origin: *
-content-length: XXXXXX
-date: Sat, 31 May 2025 XX:XX:XX GMT
-```
-
-You can then open the `location` URL in your browser to view the resized image, for example:
-```bash
-open http://localhost:13001/api/images/files/your-image-hash.jpg
-```
-Or, open the signed resize URL directly (which will perform the resize and then redirect):
-```bash
-open 'http://localhost:13001/de7BKgwO8wFeNZWRWgp3UB9jKwOkVoYM_eMKau2ECgw/rs:fill:300:300/q:80/aHR0cHM6Ly9pbWFnZXMuZXhhbXBsZS5jb20vcGhvdG8uanBn.jpg'
-```
-
-### Other Useful Commands
-
-*   **Stop the project:**
-    ```bash
-    make down
-    ```
-*   **Destroy the project (stops and removes containers, networks, and volumes):**
-    ```bash
-    make destroy
-    ```
-*   **View all logs:**
-    ```bash
-    make logs
-    ```
-*   **Show help (lists all Makefile targets):**
-    ```bash
-    make help
-    ```
-
-## API Endpoints
-
-The full grammar and every response code live in the
-[API reference](docs/user-guide/api-reference.md) - there is no
-`openapi.yaml` any more ([GH #53](https://github.com/vaam-store/image-resizer/issues/53)
-replaced OpenAPI code generation with a hand-written router). Summary:
-
-*   `GET /{signature}/{processing_options}/{plain|base64 source}.{extension}`
-    *   **Summary**: HMAC-signed, imgproxy-compatible resize URL. Fetches the source, resizes/transforms it, caches the result, and redirects to it.
-    *   **`{signature}`**: base64url HMAC-SHA256 over the rest of the path, keyed by `SIGNING_KEY`/`SIGNING_SALT` (see [Configuration](#configuration)) - or the literal `unsigned` when `ALLOW_UNSIGNED_REQUESTS=true` is set. Signing is the default, not opt-in.
-    *   **`{processing_options}`**: zero or more `/`-delimited `code:args` segments - `rs:{type}:{w}:{h}` (resize/crop), `q:{0-100}` (quality), `bl:{sigma}` (blur), `g:{true|false}` (grayscale), `el:{1|0}` (allow upscaling).
-    *   **Responses**:
-        *   `301 Moved Permanently`: Redirects to the path of the resized image. The `Location` header contains the URL to the processed image. (Never a redirect to the caller-supplied source - see [GH #25](https://github.com/vaam-store/image-resizer/issues/25).)
-        *   `400 Bad Request`: The signed-URL path is malformed, or the source URL doesn't decode as an image, or exceeds a configured limit.
-        *   `403 Forbidden`: The signature is missing, invalid, or `unsigned` without `ALLOW_UNSIGNED_REQUESTS=true`.
-        *   `502 Bad Gateway`: The origin server for the requested image failed.
-        *   `503 Service Unavailable`: The service is shedding load (concurrency limits reached).
-
-*   `GET /api/images/files/{key}`
-    *   **Summary**: Downloads a previously resized image. Unsigned - only ever serves already-cached, hash-addressed bytes, not an arbitrary fetch.
-    *   **Path Parameters**:
-        *   `key` (string, required): The unique key (hash) of the image file.
-    *   **Responses**:
-        *   `200 OK`: Returns the image file with the appropriate `Content-Type` (e.g., `image/png`, `image/jpeg`).
+Expect a `301 Moved Permanently` with a `Location` pointing at `/api/images/files/{key}`; following it returns `200` with the resized image bytes. Compute your own signature for a real source URL with the snippets in [Examples](docs/user-guide/examples.md).
 
 ## Configuration
 
-The application is configured entirely via environment variables, read by
-[`src/modules/env/env.rs`](src/modules/env/env.rs). The full, CI-checked
-reference lives at
-[`docs/getting-started/configuration.md`](docs/getting-started/configuration.md)
-(covers storage backend selection, the SSRF source-fetch guard,
-resolution/output limits, performance tuning, and observability). A
-starting-point `.env` file is at [`.env.example`](.env.example) - copy it
-to `.env` (gitignored). The most commonly-touched variables, as seen in
-[`compose.yaml`](compose.yaml):
+The service is configured entirely via environment variables, read by [`src/modules/env/env.rs`](src/modules/env/env.rs). The full, CI-checked reference (kept in sync with `env.rs` by a dedicated `docs-env-drift` CI job) is [`docs/getting-started/configuration.md`](docs/getting-started/configuration.md); performance-specific knobs (concurrency limits, HTTP client tuning, request-timeout/rate-limit shedding, the `PERFORMANCE_PROFILE` presets) are in [`docs/configuration/performance.md`](docs/configuration/performance.md). [`.env.example`](.env.example) is a starting point — copy it to `.env` (gitignored).
 
-*   `STORAGE_TYPE`: Storage backend - `LOCAL_FS` or `S3` (alias `MINIO`).
-*   `CDN_BASE_URL`: The base URL for constructing links to served image files (e.g., `http://localhost:13001/api/images/files`).
-*   `SIGNING_KEY` / `SIGNING_SALT`: Hex-encoded HMAC-SHA256 key/salt for signed URLs ([GH #27](https://github.com/vaam-store/image-resizer/issues/27)). Required unless `ALLOW_UNSIGNED_REQUESTS=true` - signing is the default, the process refuses to start without one or the other.
-*   `LOG_LEVEL`: Sets the logging verbosity (e.g., `info`, `debug`).
-*   `OTLP_SPAN_ENDPOINT`: Endpoint for OpenTelemetry trace collector (Jaeger).
-*   `OTLP_METRIC_ENDPOINT`: Endpoint for OpenTelemetry metrics collector.
-*   `OTLP_SERVICE_NAME`: Service name for OpenTelemetry.
+Most commonly touched:
+
+- `STORAGE_TYPE` — `LOCAL_FS` or `S3` (alias `MINIO`).
+- `CDN_BASE_URL` — base URL used to build the redirect `Location`.
+- `SIGNING_KEY` / `SIGNING_SALT` — hex-encoded HMAC-SHA256 key/salt for signed URLs ([GH #27](https://github.com/vaam-store/image-resizer/issues/27)). Required unless `ALLOW_UNSIGNED_REQUESTS=true` — the process fails closed at startup without one or the other.
+- `METRICS_AUTH_TOKEN` — bearer token required on `/metrics` when built with `--features otel`; also fails closed at startup unless `ALLOW_UNAUTHENTICATED_METRICS=true` ([GH #77](https://github.com/vaam-store/image-resizer/issues/77)).
+
+## API endpoints
+
+Full grammar and every response code: [API reference](docs/user-guide/api-reference.md). Summary:
+
+- `GET /{signature}/{processing_options}/{plain|base64 source}.{extension}` — signed resize request. `301` to the cached result, `400` on a malformed path or undecodable/oversized source, `403` on a bad/missing signature, `502` if the origin fetch fails, `503` when a concurrency limit is shedding load.
+- `GET /api/images/files/{key}` — unsigned download of an already-cached, hash-addressed result. Never performs an arbitrary fetch.
+- `GET /health` — unauthenticated liveness/readiness probe target.
+- `GET /metrics` — Prometheus metrics, only mounted with `--features otel`, bearer-token authenticated by default.
+
+## Performance
+
+**Cold cache** (per delivered image, medians of 3 runs, imgproxy v4.0.13, darwin/arm64 — see [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md)):
+
+| Engine | p50 | images/s |
+|---|---:|---:|
+| imgproxy | 20.50 ms | 64.51 |
+| emgr (local_fs) | 66.82 ms | 23.56 |
+
+**emgr is 3.26x slower on p50 and delivers 2.74x less throughput than imgproxy on a cold cache.** This project does not claim parity with imgproxy on raw processing speed, and this README will not pretend otherwise.
+
+**Warm cache**, same run set:
+
+| Engine | p50 | images/s |
+|---|---:|---:|
+| imgproxy | 20.10 ms | 64.94 |
+| emgr (local_fs) | 0.39 ms | 4852 |
+
+This is not a processing-speed win — it's a different architecture. imgproxy has no result cache and reprocesses every request; a production imgproxy deployment normally sits behind a CDN to absorb repeat requests. emgr instead redirects a repeat request straight to its own storage-backed cache before the pipeline ever runs. The cold cost and the warm win are **the same trade-off** seen from two sides: emgr's request path is process → write to storage → `301` → client re-fetches from storage, which is exactly why a cache miss costs an extra round trip (cold) and why a cache hit is nearly free (warm). You cannot remove one without losing the other. Which number matters more depends on your cache-hit rate in production — a number these benchmarks don't measure for you.
+
+Micro-benchmarks (single-operation, criterion, darwin/arm64):
+
+| Operation | Time |
+|---|---:|
+| JPEG decode, 1920x1080 | 7.20 ms |
+| JPEG encode (baseline) | 933 µs |
+| JPEG encode (progressive) | 17.81 ms |
+| PNG encode | 1.71 ms |
+| WebP encode | 24.26 ms |
+| Resize, downscale, Lanczos3 (`fast_image_resize`) | 3.43 ms |
+| Resize, downscale, Triangle→Bilinear (`fast_image_resize`) | 1.15 ms |
+| Full pipeline, photo → thumbnail JPEG | 6.17 ms |
+| Full pipeline, 4K photo → large downscale | 19.65 ms |
+
+Full methodology, every measured number, and the traps that produced misleading intermediate readings along the way (encoder-profile defaults, redirect-blended metrics, DCT-scale thresholds) are in [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md), the mechanism-level writeup in [`PERFORMANCE_OPTIMIZATIONS.md`](PERFORMANCE_OPTIMIZATIONS.md), the tunable knobs in [`docs/configuration/performance.md`](docs/configuration/performance.md), and the end-to-end harness itself in [`bench-imgproxy/README.md`](bench-imgproxy/README.md).
+
+## Observability
+
+Built with `--features otel`: OpenTelemetry traces/metrics exported via OTLP (`OTLP_SPAN_ENDPOINT`, `OTLP_METRIC_ENDPOINT`), a bearer-token-authenticated `/metrics` Prometheus endpoint, and structured logging (`LOG_LEVEL`). `docker compose up` brings up Jaeger (`tracking` service) as a local OTLP collector/UI.
 
 ## Contributing
 
-Please read `CONTRIBUTING.md` for details on our code of conduct, and the process for submitting pull requests to us. (Note: `CONTRIBUTING.md` to be created)
+See [`docs/development/contributing.md`](docs/development/contributing.md).
 
 ## License
 
-This project is licensed under the MIT License - see the [`LICENSE`](LICENSE:0) file for details.
+MIT — see [`LICENSE`](LICENSE).
