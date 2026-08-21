@@ -225,12 +225,24 @@ cannot both own the prefix.
 **Decision: `g:` stays grayscale; gravity is `gr:`.** Taken by the repository owner on
 2026-08-20, in preference to reassigning `g:` to gravity and moving grayscale to `gs:`.
 
-**Consequence, stated plainly so it is not rediscovered later:** `emgr` is *not* drop-in for an
-imgproxy URL that uses gravity. Such a URL does not error — it is silently misread, because
-`g:ce` parses as a valid grayscale option rather than centre gravity. Gravity is among the most
-commonly used imgproxy processing options, so the "swap your base URL" adoption story recorded
-above under Consequences is correspondingly narrower than that section implies: it holds for
-resize/quality/format/crop URLs, not for gravity ones.
+**Consequence:** `emgr` is *not* drop-in for an imgproxy URL that uses gravity. Gravity is among
+the most commonly used imgproxy processing options, so the "swap your base URL" adoption story
+recorded above under Consequences is correspondingly narrower than that section implies: it holds
+for resize/quality/format/crop URLs, not for gravity ones.
+
+**Correction (2026-08-21): this section previously claimed such a URL is "silently misread."
+That was wrong, and the real behaviour is considerably better.** `g:` routes its argument through
+`parse_bool` (`src/modules/url/options.rs`), which accepts only `true`/`1`/`false`/`0`. Every
+imgproxy gravity token — `ce`, `no`, `so`, `we`, `ea`, `noea`, `nowe`, `soea`, `sowe`, `sm`,
+`fp` — fails that parse and the request is rejected with **400 Bad Request**. A gravity URL
+carrying offsets (`g:ce:10:20`) fails the arity check first, for the same outcome.
+
+So a migrating user gets a clear, immediate error rather than a wrong image. That is the failure
+mode you want from an incompatibility: loud, at the boundary, and impossible to mistake for
+success. The original claim was written from the shape of the grammar without checking the
+parser, and it understated the design — worth recording as a correction rather than a silent
+edit, because "silently misread" is exactly the sort of claim that would justify reopening this
+decision on false grounds.
 
 **What would change this decision:** it becomes materially more expensive with every published
 `emgr` URL that uses `g:`. Today the grammar has no external users and the swap would cost only
