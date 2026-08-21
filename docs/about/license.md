@@ -1,3 +1,10 @@
+# License
+
+`emgr` is licensed under the MIT License. The full text below is
+reproduced from the repository's [`LICENSE`](https://github.com/vaam-store/image-resizer/blob/main/LICENSE)
+file.
+
+```text
 MIT License
 
 Copyright (c) 2025 Stephane SEGNING LAMBOU
@@ -19,3 +26,27 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+## Third-party notices
+
+`emgr` links native code with its own licenses and attribution
+obligations, reproduced from the repository's
+[`NOTICE`](https://github.com/vaam-store/image-resizer/blob/main/NOTICE)
+file:
+
+- **mozjpeg** (via the `mozjpeg`/`mozjpeg-sys` crates, used for DCT-scaled
+  and full-size JPEG decoding and for JPEG encoding - see the
+  [changelog](changelog.md#performance)) vendors libjpeg-turbo and
+  Independent JPEG Group (IJG) code, distributed under the IJG, Zlib and
+  BSD-3-Clause licenses. Per the IJG license, this software is based in
+  part on the work of the Independent JPEG Group.
+- **libwebp** (via the `webp` crate, BSD-3-Clause) is used for lossy WebP
+  encoding.
+
+Full license texts for every dependency ship with those crates and are
+reproduced in the dependency tree under `~/.cargo/registry` (or your
+project's vendored `Cargo.lock`-resolved sources). `cargo-deny`'s
+`licenses` check (`deny.toml`, run in CI) enforces that every dependency's
+declared license is one this project allows - see
+[Contributing](../development/contributing.md) for running it locally.

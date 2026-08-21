@@ -6,31 +6,37 @@ convention and `mockall` usage that were never implemented).
 
 ## Running tests
 
-Most tests are gated behind the `local_fs` feature (the storage backend
-that doesn't need MinIO/S3 running), which is also what CI runs
-(`.github/workflows/ci.yml`'s `test` job):
+CI (`.github/workflows/ci.yml`'s `test` job) runs one job per feature set,
+each in isolation via `--no-default-features` (a no-op today since
+`default = []`, but it stops a future non-empty default from silently
+pulling `local_fs` into the `s3` job):
 
 ```bash
-cargo test --features local_fs
+cargo test --no-default-features --features local_fs
+cargo test --no-default-features --features s3
+cargo test --no-default-features --features local_fs,otel
 ```
 
-Some tests are storage-backend-agnostic and run with any feature set;
-`--features local_fs` is the fastest way to get a fully green run without
-standing up MinIO. To also exercise the S3-backed storage code paths you
-need a running MinIO (or S3-compatible) endpoint - see
-[Docker deployment](../deployment/docker.md) for `compose.yaml`'s
-`minio`/`minio-init` services - then run with `--features s3` instead.
+`local_fs` is the fastest way to get a fully green run without standing up
+anything external, and is what most tests are gated behind - some tests
+are storage-backend-agnostic and run under any feature set. To exercise
+the S3-backed storage code paths you need a running MinIO (or
+S3-compatible) endpoint - see [Docker deployment](../deployment/docker.md)
+for `compose.yaml`'s `minio`/`minio-init` services - then run with
+`--features s3`. `local_fs,otel` is the only combination that exercises
+the `/metrics` authentication middleware (`src/modules/metrics_auth`),
+since `/metrics` is only ever mounted on an `otel` build.
 
 ### Running specific tests
 
 ```bash
 # A single test function, across every target
-cargo test --features local_fs resize_success_returns_redirect
+cargo test --no-default-features --features local_fs resize_success_returns_redirect
 
 # Only the integration tests in tests/
-cargo test --features local_fs --test storage_key_validation
-cargo test --features local_fs --test storage_local_fs_atomicity
-cargo test --features local_fs --test fixtures_smoke
+cargo test --no-default-features --features local_fs --test storage_key_validation
+cargo test --no-default-features --features local_fs --test storage_local_fs_atomicity
+cargo test --no-default-features --features local_fs --test fixtures_smoke
 ```
 
 ## Test organization
@@ -67,13 +73,52 @@ library for a service whose bugs tend to live exactly in the interaction
 with real filesystems and real HTTP responses (partial writes, redirects,
 percent-encoding).
 
+## Environment variable documentation is CI-checked
+
+Every `#[envconfig(from = "...")]` field in `src/modules/env/env.rs` must
+have a matching entry in [Configuration](../getting-started/configuration.md)
+- CI's `docs-env-drift` job runs `.github/scripts/check_env_docs.py`, which
+fails the build if the two drift apart in either direction (GH #47). Run
+it locally before opening a PR that adds or renames an environment
+variable:
+
+```bash
+python3 .github/scripts/check_env_docs.py
+```
+
 ## Benchmarks
 
-Not part of `cargo test` - criterion benches live in `benches/` and are
-run with `cargo bench --features local_fs` (wired into CI's regression
-gate, see [GH #20](https://github.com/vaam-store/image-resizer/issues/20)).
-`src/bin/benchmark.rs` is a separate end-to-end HTTP load-test binary
-against a running server, not a criterion bench - see its own `--help`.
+Two separate layers, neither part of `cargo test`:
+
+### Criterion micro-benchmarks (`benches/`)
+
+```bash
+cargo bench --features local_fs
+```
+
+Wired into CI's regression gate (see
+[GH #20](https://github.com/vaam-store/image-resizer/issues/20)): a
+`bench-baseline` job saves a `main`-branch baseline on every push to
+`main`, and a `bench` job on every PR compares against it and fails if any
+benchmark regresses past a 15% threshold
+(`.github/scripts/bench_gate.py`), posting a percentile table as a PR
+comment. `src/bin/benchmark.rs` is a separate end-to-end HTTP load-test
+binary against a running server, not a criterion bench - see its own
+`--help`. `.bench-baseline/` in the repo root records past criterion runs
+(with staleness caveats - read `BASELINE.md` there before diffing a fresh
+run against it and attributing the whole delta to your own change).
+
+### Three-way harness against imgproxy (`bench-imgproxy/`)
+
+A `docker compose`-based harness that runs `imgproxy`, `emgr` on
+`local_fs`, and `emgr` on `s3`/MinIO side by side against the same
+generated image corpus, driven by [k6](https://k6.io/). This is
+end-to-end (over HTTP, through Docker) rather than in-process, so it
+measures something criterion can't - including the local_fs-vs-S3
+storage-backend difference. Not run in CI; see
+[`bench-imgproxy/README.md`](https://github.com/vaam-store/image-resizer/blob/main/bench-imgproxy/README.md)
+for the full quick start and what the harness does and does not prove -
+its own `results/` directory (gitignored) holds past run output.
 
 ## Test coverage
 
