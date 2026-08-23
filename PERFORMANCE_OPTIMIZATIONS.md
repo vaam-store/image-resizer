@@ -211,11 +211,12 @@ bounds *queued*, not in-flight, waste.
   (`src/services/image/avif_codec.rs`) - AOM for encode (replacing the
   pure-Rust `ravif`/`rav1e` encoder `adr/0004-avif-measurement.md` measured)
   and dav1d for decode (previously unsupported entirely). See that module's
-  own doc comment for the codec/dependency choice and the AVIF encode/decode
-  work's own change report for the re-measured numbers against the old
-  `ravif` baseline - materially different from `adr/0004`'s figures at some
-  AOM speed settings, matched at others; see that report for the full
-  speed/size tradeoff.
+  own doc comment for the codec/dependency choice, and
+  `adr/0005-avif-measurement-libavif-mozjpeg.md` for the re-measurement
+  against the encoders actually shipped. `adr/0005` supersedes `adr/0004`
+  on both axes - `0004` compared `ravif` against `image`'s JPEG encoder, and
+  production now uses neither - so `0004`'s figures are void rather than
+  merely dated.
 - **Upscale guard, off by default** (#36): a request naming output
   dimensions larger than the source image is capped to the source's
   dimensions per axis unless the request opts in via `enlarge: true`

@@ -202,8 +202,9 @@ handler.rs:126-135`).
 - **AVIF encode and decode** both go through `libavif` (`src/services/image/avif_codec.rs`) — AOM
   for encode (replacing the pure-Rust `ravif`/`rav1e` encoder `adr/0004-avif-measurement.md`
   measured) and dav1d for decode (previously unsupported). See that module's own doc comment for
-  the dependency/codec choice, and the AVIF work's own change report for the re-measured byte-size/
-  encode-time numbers against the `adr/0004` baseline.
+  the dependency/codec choice, and `adr/0005-avif-measurement-libavif-mozjpeg.md` for the
+  re-measured byte-size and encode-time numbers. `adr/0004` measured the
+  encoders this replaced and its figures are void - do not quote them.
 
 ## Cache key design
 
