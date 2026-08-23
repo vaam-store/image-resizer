@@ -111,16 +111,22 @@ use sha2::{Digest, Sha256};
 /// change to this path is *perceptible*, that calculus flips and it should
 /// bump.
 ///
-/// **`strip_metadata` (#5) is hashed below (see `generate_key`) but this
-/// constant is deliberately NOT bumped for it here** - unlike every other
-/// field added above, which bumped in the same change that started hashing
-/// it. `strip_metadata`/`sm` is genuinely output-affecting (default `true`
-/// drops EXIF; `sm:0` forwards it, and JPEG/PNG/AVIF output bytes differ
-/// between the two - see `ImageService::encode_single_image`'s doc comment,
-/// `src/services/image/handler.rs`), so a real bump is still owed here -
-/// left to the integrator landing this alongside whatever else ships in the
-/// same release, rather than claimed unilaterally by this change.
-const CACHE_KEY_VERSION: u8 = 9;
+/// v10 covers `strip_metadata` (#5). It is genuinely output-affecting: the
+/// default (`true`) drops EXIF, `sm:0` forwards it, and JPEG/PNG/AVIF output
+/// bytes differ between the two (see `ImageService::encode_single_image`,
+/// `src/services/image/handler.rs`). Two requests differing only in `sm`
+/// must not collide onto a v9 key that never hashed it.
+///
+/// This bump also matters for a reason no new field usually carries.
+/// Stripping metadata is now the *default*, where the previous behaviour
+/// forwarded whatever the encoder happened to emit. Every v9 entry produced
+/// before this change may therefore hold EXIF - including GPS coordinates
+/// from a user upload - that a post-#5 request for the same URL would
+/// deliberately not produce. Without the bump those entries would keep
+/// being served indefinitely, so the privacy default would silently not
+/// apply to anything already cached. That makes this bump a correctness
+/// requirement rather than a courtesy.
+const CACHE_KEY_VERSION: u8 = 10;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
