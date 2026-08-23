@@ -430,15 +430,22 @@ fn panic_to_error(payload: Box<dyn std::any::Any + Send>, what: &str) -> anyhow:
 /// `ravif`/`rav1e` encoder `image::codecs::avif::AvifEncoder` used before
 /// this change - see this module's own doc comment for why AOM is the only
 /// backend wired in, and `handler.rs`'s `ImageFormat::Avif` match arm for
-/// how this replaces the old `AvifEncoder::new_with_speed_quality` call
-/// directly, same `quality`/`DEFAULT_AVIF_SPEED` inputs as before.
+/// how this replaces the old `AvifEncoder::new_with_speed_quality` call.
 ///
 /// `quality`/`speed` map directly onto `avifEncoder`'s own `quality`
 /// (0-100, 100 = lossless) and `speed` (0-10, 10 = fastest) fields - the
-/// same numeric ranges `DEFAULT_AVIF_QUALITY`/`DEFAULT_AVIF_SPEED` already
-/// used against `ravif`'s equivalent knobs (`AvifEncoder::
-/// new_with_speed_quality`'s own `speed`/`quality` parameters used
-/// identical 0-10/0-100 ranges), so neither constant needed to change.
+/// same *numeric ranges* `ravif`'s equivalent knobs used
+/// (`AvifEncoder::new_with_speed_quality`'s own `speed`/`quality`
+/// parameters), but **not the same scale**: AOM's `speed` (it drives
+/// AOM's `cpu-used` internally) is calibrated completely differently from
+/// rav1e's - see `DEFAULT_AVIF_SPEED`'s own doc comment in `handler.rs`
+/// for the real measurement that found the old default (`4`) cost 900ms+
+/// median per encode on AOM for no real benefit over a much faster
+/// setting, and re-derived the value this crate now ships. `quality`
+/// wasn't found to need the same kind of change, but is not guaranteed to
+/// mean the same perceptual quality at a given number either - see that
+/// same doc comment.
+///
 /// Alpha quality is set equal to `quality` - this crate's request surface
 /// has no separate alpha-quality knob, same as before this change.
 ///

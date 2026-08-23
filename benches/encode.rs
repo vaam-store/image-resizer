@@ -22,7 +22,11 @@
 mod fixtures;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use emgr::services::image::handler::{DEFAULT_JPEG_QUALITY, DEFAULT_WEBP_QUALITY, ImageService};
+use emgr::services::image::avif_codec;
+use emgr::services::image::handler::{
+    DEFAULT_AVIF_QUALITY, DEFAULT_AVIF_SPEED, DEFAULT_JPEG_QUALITY, DEFAULT_WEBP_QUALITY,
+    ImageService,
+};
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 
@@ -87,6 +91,18 @@ fn bench_encode(c: &mut Criterion) {
             },
         );
     }
+
+    // #68: AVIF via `avif_codec::encode` (`libavif`+AOM), replacing
+    // `image::codecs::avif::AvifEncoder` (`ravif`/`rav1e`, removed
+    // entirely) - see that function's own doc comment and
+    // `DEFAULT_AVIF_SPEED`'s in `handler.rs` for why its value changed
+    // from what `ravif` used.
+    group.bench_with_input(BenchmarkId::from_parameter("avif"), &img, |b, img| {
+        b.iter(|| {
+            avif_codec::encode(img, DEFAULT_AVIF_QUALITY, DEFAULT_AVIF_SPEED, None)
+                .expect("encode fixture")
+        });
+    });
 
     group.finish();
 }

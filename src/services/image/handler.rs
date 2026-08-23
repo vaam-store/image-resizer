@@ -50,21 +50,43 @@ pub const DEFAULT_WEBP_QUALITY: f32 = 82.0;
 /// against this exact default and requested no change to it either.
 pub const DEFAULT_JPEG_QUALITY: u8 = 75;
 
-/// Default AVIF encode quality (1-100, `ravif`'s own scale via
-/// `image::codecs::avif::AvifEncoder`), used when `ResizeQuery::quality`
-/// (the `q:{0-100}` processing option) isn't set. `80` matches both
-/// `AvifEncoder::new`'s own default and `cavif`'s (the reference AVIF CLI
-/// `ravif` is built from) - see
-/// `image-0.25.10/src/codecs/avif/encoder.rs:59-60`. Measured against real
-/// photographs in `adr/0004-avif-measurement.md`.
+/// Default AVIF encode quality (0-100, `avifEncoder.quality`'s own scale
+/// via `libavif`/AOM as of #68 - previously `ravif`'s scale via
+/// `image::codecs::avif::AvifEncoder`, before AOM replaced it), used when
+/// `ResizeQuery::quality` (the `q:{0-100}` processing option) isn't set.
+/// `80` was `AvifEncoder::new`'s own pre-#68 default and `cavif`'s
+/// reference default; kept unchanged by #68 - the encode-time/size
+/// re-measurement this change's own report describes swept quality at 80
+/// as the fixed anchor and found no quality-driven reason to move it, only
+/// a speed-driven one (see `DEFAULT_AVIF_SPEED` below). Originally
+/// measured against real photographs in `adr/0004-avif-measurement.md`
+/// (against the now-removed `ravif` encoder - AOM's own quality scale is
+/// not guaranteed to mean the same thing, per that ADR's and adr/0003's
+/// own "nominal quality numbers aren't comparable across encoders"
+/// finding, but no re-measurement flagged a reason to change the value).
 pub const DEFAULT_AVIF_QUALITY: u8 = 80;
 
-/// AVIF encode speed (1-10, slower = smaller/better, `ravif`'s scale),
-/// again matching `AvifEncoder::new`/`cavif`'s own default. Not exposed as
-/// a request-level knob (imgproxy has no equivalent option either) - see
-/// `adr/0004-avif-measurement.md` for the encode-time cost this trades
-/// against output size at this setting.
-pub const DEFAULT_AVIF_SPEED: u8 = 4;
+/// AVIF encode speed (0-10, `avifEncoder.speed`'s own scale via
+/// `libavif`/AOM - 10 = fastest, 0 = slowest, driving AOM's `cpu-used`
+/// internally). **Not the same scale `ravif`/`cavif` used before #68** -
+/// this is the single most important finding from that change's own
+/// report: naively keeping the old value (`4`, calibrated for rav1e) on
+/// the new AOM-backed encoder cost 900ms+ median per encode (Kodak
+/// corpus, quality=80) for barely any size/quality benefit over faster
+/// settings. A real sweep (speed 4/6/8/9/10 at fixed quality=80, all 24
+/// Kodak images) found AOM speed=6 both *smaller* and *lower-DSSIM*
+/// (higher quality) than speed=8, while still ~6x faster than speed=4 -
+/// speed 8-10 were faster still but strictly worse on both size and
+/// DSSIM than speed=6, i.e. a genuinely dominated choice, not a
+/// speed/quality tradeoff. `6` is therefore not "the same number as
+/// before" preserved out of caution - it is a re-derived default for a
+/// different encoder's differently-calibrated knob. See this change's own
+/// report for the full sweep table and the corpus-wide matched-DSSIM
+/// size-ratio measurement at this setting (median ~1.04x `ravif`'s old
+/// output - i.e. slightly *larger*, not smaller, at matched perceptual
+/// quality - materially different from the informally-cited "13%
+/// smaller" figure; see that report for why).
+pub const DEFAULT_AVIF_SPEED: u8 = 6;
 
 /// Default background colour (#34) used both to flatten alpha before
 /// encoding to a format with no alpha channel, and as the fill colour for
@@ -1062,12 +1084,12 @@ impl ImageService {
             // #68: routed through `avif_codec::encode` (`libavif`/AOM)
             // instead of `image::codecs::avif::AvifEncoder`
             // (`ravif`/`rav1e`, removed entirely - see `Cargo.toml`'s
-            // `image` dependency comment) for the measured speed/size win
-            // documented in this change's own report. `quality`/
-            // `DEFAULT_AVIF_SPEED` are the exact same inputs the old
-            // `AvifEncoder::new_with_speed_quality` call took - see
-            // `avif_codec::encode`'s own doc comment for why neither
-            // constant needed to change.
+            // `image` dependency comment). `DEFAULT_AVIF_SPEED` was
+            // re-derived for AOM's own speed scale, not carried over
+            // unchanged from `ravif` - see that constant's own doc comment
+            // in this file for the real measurement behind the new value
+            // and `avif_codec::encode`'s doc comment for why the two
+            // encoders' `speed` knobs aren't interchangeable numbers.
             ImageFormat::Avif => {
                 let quality = params.quality.unwrap_or(DEFAULT_AVIF_QUALITY);
                 let exif_ref = exif_metadata.as_deref();
@@ -3279,7 +3301,13 @@ impl ImageService {
     /// `.expect("ImageBuffer couldn't be created")` internally
     /// (`webp-0.3.1/src/shared.rs`), which would turn a shape mismatch into
     /// an uncatchable-by-design panic path instead of a graceful `Result`.
-    fn libwebp_decode(image_bytes: &[u8]) -> Result<DynamicImage> {
+    ///
+    /// `pub` (like `mozjpeg_decode`/`encode_webp`/`encode_jpeg` above) so
+    /// `benches/decode.rs` can benchmark the exact WebP decode path
+    /// production uses (#66) instead of the `image::load_from_memory_with_format`
+    /// call that was representative before this change but now only
+    /// reflects the pre-#66 decoder.
+    pub fn libwebp_decode(image_bytes: &[u8]) -> Result<DynamicImage> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::libwebp_decode_inner(image_bytes)
         }))

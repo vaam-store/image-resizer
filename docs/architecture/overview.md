@@ -185,8 +185,11 @@ handler.rs:139-146`).
 - **WebP** encode/decode goes through the `webp` crate (real lossy libwebp), not the `image` crate's
   lossless-only WebP encoder. See `adr/0001-image-engine.md` (original rationale) and `adr/0003-
   webp-measurement.md` (corrected byte-size measurement on real photos).
-- **AVIF is encode-only.** See `adr/0004-avif-measurement.md` for the byte-size/encode-time
-  measurement this decision is based on.
+- **AVIF encode and decode** both go through `libavif` (`src/services/image/avif_codec.rs`) — AOM
+  for encode (replacing the pure-Rust `ravif`/`rav1e` encoder `adr/0004-avif-measurement.md`
+  measured) and dav1d for decode (previously unsupported). See that module's own doc comment for
+  the dependency/codec choice, and the AVIF work's own change report for the re-measured byte-size/
+  encode-time numbers against the `adr/0004` baseline.
 
 ## Cache key design
 

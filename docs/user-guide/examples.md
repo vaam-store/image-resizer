@@ -82,8 +82,8 @@ below for what happens if you use imgproxy's own `g:` by mistake.
 
 ### Format conversion
 
-Convert to AVIF (smallest, most modern; encode-only in this service — see
-the [format table](api-reference.md#plainbase64-sourceextension)):
+Convert to AVIF (smallest, most modern; both encode and decode are
+supported — see the [format table](api-reference.md#plainbase64-sourceextension)):
 
 ```
 GET /X20ne2Igk1DfeVV6z5WxY5Be4X-Vbei4l55EfcDN1wE/q:70/aHR0cHM6Ly9pbWFnZXMuZXhhbXBsZS5jb20vcGhvdG8uanBn.avif

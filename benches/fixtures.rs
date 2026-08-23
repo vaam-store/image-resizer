@@ -266,6 +266,29 @@ pub fn photo_like_sized(width: u32, height: u32, format: ImageFormat) -> Vec<u8>
     })
 }
 
+/// Same photo-like content, at an arbitrary size, AVIF-encoded via the
+/// caller-supplied `encode_fn` (#67/#68) - deliberately *not* calling
+/// `avif_codec::encode` directly here (unlike `photo_like_sized`'s
+/// `image::write_to` call above): this module is `#[path]`-included from
+/// three different compilation contexts (`handler.rs`'s own test module,
+/// inside the `emgr` lib crate itself; `benches/*.rs` and `tests/*.rs`,
+/// separate crates that depend on `emgr` externally), and those two
+/// contexts need opposite spellings (`crate::services::...` inside the
+/// lib, `emgr::services::...` outside it) to name the same function -
+/// there is no single path that resolves in both. Accepting the encoder
+/// as a parameter sidesteps that entirely: each caller passes whichever
+/// spelling is correct for its own compilation context.
+pub fn photo_like_sized_avif(
+    width: u32,
+    height: u32,
+    encode_fn: impl FnOnce(&DynamicImage) -> Vec<u8>,
+) -> Vec<u8> {
+    cached(&format!("photo_like_{width}x{height}.avif"), || {
+        let img = DynamicImage::ImageRgb8(gradient_noise_rgb(width, height));
+        encode_fn(&img)
+    })
+}
+
 pub const ORIENTED_W: u32 = 120;
 pub const ORIENTED_H: u32 = 80;
 /// Marker block side length, in canonical (already-upright) pixels - well
