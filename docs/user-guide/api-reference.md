@@ -28,7 +28,7 @@ uses the same prefix for gravity, and the repository owner chose to keep
 `g:` as grayscale rather than break it.
 
 **Practical consequence, verified against `parse_bool`/the `g` match arm
-(`options.rs:374-377`, `709-718`):** `g:` here accepts exactly one
+(`options.rs:383-386`, `731-740`):** `g:` here accepts exactly one
 argument, and it must parse as a boolean (`true`/`false`/`1`/`0`). Every
 real imgproxy gravity token (`ce`, `no`, `so`, `ea`, `we`, `noea`, `nowe`,
 `soea`, `sowe`, `sm`, `obj`, `objw`, or a 3-argument `fp:{x}:{y}`) fails
@@ -101,24 +101,25 @@ against the code later.
 
 | Code | Syntax | Default | What it does | imgproxy equivalent |
 |---|---|---|---|---|
-| `rs` | `rs:{type}:{width}:{height}` | no resize | Resize per `{type}` once both dimensions are non-zero; a lone width or height resizes preserving aspect ratio. `{type}` is one of `fit`/`fill`/`force`/`auto` — see [Resize type (`rs:`)](#resize-type-rs) below. `0` for either dimension means "not set". (`options.rs:220-236`) | Same option, same name. |
-| `q` | `q:{0-100}` | encoder default (JPEG 85 / WebP 80) | Global output encode quality. Overridden per-format by `fq:`. (`options.rs:237-240`) | Same. |
-| `fq` | `fq:{format1}:{q1}:{format2}:{q2}:...` | — | Per-format quality override, redefining `q:` for one or more formats in the same request. Only `jpg`/`jpeg` and `webp` are accepted — `fq:png:N` is a `400`, because PNG output here has no continuous quality knob (fixed `CompressionType::Best`). Repeating a format lets the later pair win. (`options.rs:241-284`) | Same option (`format_quality`); imgproxy also silently ignores `png`/other unsupported formats — this service rejects them instead. |
-| `webpo` | `webpo:{compression}` | lossy | WebP compression mode: `lossy` or `lossless` only. **Only the first of imgproxy's three `webp_options` slots is implemented** — `smart_subsample` and `preset` are rejected (`400`) if supplied, not silently ignored, because the underlying `webp` crate has no equivalent knob and no `mixed` mode either. (`options.rs:285-315`) | Partial: imgproxy's `webp_options`/`webpo:{compression}:{smart_subsample}:{preset}`. |
-| `jpgo` | `jpgo:{progressive}:{no_subsample}` | deployment default | JPEG encode tuning. **Only the first two of imgproxy's six slots are implemented** — `trellis_quant`, `overshoot_deringing`, `optimize_scans`, `quant_table` are rejected (`400`) rather than silently ignored, since `mozjpeg::Compress` has no direct equivalent for them. Each of the two implemented slots may be left blank (`jpgo:1:`) to keep this deployment's configured default (`JPEG_PROGRESSIVE`/`JPEG_NO_SUBSAMPLING`). See [subsection](#jpeg-tuning-jpgo) below. (`options.rs:316-352`) | Partial: imgproxy's `jpeg_options`/`jpgo:{progressive}:{no_subsample}:{trellis_quant}:{overshoot_deringing}:{optimize_scans}:{quant_table}`. |
-| `mb` | `mb:{bytes}` | none (no limit) | Maximum encoded output size in bytes; the encoder iteratively lowers quality until the output fits (or a bounded search is exhausted). `0` means "not set". **Only applied to JPEG output** — WebP, PNG, AVIF and GIF ignore it entirely (`encode_single_image`, `src/services/image/handler.rs:911-926`). | Diverges: imgproxy's `max_bytes` also applies to WebP; this service's does not. |
-| `bl` | `bl:{sigma}` | none | Gaussian blur sigma, applied after resize/rotate/flip. (`options.rs:370-373`) | Same. |
-| `g` | `g:{true\|false\|1\|0}` | none (off) | **Grayscale** — see the [callout above](#the-most-important-divergence-from-imgproxy-g-is-grayscale-not-gravity). (`options.rs:374-377`) | **Diverges — imgproxy's `g:` is gravity.** |
+| `rs` | `rs:{type}:{width}:{height}` | no resize | Resize per `{type}` once both dimensions are non-zero; a lone width or height resizes preserving aspect ratio. `{type}` is one of `fit`/`fill`/`force`/`auto` — see [Resize type (`rs:`)](#resize-type-rs) below. `0` for either dimension means "not set". (`options.rs:229-245`) | Same option, same name. |
+| `q` | `q:{0-100}` | encoder default (JPEG 85 / WebP 80) | Global output encode quality. Overridden per-format by `fq:`. (`options.rs:246-249`) | Same. |
+| `fq` | `fq:{format1}:{q1}:{format2}:{q2}:...` | — | Per-format quality override, redefining `q:` for one or more formats in the same request. Only `jpg`/`jpeg` and `webp` are accepted — `fq:png:N` is a `400`, because PNG output here has no continuous quality knob (fixed `CompressionType::Best`). Repeating a format lets the later pair win. (`options.rs:250-293`) | Same option (`format_quality`); imgproxy also silently ignores `png`/other unsupported formats — this service rejects them instead. |
+| `webpo` | `webpo:{compression}` | lossy | WebP compression mode: `lossy` or `lossless` only. **Only the first of imgproxy's three `webp_options` slots is implemented** — `smart_subsample` and `preset` are rejected (`400`) if supplied, not silently ignored, because the underlying `webp` crate has no equivalent knob and no `mixed` mode either. (`options.rs:294-324`) | Partial: imgproxy's `webp_options`/`webpo:{compression}:{smart_subsample}:{preset}`. |
+| `jpgo` | `jpgo:{progressive}:{no_subsample}` | deployment default | JPEG encode tuning. **Only the first two of imgproxy's six slots are implemented** — `trellis_quant`, `overshoot_deringing`, `optimize_scans`, `quant_table` are rejected (`400`) rather than silently ignored, since `mozjpeg::Compress` has no direct equivalent for them. Each of the two implemented slots may be left blank (`jpgo:1:`) to keep this deployment's configured default (`JPEG_PROGRESSIVE`/`JPEG_NO_SUBSAMPLING`). See [subsection](#jpeg-tuning-jpgo) below. (`options.rs:325-361`) | Partial: imgproxy's `jpeg_options`/`jpgo:{progressive}:{no_subsample}:{trellis_quant}:{overshoot_deringing}:{optimize_scans}:{quant_table}`. |
+| `mb` | `mb:{bytes}` | none (no limit) | Maximum encoded output size in bytes; the encoder iteratively lowers quality until the output fits (or a bounded search is exhausted). `0` means "not set". **Only applied to JPEG output** — WebP, PNG, AVIF and GIF ignore it entirely (`encode_single_image`, `src/services/image/handler.rs:1029-1061`). | Diverges: imgproxy's `max_bytes` also applies to WebP; this service's does not. |
+| `bl` | `bl:{sigma}` | none | Gaussian blur sigma, applied after resize/rotate/flip. (`options.rs:379-382`) | Same. |
+| `g` | `g:{true\|false\|1\|0}` | none (off) | **Grayscale** — see the [callout above](#the-most-important-divergence-from-imgproxy-g-is-grayscale-not-gravity). (`options.rs:383-386`) | **Diverges — imgproxy's `g:` is gravity.** |
 | `el` | `el:{true\|false\|1\|0}` | `false` | Enlarge: permit upscaling past the source resolution. Refused by default ([GH #36](https://github.com/vaam-store/image-resizer/issues/36)). | Same. |
-| `bg` | `bg:{R}:{G}:{B}` or `bg:{hex}` | opaque white | Background colour used to flatten alpha for formats with no alpha channel (JPEG) and to normalise fully-transparent pixels for formats that keep alpha (PNG/WebP/AVIF/GIF). `{hex}` accepts 3- or 6-digit hex, no leading `#`. (`options.rs:382-387`, `params.rs:348-359`) | Same, except imgproxy's default is "disabled" (no flatten); this service always flattens. |
-| `ar` | `ar:{true\|false\|1\|0}` | `true` (on) | Auto-rotate per the source's EXIF `Orientation` tag, before any resize/crop. Note the default is `true` here — unlike every other boolean option on this list. (`options.rs:395-398`, `params.rs:361-379`) | Same, including the `true` default. |
-| `rot` | `rot:{angle}` | `0` | Rotate clockwise by `{angle}` degrees, applied *after* resize. Must be a multiple of 90 (negative allowed, normalised via `rem_euclid(360)`). (`options.rs:448-451`) | Same. |
-| `fl` | `fl:{horizontal}:{vertical}` | `0:0` | Flip. Each slot is an independent boolean; `fl:1` flips only horizontally. Applied immediately after `rot:`. (`options.rs:452-469`) | Same. |
-| `ex` | `ex:{true\|false\|1\|0}` | `false` | Extend: pad the resized image up to the full requested `width`x`height` (centred, background-filled) if the resize would otherwise come out smaller. No-op unless both `width` and `height` are set. **Only the boolean argument is accepted** — imgproxy's optional trailing `:gravity` argument is rejected (`400`), since only centre-gravity extend is implemented. (`options.rs:479-487`) | Partial: imgproxy's `extend`/`ex:{enabled}:{gravity}` — the gravity slot isn't supported here. |
-| `z` | `z:{zoom}` or `z:{zoom_x}:{zoom_y}` | `1.0:1.0` | Multiplies an axis's requested size before resize. A single argument sets both axes. **Only scales an axis that already has an explicit `width`/`height` set** — unlike imgproxy, this service cannot zoom the "natural" source size with no explicit dimension. (`options.rs:494-500`, `effective_resize_box`, `src/services/image/handler.rs:2413-2417`) | Diverges: imgproxy can also scale with no explicit width/height; this service can't. |
-| `dpr` | `dpr:{value}` | `1.0` | Device-pixel-ratio multiplier, same mechanics and same "only scales an axis with an explicit dimension" narrowing as `z:` above — combined multiplicatively with it on the same axis. (`options.rs:501-505`) | Diverges the same way `z:` does. |
-| `mw` | `mw:{width}` | none | Minimum *resulting* width — a floor, not a cap. **Not gated by `el:`**: it can force upscaling past the source even with `el:0`, matching imgproxy's own behaviour. (`options.rs:506-512`) | Same (`min-width`). |
-| `mh` | `mh:{height}` | none | Same as `mw`, for height. (`options.rs:513-516`) | Same (`min-height`). |
+| `bg` | `bg:{R}:{G}:{B}` or `bg:{hex}` | opaque white | Background colour used to flatten alpha for formats with no alpha channel (JPEG) and to normalise fully-transparent pixels for formats that keep alpha (PNG/WebP/AVIF/GIF). `{hex}` accepts 3- or 6-digit hex, no leading `#`. (`options.rs:391-396`, `params.rs:348-359`) | Same, except imgproxy's default is "disabled" (no flatten); this service always flattens. |
+| `ar` | `ar:{true\|false\|1\|0}` | `true` (on) | Auto-rotate per the source's EXIF `Orientation` tag, before any resize/crop. Note the default is `true` here — unlike every other boolean option on this list. (`options.rs:404-407`, `params.rs:361-379`) | Same, including the `true` default. |
+| `sm` | `sm:{true\|false\|1\|0}` | `true` (strip) | Strip the source's EXIF metadata (GPS, camera make/model, timestamps, ...) from the output instead of forwarding it. Like `ar`, the default is `true` — unlike every other boolean option on this list except `ar`, and a deliberate behaviour change from before this option existed (EXIF used to be silently dropped for every format anyway, just as an accident of no encoder being asked to write it, not a considered default). Governs EXIF only: the embedded ICC colour profile is a separate, always-forwarded concern (see [Processing pipeline order](#processing-pipeline-order)), and a kept EXIF blob has its `Orientation` tag neutralised to `1` when `ar` already rotated the pixels, so a viewer can't double-rotate. Real per-format support for *writing* kept EXIF back out: JPEG (raw `mozjpeg` `APP1` marker) and PNG/AVIF (`ImageEncoder::set_exif_metadata`) honour `sm:0`; WebP and GIF cannot — their encoders have no EXIF API at all, so `sm:0` against those output formats is a documented no-op. (`options.rs:408-420`, `params.rs:381-430`, `encode_single_image`, `src/services/image/handler.rs:661-744`) | Same option, same name and default (`IMGPROXY_STRIP_METADATA: true`). imgproxy additionally exposes `strip_color_profile`/`scp` (strip + convert ICC to sRGB — not implemented here; would need a colour-management dependency this crate doesn't have) and `keep_copyright`/`kcr` (retain just the copyright field while otherwise stripping — not implemented here; would need an EXIF/IPTC/XMP field-level parser this crate doesn't have). `sm` here is all-or-nothing. |
+| `rot` | `rot:{angle}` | `0` | Rotate clockwise by `{angle}` degrees, applied *after* resize. Must be a multiple of 90 (negative allowed, normalised via `rem_euclid(360)`). (`options.rs:470-473`) | Same. |
+| `fl` | `fl:{horizontal}:{vertical}` | `0:0` | Flip. Each slot is an independent boolean; `fl:1` flips only horizontally. Applied immediately after `rot:`. (`options.rs:474-491`) | Same. |
+| `ex` | `ex:{true\|false\|1\|0}` | `false` | Extend: pad the resized image up to the full requested `width`x`height` (centred, background-filled) if the resize would otherwise come out smaller. No-op unless both `width` and `height` are set. **Only the boolean argument is accepted** — imgproxy's optional trailing `:gravity` argument is rejected (`400`), since only centre-gravity extend is implemented. (`options.rs:501-509`) | Partial: imgproxy's `extend`/`ex:{enabled}:{gravity}` — the gravity slot isn't supported here. |
+| `z` | `z:{zoom}` or `z:{zoom_x}:{zoom_y}` | `1.0:1.0` | Multiplies an axis's requested size before resize. A single argument sets both axes. **Only scales an axis that already has an explicit `width`/`height` set** — unlike imgproxy, this service cannot zoom the "natural" source size with no explicit dimension. (`options.rs:516-522`, `effective_resize_box`, `src/services/image/handler.rs:2765-2773`) | Diverges: imgproxy can also scale with no explicit width/height; this service can't. |
+| `dpr` | `dpr:{value}` | `1.0` | Device-pixel-ratio multiplier, same mechanics and same "only scales an axis with an explicit dimension" narrowing as `z:` above — combined multiplicatively with it on the same axis. (`options.rs:523-527`) | Diverges the same way `z:` does. |
+| `mw` | `mw:{width}` | none | Minimum *resulting* width — a floor, not a cap. **Not gated by `el:`**: it can force upscaling past the source even with `el:0`, matching imgproxy's own behaviour. (`options.rs:528-534`) | Same (`min-width`). |
+| `mh` | `mh:{height}` | none | Same as `mw`, for height. (`options.rs:535-538`) | Same (`min-height`). |
 
 ##### Resize type (`rs:`)
 
@@ -138,7 +139,7 @@ rs:{type}:{width}:{height}
 An empty type slot (`rs::800:600`) also defaults to `fit`. An unrecognised
 type is rejected with `400`, not silently substituted
 (`ResizeType::from_str`, `src/models/params.rs:113-133`; dispatch in
-`src/services/image/handler.rs:1003-1042`).
+`src/services/image/handler.rs:1147-1188`).
 
 ##### Explicit crop (`c:`)
 
@@ -148,8 +149,8 @@ c:{width}:{height}[:{gravity_tokens...}]
 
 Crops the *decoded, autorotated, trimmed* image to `{width}`x`{height}`
 before any resize math runs (`process_image_blocking_with_limits`,
-`src/services/image/handler.rs:607-620`). Each dimension follows a
-three-way convention (`options.rs:788-812`, `parse_crop_dimension`):
+`src/services/image/handler.rs:618-644`). Each dimension follows a
+three-way convention (`options.rs:810-834`, `parse_crop_dimension`):
 
 - `0` — use the full source dimension on that axis (no crop on that axis).
 - `>= 1` — absolute pixel size.
@@ -160,7 +161,7 @@ using the same token vocabulary as [`gr:`](#gravity-gr) below (`ce`, `no`,
 `so`, `ea`, `we`, `noea`, `nowe`, `soea`, `sowe`, or `fp:{x}:{y}`). If
 omitted, the crop inherits whatever `gr:` sets elsewhere in the URL —
 order-independent, since resolution happens after the whole URL has been
-parsed (`options.rs:67-72`, `569-573`).
+parsed (`options.rs:75-80`, `569-573`).
 
 ##### Gravity (`gr:`)
 
@@ -173,7 +174,7 @@ Anchors two things: the overflow-crop side of `rs:fill`/`rs:auto`, and an
 explicit `c:` crop that doesn't name its own gravity. `{type}` is one of
 `ce` (centre, default), `no`, `so`, `ea`, `we`, `noea`, `nowe`, `soea`,
 `sowe`, or `fp:{x}:{y}` — a focus point, `x`/`y` fractions in `[0, 1]` of
-the image (`options.rs:826-862`).
+the image (`options.rs:848-884`).
 
 Two divergences from imgproxy, both deliberate:
 
@@ -181,7 +182,7 @@ Two divergences from imgproxy, both deliberate:
 - **Smart/saliency gravity (`sm`) and object-detection gravity (`obj`,
   `objw`, imgproxy Pro) are rejected with `400`**, not silently aliased to
   `ce` or any other gravity — there is no saliency/object-detection
-  implementation behind them (`options.rs:820-825`, `858-860`;
+  implementation behind them (`options.rs:842-847`, `858-860`;
   `Gravity`'s doc comment, `src/models/params.rs:149-155`).
 - **No `x_offset`/`y_offset` nudge** on the directional/corner/centre
   variants. imgproxy lets every gravity type take an extra offset pair;
@@ -206,15 +207,15 @@ the grammar).
 
 `wm:` is what actually enables watermarking; every other field below is a
 modifier that has no effect unless `wm:` is also present
-(`options.rs:124-130`). Composited after resize/rotate/flip/grayscale/blur
+(`options.rs:132-138`). Composited after resize/rotate/flip/grayscale/blur
 but before the alpha-flatten/normalise stage, so the watermark's own alpha
 is correctly composited rather than slipping past it
-(`src/services/image/handler.rs:727-741`).
+(`src/services/image/handler.rs:853-858`).
 
 | Field | Syntax | Default | Meaning |
 |---|---|---|---|
 | Opacity (required) | `wm:{opacity}` | — | Final opacity, clamped to `[0, 1]`. |
-| Position | `wm:{opacity}:{position}` | `ce` | One of `ce`, `no`, `so`, `ea`, `we`, `noea`, `nowe`, `soea`, `sowe`. **Tiling modes `re` (repeat) and `ch` (chessboard) are documented by imgproxy but not implemented** — rejected with `400` like any other unsupported value (`options.rs:647-671`). |
+| Position | `wm:{opacity}:{position}` | `ce` | One of `ce`, `no`, `so`, `ea`, `we`, `noea`, `nowe`, `soea`, `sowe`. **Tiling modes `re` (repeat) and `ch` (chessboard) are documented by imgproxy but not implemented** — rejected with `400` like any other unsupported value (`options.rs:669-693`). |
 | X offset | `wm:{opacity}:{position}:{x_offset}` | `0` | From `position`'s anchor. `>= 1.0` magnitude is absolute pixels; smaller is a fraction of the base image's width. |
 | Y offset | `wm:{opacity}:{position}:{x}:{y_offset}` | `0` | Same convention, against height. |
 | Scale | `wm:{opacity}:{position}:{x}:{y}:{scale}` | `0` (no scaling) | Watermark size as a fraction of the base image, fit preserving the watermark's own aspect ratio. |
@@ -224,7 +225,7 @@ is correctly composited rather than slipping past it
 | Shadow | `wmsh:{sigma}` | none | Gaussian-blur sigma for a drop-shadow silhouette behind the watermark. |
 
 Every trailing slot in `wm:` may be omitted (a shorter segment) or left
-blank (`wm:0.5::10`) to keep its default (`options.rs:610-645`).
+blank (`wm:0.5::10`) to keep its default (`options.rs:632-667`).
 
 ##### JPEG tuning (`jpgo:`)
 
@@ -239,7 +240,7 @@ jpgo:{progressive}:{no_subsample}
 
 Either slot left blank keeps this deployment's configured default
 (`JPEG_PROGRESSIVE`/`JPEG_NO_SUBSAMPLING`, resolved in
-`encode_single_image`, `src/services/image/handler.rs:903-908`). imgproxy's
+`encode_single_image`, `src/services/image/handler.rs:1034-1039`). imgproxy's
 remaining four slots (`trellis_quant`, `overshoot_deringing`,
 `optimize_scans`, `quant_table`) are **not implemented and are rejected
 with `400`** if a third argument or beyond is present — there is no
@@ -253,7 +254,7 @@ t:{threshold}:{color}:{equal_hor}:{equal_ver}
 
 Removes uniform-colour borders. Always the *first* geometry operation
 applied, right after decode/autorotate and before crop/resize
-(`src/services/image/handler.rs:596-605`).
+(`src/services/image/handler.rs:618-631`).
 
 - `threshold` (required) — colour-similarity tolerance, compared as the
   maximum per-channel (Chebyshev) distance from the target colour. This is
@@ -274,7 +275,7 @@ pd:{top}:{right}:{bottom}:{left}
 ```
 
 CSS-shorthand-style cascading fallback, reproducing imgproxy's exact
-positional-with-fallback parse (`options.rs:925-971`):
+positional-with-fallback parse (`options.rs:947-993`):
 
 - `right` falls back to `top` when omitted/empty.
 - `bottom` falls back to `top` (not `right`) when omitted/empty.
@@ -323,25 +324,28 @@ both env vars.
 
 Several options interact, and the order they're applied in is not obvious
 from the URL alone — for example, `t:` (trim) always runs before `c:`
-(crop), and `rot:`/`fl:` run *after* resize, not before. This is the exact
-order `ImageService` applies them in
-(`src/services/image/handler.rs:490-968`):
+(crop), and `rot:`/`fl:` run *after* resize, not before. `sm:` (metadata
+strip/keep) is not a geometry step at all — it's resolved once at the very
+top of the encode stage (node N below) and only affects what the chosen
+encoder writes, not any pixel transform. This is the exact order
+`ImageService` applies them in
+(`src/services/image/handler.rs:534-1112`):
 
 ```mermaid
 flowchart TD
-    A["Decode source bytes<br/>(DCT-scaled for JPEG — decode_jpeg_scaled,<br/>handler.rs:2832)"] --> B["Autorotate<br/>(EXIF Orientation, ar: — handler.rs:592-594)"]
-    B --> C["Trim<br/>(t: — handler.rs:602-605)"]
-    C --> D["Explicit crop<br/>(c: — handler.rs:615-618)"]
-    D --> E["Resize<br/>(rs:/fit/fill/force/auto,<br/>zoom/dpr/enlarge/min-width/min-height —<br/>handler.rs:665-684)"]
-    E --> F["Rotate<br/>(rot: — handler.rs:1056)"]
-    F --> G["Flip<br/>(fl: — handler.rs:1057)"]
-    G --> H["Grayscale<br/>(g: — handler.rs:1060-1064)"]
-    H --> I["Blur<br/>(bl: — handler.rs:1066-1070)"]
-    I --> J["Extend<br/>(ex: — handler.rs:694-705)"]
-    J --> K["Padding<br/>(pd: — handler.rs:707-710)"]
-    K --> L["Watermark composite<br/>(wm: — handler.rs:736-741)"]
-    L --> M["Alpha flatten / normalise<br/>(bg: — handler.rs:767-801)"]
-    M --> N["Encode<br/>(q:/fq:/jpgo:/mb:/webpo:, format from<br/>the URL's .extension — handler.rs:847-965)"]
+    A["Decode source bytes<br/>(DCT-scaled for JPEG — decode_jpeg_scaled,<br/>handler.rs:3155)"] --> B["Autorotate<br/>(EXIF Orientation, ar: — handler.rs:618-620)"]
+    B --> C["Trim<br/>(t: — handler.rs:628-631)"]
+    C --> D["Explicit crop<br/>(c: — handler.rs:641-644)"]
+    D --> E["Resize<br/>(rs:/fit/fill/force/auto,<br/>zoom/dpr/enlarge/min-width/min-height —<br/>handler.rs:782-801)"]
+    E --> F["Rotate<br/>(rot: — handler.rs:1200)"]
+    F --> G["Flip<br/>(fl: — handler.rs:1201)"]
+    G --> H["Grayscale<br/>(g: — handler.rs:1204-1208)"]
+    H --> I["Blur<br/>(bl: — handler.rs:1210-1214)"]
+    I --> J["Extend<br/>(ex: — handler.rs:811-822)"]
+    J --> K["Padding<br/>(pd: — handler.rs:824-827)"]
+    K --> L["Watermark composite<br/>(wm: — handler.rs:853-858)"]
+    L --> M["Alpha flatten / normalise<br/>(bg: — handler.rs:887-918)"]
+    M --> N["Encode<br/>(q:/fq:/jpgo:/mb:/webpo:/sm:, format from<br/>the URL's .extension — handler.rs:971-1109)"]
 ```
 
 Two ordering consequences worth calling out explicitly:
@@ -353,7 +357,7 @@ Two ordering consequences worth calling out explicitly:
   pipeline), a 90°/270° rotation's effect on *which axis* gets which
   requested dimension is already accounted for earlier, in the resize-box
   calculation itself (`effective_resize_box`,
-  `src/services/image/handler.rs:2430-2497`) — the rotation you see here
+  `src/services/image/handler.rs:2740-2827`) — the rotation you see here
   is purely the final pixel rotation.
 
 #### `{plain|base64 source}.{extension}`

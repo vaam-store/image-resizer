@@ -64,6 +64,14 @@ pub struct ProcessingOptions {
     /// own doc comment for why.
     pub autorotate: Option<bool>,
 
+    /// `sm`'s parsed boolean (#5) - see
+    /// [`crate::models::params::ResizeQuery::strip_metadata`]. `None` means
+    /// "use the default", which is `true` (strip) - same "absent means the
+    /// non-zero-value default" shape as `autorotate` just above, not the
+    /// `false`-when-absent convention every other `Option<bool>` field here
+    /// follows.
+    pub strip_metadata: Option<bool>,
+
     /// `c`'s parsed crop region (#50) - see [`Crop`]. A `c:` segment whose
     /// own gravity token is omitted resolves its `Crop::gravity` from
     /// `Self::gravity` (below) once the whole segment list has been parsed
@@ -165,6 +173,7 @@ impl Default for ProcessingOptions {
             max_bytes: None,
             background: None,
             autorotate: None,
+            strip_metadata: None,
             crop: None,
             gravity: Gravity::default(),
             rotate: 0,
@@ -395,6 +404,19 @@ impl ProcessingOptions {
                 "ar" => {
                     let [value] = require_args::<1>(&args, segment)?;
                     opts.autorotate = Some(parse_bool(value, segment)?);
+                }
+                // sm:{0|1|true|false} - imgproxy's `strip_metadata`/`sm`
+                // processing option (#5,
+                // <https://docs.imgproxy.net/usage/processing#strip-metadata>):
+                // whether to drop the source's EXIF metadata instead of
+                // forwarding it to the output. Carried through to
+                // `ResizeQuery::strip_metadata`, defaulting to `true` (strip)
+                // when this segment is absent - see that field's doc comment
+                // for why this, like `ar` above, does not follow every other
+                // `Option<bool>` field's "`false` when absent" convention.
+                "sm" => {
+                    let [value] = require_args::<1>(&args, segment)?;
+                    opts.strip_metadata = Some(parse_bool(value, segment)?);
                 }
                 // c:{width}:{height}[:{gravity_tokens...}] - imgproxy's
                 // explicit crop (#50, <https://docs.imgproxy.net/usage/processing#crop>).
@@ -1293,6 +1315,42 @@ mod tests {
     fn autorotate_defaults_to_none_when_absent() {
         let opts = ProcessingOptions::parse(&[]).unwrap();
         assert_eq!(opts.autorotate, None);
+    }
+
+    #[test]
+    fn parses_strip_metadata() {
+        assert_eq!(
+            ProcessingOptions::parse(&["sm:1"]).unwrap().strip_metadata,
+            Some(true)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["sm:0"]).unwrap().strip_metadata,
+            Some(false)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["sm:true"])
+                .unwrap()
+                .strip_metadata,
+            Some(true)
+        );
+        assert_eq!(
+            ProcessingOptions::parse(&["sm:false"])
+                .unwrap()
+                .strip_metadata,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn strip_metadata_defaults_to_none_when_absent() {
+        let opts = ProcessingOptions::parse(&[]).unwrap();
+        assert_eq!(opts.strip_metadata, None);
+    }
+
+    #[test]
+    fn strip_metadata_rejects_non_boolean_value() {
+        let err = ProcessingOptions::parse(&["sm:maybe"]).unwrap_err();
+        assert!(matches!(err, UrlParseError::InvalidOptionValue { .. }));
     }
 
     #[test]
