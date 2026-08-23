@@ -95,6 +95,59 @@ jobs:
         continue-on-error: true
         run: cargo clippy --features local_fs --all-targets -- -D warnings
 
+  helm-verify:
+    # GH #84 / #85: nothing in CI ever rendered helm/emgr or
+    # helm/serverless, which is exactly how both charts shipped without
+    # the SIGNING_KEY/SIGNING_SALT/METRICS_AUTH_TOKEN env wiring (#84) and
+    # helm/serverless shipped a doubled `ghcr.io/ghcr.io/...` image
+    # reference, a literal `${LOG_LEVEL:-info}` value, and an unpublished
+    # `latest` tag (#85). `helm lint`/`helm template` need no cluster and
+    # run in well under a minute, so there's no excuse for this gap.
+    name: Helm lint + template (both charts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      # `helm dependency build` (not `update`) - both charts commit a
+      # Chart.lock, so this resolves exactly the pinned `common` library
+      # version rather than re-resolving against whatever is newest.
+      # `helm dependency build` resolves `Chart.yaml`'s dependencies against
+      # repositories the running machine already knows about. A developer's
+      # laptop usually has them from earlier work, so this step passes
+      # locally and fails on a clean runner with "no repository definition
+      # for ...". Adding the repo explicitly is what makes the job
+      # reproducible rather than dependent on ambient local state - which is
+      # the entire point of adding it to CI.
+      #
+      # helm/serverless's `common` comes from an OCI registry, which needs no
+      # `helm repo add`; only helm/emgr's bjw-s-labs repository does.
+      - name: helm repo add
+        run: |
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm repo update
+
+      - name: helm dependency build
+        run: |
+          helm dependency build ./helm/emgr
+          helm dependency build ./helm/serverless
+
+      - name: helm lint
+        run: |
+          helm lint ./helm/emgr
+          helm lint ./helm/serverless
+
+      # Rendering is the actual regression gate here: #85's doubled
+      # registry, unexpanded LOG_LEVEL, and #84's missing signing/metrics
+      # env vars were all only visible in rendered output, never in the
+      # source YAML alone (`helm lint` alone did not catch any of them).
+      - name: helm template
+        run: |
+          helm template ./helm/emgr
+          helm template ./helm/serverless
+
   cargo-deny:
     name: cargo-deny (advisories, licenses, bans, sources)
     runs-on: ubuntu-latest

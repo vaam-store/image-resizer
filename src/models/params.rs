@@ -378,6 +378,57 @@ pub struct ResizeQuery {
     /// after a crop would compose the crop against the wrong axes.
     pub autorotate: bool,
 
+    /// #5 - imgproxy's `strip_metadata`/`sm:{0|1|true|false}` processing
+    /// option (<https://docs.imgproxy.net/usage/processing#strip-metadata>):
+    /// whether to drop the source's EXIF metadata (GPS coordinates, camera
+    /// make/model, timestamps, ...) instead of forwarding it to the output.
+    ///
+    /// Defaults to `true` (strip) - matching imgproxy's own documented
+    /// default (`IMGPROXY_STRIP_METADATA: true`) and, unlike every other
+    /// boolean option on this struct besides `autorotate`, chosen
+    /// deliberately rather than inherited from `bool`'s zero value: this
+    /// service accepts arbitrary user-uploaded sources, and forwarding GPS
+    /// coordinates or other EXIF fields by default is a real privacy
+    /// footgun, not a neutral one. A caller who wants metadata preserved
+    /// must opt in with `sm:0`/`sm:false`.
+    ///
+    /// This governs EXIF specifically - the fields a phone/camera embeds
+    /// about *when, where and with what* a photo was taken. It deliberately
+    /// does **not** cover:
+    /// - The embedded ICC colour profile (`icc_profile` threaded through
+    ///   `ImageService::encode_single_image`, `src/services/image/handler.rs`,
+    ///   #33) - that's colour-correctness data, not privacy-sensitive
+    ///   metadata, and stays unconditionally forwarded exactly as it did
+    ///   before this option existed. imgproxy draws the same line, just with
+    ///   its own separate `strip_color_profile`/`scp` option (default
+    ///   `true`, and unlike a bare "stop forwarding" toggle, imgproxy's
+    ///   version *converts* the profile to sRGB rather than merely dropping
+    ///   it - color-managing every image on the way in would need a real
+    ///   colour-management dependency this crate doesn't have and can't add
+    ///   here, so that option is not implemented at all rather than shipped
+    ///   as a lesser, non-equivalent stand-in).
+    /// - imgproxy's `keep_copyright`/`kcr` (default `true`: even when
+    ///   `strip_metadata` is on, imgproxy keeps just the copyright field) is
+    ///   also not implemented - doing that faithfully means parsing the raw
+    ///   EXIF/IPTC/XMP blob well enough to extract one field, which needs an
+    ///   actual metadata-parsing dependency this crate doesn't have either.
+    ///   `strip_metadata` here is all-or-nothing.
+    ///
+    /// EXIF `Orientation` is a special case regardless of this flag's value:
+    /// `autorotate` (above) applies it to the *pixels* and the corrected
+    /// image never carries a stale rotation instruction forward - see
+    /// `ImageService::neutralize_exif_orientation`'s doc comment
+    /// (`src/services/image/handler.rs`) for how "keep metadata" avoids
+    /// telling an EXIF-aware viewer to rotate an already-rotated image a
+    /// second time.
+    ///
+    /// Per-format support for actually *writing* kept EXIF back out is not
+    /// uniform - see `ImageService::encode_single_image`'s own doc comment
+    /// for the real matrix (JPEG via a raw `mozjpeg` APP1 marker, PNG and
+    /// AVIF via `image`'s `ImageEncoder::set_exif_metadata`, WebP and GIF
+    /// unsupported by their respective encoders regardless of this flag).
+    pub strip_metadata: bool,
+
     /// Explicit `crop`/`c:` processing option (#50) - `None` means no
     /// explicit crop, the pre-#50 behaviour. See [`Crop`].
     pub crop: Option<Crop>,
@@ -539,7 +590,9 @@ impl Default for ResizeQuery {
     /// "autorotate stays on unless a caller opts out" default; `crop`/
     /// `gravity` (#50) default to "no explicit crop" / `Gravity::default()`
     /// (`Center`), same as `ProcessingOptions`'s own hand-written `Default`
-    /// (`src/modules/url/options.rs`).
+    /// (`src/modules/url/options.rs`). `strip_metadata` (#5) also defaults
+    /// to `true` - not `bool`'s zero value - same reasoning as `autorotate`:
+    /// see its own field doc comment.
     fn default() -> Self {
         Self {
             url: String::new(),
@@ -559,6 +612,7 @@ impl Default for ResizeQuery {
             max_bytes: None,
             background: None,
             autorotate: true,
+            strip_metadata: true,
             crop: None,
             gravity: Gravity::default(),
             rotate: 0,

@@ -80,6 +80,7 @@ fn bench_encode(c: &mut Criterion) {
                         progressive,
                         no_subsampling,
                         None,
+                        None,
                     )
                     .expect("encode fixture")
                 });

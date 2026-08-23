@@ -371,6 +371,130 @@ pub fn oriented(exif_orientation: u8) -> Vec<u8> {
     })
 }
 
+/// Builds a raw, prefix-less TIFF-formatted Exif blob (same convention as
+/// [`minimal_exif_orientation`] above) carrying **both** an `Orientation`
+/// tag (0x0112) and a full GPS IFD (`GPSInfo`/0x8825 pointing at
+/// `GPSLatitudeRef`/`GPSLatitude`/`GPSLongitudeRef`/`GPSLongitude`) - #5's
+/// "keep metadata" tests need a real, privacy-sensitive field (GPS
+/// coordinates), not just the bare Orientation tag `minimal_exif_orientation`
+/// already covers, to prove strip-vs-keep actually differs in substance and
+/// not merely in whether an (otherwise empty) APP1 segment is present at
+/// all.
+///
+/// Byte layout (little-endian TIFF, `"II"`), sized and offset by hand so
+/// every IFD's `next-IFD`/tag-value offset points at the byte right where
+/// the following section actually starts - each `assert_eq!` below is a
+/// self-check that a later edit to one section can't silently desync the
+/// hardcoded offset baked into an earlier one:
+/// - `0..8`    TIFF header (byte order, magic 42, IFD0 offset = 8)
+/// - `8..38`   IFD0 - 2 entries (`Orientation`, `GPSInfo` pointer -> 38) + next-IFD (0)
+/// - `38..92`  GPS IFD - 4 entries (`GPSLatitudeRef`, `GPSLatitude` -> 92,
+///   `GPSLongitudeRef`, `GPSLongitude` -> 116) + next-IFD (0)
+/// - `92..116` `GPSLatitude`'s 3 RATIONALs (degrees/minutes/seconds, denominator 1)
+/// - `116..140` `GPSLongitude`'s 3 RATIONALs
+///
+/// The coordinates encoded (37 49 32 N, 122 28 42 W) are the Golden Gate
+/// Bridge, San Francisco - a real, recognisable location, not placeholder
+/// zeros, so a test asserting "GPS is gone" can't accidentally pass against
+/// a degenerate all-zero value that might mean "unset" under some other
+/// convention.
+fn exif_orientation_and_gps(exif_orientation: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(140);
+
+    // --- TIFF header (0..8) ---
+    buf.extend_from_slice(b"II");
+    buf.extend_from_slice(&42u16.to_le_bytes());
+    buf.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+
+    // --- IFD0 (8..38): Orientation + GPSInfo pointer ---
+    buf.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
+    // Orientation (0x0112, SHORT, count 1)
+    buf.extend_from_slice(&0x0112u16.to_le_bytes());
+    buf.extend_from_slice(&3u16.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&u16::from(exif_orientation).to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // padding (high 2 bytes of value field)
+    // GPSInfo (0x8825, LONG, count 1) -> GPS IFD at offset 38
+    buf.extend_from_slice(&0x8825u16.to_le_bytes());
+    buf.extend_from_slice(&4u16.to_le_bytes());
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&38u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD: none
+    assert_eq!(buf.len(), 38, "IFD0 must end exactly at the GPS IFD's offset");
+
+    // --- GPS IFD (38..92): LatRef, Lat, LonRef, Lon ---
+    buf.extend_from_slice(&4u16.to_le_bytes()); // 4 entries
+    // GPSLatitudeRef (1, ASCII, count 2 incl. NUL) - "N\0" fits inline
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(b"N\0\0\0");
+    // GPSLatitude (2, RATIONAL, count 3) -> data at offset 92
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&5u16.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&92u32.to_le_bytes());
+    // GPSLongitudeRef (3, ASCII, count 2 incl. NUL) - "W\0"
+    buf.extend_from_slice(&3u16.to_le_bytes());
+    buf.extend_from_slice(&2u16.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(b"W\0\0\0");
+    // GPSLongitude (4, RATIONAL, count 3) -> data at offset 116
+    buf.extend_from_slice(&4u16.to_le_bytes());
+    buf.extend_from_slice(&5u16.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
+    buf.extend_from_slice(&116u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD: none
+    assert_eq!(buf.len(), 92, "GPS IFD must end exactly at the GPSLatitude data offset");
+
+    // --- GPSLatitude data (92..116): 37 deg, 49 min, 32 sec ---
+    for value in [37u32, 49, 32] {
+        buf.extend_from_slice(&value.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // denominator
+    }
+    assert_eq!(
+        buf.len(),
+        116,
+        "GPSLongitude data must start right after GPSLatitude's"
+    );
+
+    // --- GPSLongitude data (116..140): 122 deg, 28 min, 42 sec ---
+    for value in [122u32, 28, 42] {
+        buf.extend_from_slice(&value.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+    }
+    assert_eq!(buf.len(), 140);
+
+    buf
+}
+
+/// A JPEG fixture (`oriented_canonical`'s pixels, undistorted - GPS/orientation
+/// stripping is what's under test here, not the orientation-transform math
+/// `oriented()` above already covers) whose Exif blob carries both a real
+/// GPS location and the given `exif_orientation` code (#5). Used to prove:
+/// - `sm`'s default (strip) drops the GPS coordinates from the output.
+/// - `sm:0` (keep) forwards them, for every format that can carry Exif.
+/// - When `exif_orientation != 1` and autorotate is on, the *kept* output's
+///   own Orientation tag reads back as `1` (normalised), not the original
+///   value - i.e. the double-rotation guard actually ran.
+pub fn jpeg_with_gps_exif(exif_orientation: u8) -> Vec<u8> {
+    cached(&format!("gps_exif_{exif_orientation}.jpg"), || {
+        let canonical = DynamicImage::ImageRgb8(oriented_canonical());
+
+        use image::ImageEncoder;
+
+        let mut buf = Cursor::new(Vec::new());
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut buf);
+        encoder
+            .set_exif_metadata(exif_orientation_and_gps(exif_orientation))
+            .expect("JpegEncoder supports Exif metadata");
+        canonical
+            .write_with_encoder(encoder)
+            .expect("fixture encoding should never fail");
+        buf.into_inner()
+    })
+}
+
 /// content-type for a fixture identified by name, as served by the
 /// `benchmark` bin's local origin server and used to pick a decode/encode
 /// extension in tests.

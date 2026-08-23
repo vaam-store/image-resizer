@@ -105,6 +105,15 @@ pub struct ImageService {
     config: PerformanceConfig,
 }
 
+/// Decode result shared by `ImageService::decode_with_limits`/
+/// `decode_with_image_crate`/`decode_jpeg_scaled`: the pixels, the source's
+/// EXIF `Orientation` (#33), its embedded ICC colour profile if any (#33),
+/// and its raw EXIF metadata blob if any (#5) - see each function's own doc
+/// comment for how the latter three are read off the source. A named alias
+/// (clippy's `type_complexity`) rather than repeating the 4-tuple at every
+/// one of those signatures.
+type DecodedImage = (DynamicImage, Orientation, Option<Vec<u8>>, Option<Vec<u8>>);
+
 impl ImageService {
     pub fn new() -> Result<Self> {
         Self::with_config(PerformanceConfig::default())
@@ -564,6 +573,14 @@ impl ImageService {
                         src_height,
                         params,
                         None,
+                        // #5: same reasoning as the `icc_profile: None` just
+                        // above - `decode_animation_source` doesn't extract
+                        // EXIF from the GIF/WebP animation decoders either,
+                        // and there's no tracked orientation to have applied
+                        // (animation frames are never auto-rotated), so
+                        // there's nothing to keep and nothing to neutralize.
+                        None,
+                        false,
                         config,
                         watermark_bytes,
                     );
@@ -578,7 +595,7 @@ impl ImageService {
         let (src_width, src_height) = Self::peek_dimensions(image_bytes, format)?;
         Self::check_source_resolution(src_width, src_height, config.max_src_resolution_mp)?;
 
-        let (mut img, orientation, icc_profile) =
+        let (mut img, orientation, icc_profile, exif_metadata) =
             Self::decode_with_limits(image_bytes, format, config.max_src_resolution_mp, params)?;
 
         // #33: autorotate (imgproxy's `auto_rotate`/`ar` option, on by
@@ -589,6 +606,15 @@ impl ImageService {
         // decision and the #36 upscale guard) must already reflect the
         // corrected axes. Applying it after a crop would compose the crop
         // against the wrong axes entirely.
+        //
+        // #5: `exif_orientation_applied` records whether that happened, for
+        // `encode_single_image`'s benefit - once `apply_orientation` runs,
+        // the *pixels* are corrected but a kept, forwarded EXIF blob would
+        // still carry the *original* (now-stale) Orientation tag, telling
+        // any EXIF-aware viewer to rotate an already-rotated image a second
+        // time. See `Self::neutralize_exif_orientation`'s doc comment for
+        // how that's avoided.
+        let exif_orientation_applied = params.autorotate && orientation != Orientation::NoTransforms;
         if params.autorotate {
             img.apply_orientation(orientation);
         }
@@ -625,6 +651,8 @@ impl ImageService {
             src_height,
             params,
             icc_profile,
+            exif_metadata,
+            exif_orientation_applied,
             config,
             watermark_bytes,
         )
@@ -643,16 +671,105 @@ impl ImageService {
     /// `ImageDecoder` has already been consumed by `DynamicImage::from_decoder`.
     /// The animated-but-actually-single-frame fallback has no ICC profile to
     /// forward - `decode_animation_source` doesn't extract one from the
-    /// GIF/WebP animation decoders - so it passes `None`.
+    /// GIF/WebP animation decoders - so it passes `None`. `exif_metadata`
+    /// and `exif_orientation_applied` (#5) are threaded through the same
+    /// way and for the same reason.
+    ///
+    /// # `strip_metadata` (#5) and the real per-format "keep" matrix
+    ///
+    /// `params.strip_metadata` (default `true`) gates whether `exif_metadata`
+    /// is forwarded to the encoder at all - `true` (the default) drops it
+    /// unconditionally, matching imgproxy's own `strip_metadata`/`sm`
+    /// default. This covers EXIF only - see `ResizeQuery::strip_metadata`'s
+    /// own doc comment (`src/models/params.rs`) for why the embedded ICC
+    /// colour profile (`icc_profile`) is a separate, always-on concern.
+    ///
+    /// When metadata is kept, `exif_orientation_applied` decides whether the
+    /// blob's `Orientation` tag needs neutralizing first
+    /// (`Self::neutralize_exif_orientation`) - see that function's doc
+    /// comment for why forwarding it unchanged after `autorotate` has
+    /// already rotated the pixels would double-rotate the image in any
+    /// EXIF-aware viewer.
+    ///
+    /// Whether the resolved EXIF bytes actually reach the output depends on
+    /// what each encoder below can do with them - not uniform across
+    /// formats, exactly like `icc_profile` already isn't (see that field's
+    /// own comment on the JPEG/AVIF branches below):
+    /// - **JPEG**: written as a raw `APP1` marker by `Self::encode_jpeg`
+    ///   (mozjpeg's `CompressStarted::write_marker`, the same primitive
+    ///   `write_icc_profile` already uses for `APP2`) - mozjpeg has no
+    ///   higher-level EXIF API, so this crate builds the `"Exif\0\0"`-
+    ///   prefixed segment by hand.
+    /// - **PNG**: `image::codecs::png::PngEncoder::set_exif_metadata` -
+    ///   PNG's `eXIf` chunk is a real, standard part of the format
+    ///   (verified against `image-0.25.10/src/codecs/png.rs`: the decoder
+    ///   already reads it too, which is where `exif_metadata` above comes
+    ///   from for a PNG *source*).
+    /// - **AVIF**: `image::codecs::avif::AvifEncoder::set_exif_metadata` -
+    ///   supported despite AVIF having *no* ICC API at all (verified: that
+    ///   encoder overrides `set_exif_metadata` but not `set_icc_profile`,
+    ///   `image-0.25.10/src/codecs/avif/encoder.rs`) - the two are
+    ///   genuinely independent capabilities on this encoder, not a package
+    ///   deal. AVIF is encode-only in this crate (no `avif-native` decode
+    ///   feature - see `ImageFormat::Avif`'s own doc comment,
+    ///   `src/models/params.rs`), so this only matters when converting a
+    ///   JPEG/PNG/WebP *source*'s metadata into an AVIF *output*.
+    /// - **WebP**: **unsupported, always** - this crate's lossy WebP output
+    ///   goes through the standalone `webp` crate (`Self::encode_webp`), not
+    ///   `image`'s own `WebPEncoder` (see that function's own doc comment
+    ///   for why); `webp` 0.3.1's `Encoder` has no EXIF/ICC API whatsoever
+    ///   (verified against its public API - `new`/`from_image`/`from_rgb`/
+    ///   `from_rgba`/`encode`/`encode_lossless`/`encode_simple`/
+    ///   `encode_advanced`, nothing metadata-related). `sm:0` against a
+    ///   `.webp` output is therefore a no-op - not a bug, a real limitation
+    ///   of the encoder this crate uses, same as ICC already is for this
+    ///   format.
+    /// - **GIF**: **unsupported, always** - neither `image`'s `GifEncoder`
+    ///   nor the GIF format itself (via this crate's decoder) has any EXIF
+    ///   concept (verified: no `exif`/`Exif` hit anywhere in
+    ///   `image-0.25.10/src/codecs/gif.rs`, decoder or encoder). Same
+    ///   "no-op, not a bug" note as WebP.
+    // #5 pushes this from 7 to 9 parameters, past clippy's default
+    // `too_many_arguments` threshold (8) - already precedented in this crate
+    // (`src/services/cache/handler.rs`'s `params_with_enlarge` test helper
+    // carries the same allow). Bundling `exif_metadata`/
+    // `exif_orientation_applied` into a struct alongside `icc_profile` was
+    // considered and rejected: every one of these is a distinct, independent
+    // per-call value threaded through from two different call sites (the
+    // main decode path and the animated-single-frame fallback), not a
+    // cohesive "options" bag a caller configures - a wrapper type here would
+    // just move the same nine values one level of indirection away, without
+    // making any call site more readable.
+    #[allow(clippy::too_many_arguments)]
     fn encode_single_image(
         img: DynamicImage,
         src_width: u32,
         src_height: u32,
         params: &ResizeQuery,
         icc_profile: Option<Vec<u8>>,
+        exif_metadata: Option<Vec<u8>>,
+        exif_orientation_applied: bool,
         config: &PerformanceConfig,
         watermark_bytes: Option<&[u8]>,
     ) -> Result<(Vec<u8>, String)> {
+        // #5: resolve once, up front, what (if anything) actually gets
+        // forwarded to whichever format-specific encoder runs below -
+        // `params.strip_metadata` gates it entirely, and a kept blob whose
+        // pixels were just auto-rotated must have its `Orientation` tag
+        // neutralized first (see `Self::neutralize_exif_orientation`'s doc
+        // comment) or dropped outright if that can't be done safely.
+        let exif_metadata: Option<Vec<u8>> = if params.strip_metadata {
+            None
+        } else {
+            exif_metadata.and_then(|raw| {
+                if exif_orientation_applied {
+                    Self::neutralize_exif_orientation(&raw)
+                } else {
+                    Some(raw)
+                }
+            })
+        };
+
         // #51: folds the #36 enlarge guard together with `zoom`, `dpr`,
         // `min-width`/`min-height` and the `rotate` axis swap into the box
         // actually fed to the resize dispatch below (`resize_box`), plus
@@ -844,6 +961,13 @@ impl ImageService {
         // patching raw ICC chunks into the container format by hand - real
         // work, not a small addition, so it's left as follow-up rather than
         // half-done here.
+        //
+        // #5: `exif_metadata` (resolved above, already `None` if
+        // `params.strip_metadata` or unavailable) follows a *different*
+        // per-format matrix than `icc_profile` - notably AVIF *can* carry it
+        // even though it can't carry ICC. See `encode_single_image`'s own
+        // doc comment for the full breakdown with citations; each branch
+        // below only handles the mechanics.
         let output_bytes = match output_format {
             ImageFormat::WebP => {
                 let lossless = params.webp_lossless.unwrap_or(false);
@@ -878,6 +1002,13 @@ impl ImageService {
                     // request error.
                     let _ = encoder.set_icc_profile(icc);
                 }
+                if let Some(exif) = exif_metadata {
+                    // #5: same best-effort spirit as `set_icc_profile` just
+                    // above - `PngEncoder::set_exif_metadata` only fails for
+                    // an encoder that doesn't support it at all, never for
+                    // `PngEncoder` itself.
+                    let _ = encoder.set_exif_metadata(exif);
+                }
                 img.write_with_encoder(encoder)
                     .context(format!("Failed to encode image to {:?}", output_format))?;
 
@@ -907,6 +1038,7 @@ impl ImageService {
                     .jpeg_no_subsampling
                     .unwrap_or(config.jpeg_no_subsampling_default);
                 let icc_ref = icc_profile.as_deref();
+                let exif_ref = exif_metadata.as_deref();
 
                 let result = match params.max_bytes {
                     // `max_bytes` is only meaningful for JPEG here - see
@@ -918,9 +1050,11 @@ impl ImageService {
                     // all (`fq:png:N` is already rejected at parse time
                     // for the same reason).
                     Some(max_bytes) => Self::encode_with_max_bytes(max_bytes, quality, |q| {
-                        Self::encode_jpeg(&img, q, progressive, no_subsampling, icc_ref)
+                        Self::encode_jpeg(&img, q, progressive, no_subsampling, icc_ref, exif_ref)
                     }),
-                    None => Self::encode_jpeg(&img, quality, progressive, no_subsampling, icc_ref),
+                    None => {
+                        Self::encode_jpeg(&img, quality, progressive, no_subsampling, icc_ref, exif_ref)
+                    }
                 };
 
                 result.context(format!("Failed to encode image to {:?}", output_format))?
@@ -930,11 +1064,21 @@ impl ImageService {
                 let estimated_size = Self::estimate_output_size(&img, &output_format);
                 let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
 
-                let encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(
+                let mut encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(
                     &mut buf,
                     DEFAULT_AVIF_SPEED,
                     quality,
                 );
+                if let Some(exif) = exif_metadata {
+                    // #5: `AvifEncoder::set_exif_metadata` is real - verified
+                    // against `image-0.25.10/src/codecs/avif/encoder.rs`,
+                    // which overrides it (`with_exif`) despite *not*
+                    // overriding `set_icc_profile` at all (the ICC comment
+                    // above this match still applies unchanged: AVIF has no
+                    // route for that). EXIF and ICC are independent
+                    // capabilities on this encoder, not a package deal.
+                    let _ = encoder.set_exif_metadata(exif);
+                }
                 img.write_with_encoder(encoder)
                     .context(format!("Failed to encode image to {:?}", output_format))?;
 
@@ -2019,21 +2163,35 @@ impl ImageService {
     /// rather than returning one, so a real encode failure must be caught
     /// here instead of taking the whole worker thread down. `AssertUnwindSafe`
     /// is sound for the same reason it is in `mozjpeg_decode`: every
-    /// captured value (`rgb`, `icc_owned`, the `Copy` scalars) is either
-    /// freshly-owned local data or `Copy`, none of it shared/interior-mutable
-    /// state that could be left torn by an unwind.
+    /// captured value (`rgb`, `icc_owned`, `exif_owned`, the `Copy` scalars)
+    /// is either freshly-owned local data or `Copy`, none of it shared/
+    /// interior-mutable state that could be left torn by an unwind.
+    ///
+    /// `exif_metadata` (#5) is written the same way `icc_profile` already is.
+    /// See `encode_jpeg_inner`'s own comment at the `write_marker` call for
+    /// why mozjpeg needs the raw `APP1` bytes built by hand, unlike PNG/AVIF
+    /// which have a dedicated `ImageEncoder::set_exif_metadata`.
     pub fn encode_jpeg(
         img: &DynamicImage,
         quality: u8,
         progressive: bool,
         no_subsampling: bool,
         icc_profile: Option<&[u8]>,
+        exif_metadata: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         let rgb = img.to_rgb8();
         let icc_owned = icc_profile.map(<[u8]>::to_vec);
+        let exif_owned = exif_metadata.map(<[u8]>::to_vec);
 
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::encode_jpeg_inner(&rgb, quality, progressive, no_subsampling, icc_owned.as_deref())
+            Self::encode_jpeg_inner(
+                &rgb,
+                quality,
+                progressive,
+                no_subsampling,
+                icc_owned.as_deref(),
+                exif_owned.as_deref(),
+            )
         }))
         .unwrap_or_else(|payload| {
             let msg = payload
@@ -2051,6 +2209,7 @@ impl ImageService {
         progressive: bool,
         no_subsampling: bool,
         icc_profile: Option<&[u8]>,
+        exif_metadata: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         let (width, height) = rgb.dimensions();
 
@@ -2169,6 +2328,37 @@ impl ImageService {
             started.write_icc_profile(icc);
         }
 
+        if let Some(exif) = exif_metadata.filter(|exif| !exif.is_empty()) {
+            // #5: mozjpeg has no dedicated EXIF API (unlike its
+            // `write_icc_profile` for `APP2`/ICC just above), so the `APP1`
+            // segment is built by hand: a 6-byte `"Exif\0\0"` marker
+            // (JPEG/EXIF's own container convention, JEITA CP-3451) followed
+            // by the raw TIFF-formatted bytes `ImageDecoder::exif_metadata`
+            // returns (that trait's own doc comment: "the payload...
+            // starting at the TIFF header", i.e. *without* the marker
+            // prefix - confirmed empirically: `image::codecs::jpeg::encoder`'s
+            // `write_exif` prepends the identical constant before handing
+            // its own `self.exif` to `write_segment`, so this reproduces
+            // that encoder's on-the-wire format exactly).
+            //
+            // Capped at the same `MAX_DATA_BYTES_IN_MARKER` mozjpeg itself
+            // uses inside `write_icc_profile` (65533 total marker bytes,
+            // minus this crate's own 6-byte prefix rather than
+            // `write_icc_profile`'s 14-byte `ICC_PROFILE\0` + chunk-index
+            // overhead) - unlike ICC, EXIF has no standard multi-segment
+            // chunking convention to fall back on for an oversized blob, so
+            // an over-limit blob is silently dropped (best-effort, same
+            // spirit as the ICC branch above) rather than writing a
+            // corrupt/truncated marker or panicking.
+            const MAX_EXIF_MARKER_BYTES: usize = 65533 - b"Exif\0\0".len();
+            if exif.len() <= MAX_EXIF_MARKER_BYTES {
+                let mut app1 = Vec::with_capacity(6 + exif.len());
+                app1.extend_from_slice(b"Exif\0\0");
+                app1.extend_from_slice(exif);
+                started.write_marker(mozjpeg::Marker::APP(1), &app1);
+            }
+        }
+
         started
             .write_scanlines(rgb.as_raw())
             .context("mozjpeg: failed to write scanlines")?;
@@ -2176,6 +2366,126 @@ impl ImageService {
         started
             .finish()
             .context("mozjpeg: failed to finish compression")
+    }
+
+    /// Rewrites the EXIF `Orientation` tag (0x0112) inside a raw,
+    /// prefix-less TIFF-formatted EXIF blob (the shape
+    /// `ImageDecoder::exif_metadata`/`ImageEncoder::set_exif_metadata` both
+    /// use - no leading `"Exif\0\0"`, see `encode_jpeg_inner`'s comment at
+    /// its `write_marker` call) to `1` (`Orientation::Normal`), in place.
+    ///
+    /// # Why this exists (#5)
+    ///
+    /// `params.autorotate` (on by default, #33) applies the source's EXIF
+    /// `Orientation` tag to the *pixels* via `DynamicImage::apply_orientation`
+    /// and the corrected `DynamicImage` carries no memory of the original
+    /// tag afterward. If a caller also asks to *keep* metadata (`sm:0`), the
+    /// *original*, now-stale `raw` EXIF blob read straight off the source
+    /// decoder would still say "rotate me" - forwarding it unchanged would
+    /// tell any EXIF-aware viewer (which auto-rotates on display, exactly
+    /// like this crate just did) to rotate the *already-upright* pixels a
+    /// second time. This function is what stops that: it finds the one tag
+    /// responsible and overwrites its value to `1` (no transform), leaving
+    /// every other field (GPS, camera make/model, timestamps - the actual
+    /// content a caller asked to keep) byte-for-byte untouched.
+    ///
+    /// Only called when `encode_single_image` already knows autorotation
+    /// actually changed the pixels (`exif_orientation_applied`) - see that
+    /// function's own resolution step. When autorotate is off, the pixels
+    /// were never touched, so the original tag is still an accurate
+    /// instruction and this function is not called at all.
+    ///
+    /// # Deliberately conservative: fails closed
+    ///
+    /// This is a minimal, bounds-checked IFD0 walk - not a general TIFF
+    /// parser - covering exactly the shape a well-formed Exif `Orientation`
+    /// entry takes (TIFF 6.0 / Exif 2.3: tag `0x0112`, type `3`/SHORT, count
+    /// `1`, value in the first 2 bytes of the entry's 4-byte value field).
+    /// If the blob doesn't parse as a well-formed TIFF header + IFD0 at all,
+    /// or no Orientation tag is found there, this returns `None` rather than
+    /// guessing or returning the input unchanged - `encode_single_image`'s
+    /// caller treats `None` as "drop the metadata entirely for this
+    /// response" (see its own resolution step), which is the only choice
+    /// that can't possibly leave a stale, un-neutralized Orientation tag in
+    /// forwarded output. In practice this fallback essentially never
+    /// triggers for real photos: `decoder.orientation()` (what
+    /// `exif_orientation_applied` is derived from) only ever reports a
+    /// non-`NoTransforms` value in the first place by successfully parsing
+    /// this exact tag out of this exact blob shape via `image`'s own
+    /// `Orientation::from_exif_chunk` - so the tag this function looks for
+    /// is, barring a very unusual multi-IFD/sub-IFD layout, already known to
+    /// be there.
+    fn neutralize_exif_orientation(exif: &[u8]) -> Option<Vec<u8>> {
+        const ORIENTATION_TAG: u16 = 0x0112;
+        const TYPE_SHORT: u16 = 3;
+        const TIFF_MAGIC: u16 = 42;
+        const IFD_ENTRY_LEN: usize = 12;
+
+        let little_endian = match exif.get(0..2)? {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let read_u16 = |b: &[u8]| -> u16 {
+            let bytes = [b[0], b[1]];
+            if little_endian {
+                u16::from_le_bytes(bytes)
+            } else {
+                u16::from_be_bytes(bytes)
+            }
+        };
+        let read_u32 = |b: &[u8]| -> u32 {
+            let bytes = [b[0], b[1], b[2], b[3]];
+            if little_endian {
+                u32::from_le_bytes(bytes)
+            } else {
+                u32::from_be_bytes(bytes)
+            }
+        };
+
+        if read_u16(exif.get(2..4)?) != TIFF_MAGIC {
+            return None;
+        }
+
+        let ifd0_offset = read_u32(exif.get(4..8)?) as usize;
+        let entries_start = ifd0_offset.checked_add(2)?;
+        let entry_count = usize::from(read_u16(exif.get(ifd0_offset..entries_start)?));
+        let entries_len = entry_count.checked_mul(IFD_ENTRY_LEN)?;
+        let entries_end = entries_start.checked_add(entries_len)?;
+        if entries_end > exif.len() {
+            return None;
+        }
+
+        for i in 0..entry_count {
+            let entry_start = entries_start + i * IFD_ENTRY_LEN;
+            let tag = read_u16(exif.get(entry_start..entry_start + 2)?);
+            if tag != ORIENTATION_TAG {
+                continue;
+            }
+
+            let field_type = read_u16(exif.get(entry_start + 2..entry_start + 4)?);
+            let count = read_u32(exif.get(entry_start + 4..entry_start + 8)?);
+            // A well-formed Orientation entry is always exactly one SHORT -
+            // anything else is a shape this function doesn't recognise, so
+            // fail closed (see doc comment) rather than patch a field that
+            // might not mean what it's assumed to mean.
+            if field_type != TYPE_SHORT || count != 1 {
+                return None;
+            }
+
+            let value_start = entry_start + 8;
+            let mut patched = exif.to_vec();
+            let normal: u16 = 1; // `Orientation::Normal` / "no transform needed"
+            let normal_bytes = if little_endian {
+                normal.to_le_bytes()
+            } else {
+                normal.to_be_bytes()
+            };
+            patched[value_start..value_start + 2].copy_from_slice(&normal_bytes);
+            return Some(patched);
+        }
+
+        None
     }
 
     /// Maximum number of extra encode attempts `encode_with_max_bytes`'s
@@ -2731,7 +3041,7 @@ impl ImageService {
         format: Option<ImageFormat>,
         max_src_resolution_mp: u64,
         params: &ResizeQuery,
-    ) -> Result<(image::DynamicImage, Orientation, Option<Vec<u8>>)> {
+    ) -> Result<DecodedImage> {
         if format == Some(ImageFormat::Jpeg) {
             match Self::decode_jpeg_scaled(image_bytes, max_src_resolution_mp, params) {
                 Ok(result) => return Ok(result),
@@ -2753,15 +3063,17 @@ impl ImageService {
     /// depth behind `check_source_resolution`'s header-only check, not a
     /// replacement for it.
     ///
-    /// Also returns the source's EXIF `Orientation` (#33) and embedded ICC
-    /// colour profile, if any - both must be read off the `ImageDecoder`
-    /// before it's consumed by `DynamicImage::from_decoder`, which is why
-    /// this goes through `ImageReader::into_decoder` rather than the
-    /// simpler `ImageReader::decode` it used to call directly.
-    /// `orientation` defaults to `Orientation::NoTransforms` (rather than
-    /// failing the whole request) if it can't be read - a source with
-    /// malformed EXIF should still decode and process, just without
-    /// autorotation.
+    /// Also returns the source's EXIF `Orientation` (#33), embedded ICC
+    /// colour profile, and raw EXIF metadata blob (#5), if any - all three
+    /// must be read off the `ImageDecoder` before it's consumed by
+    /// `DynamicImage::from_decoder`, which is why this goes through
+    /// `ImageReader::into_decoder` rather than the simpler
+    /// `ImageReader::decode` it used to call directly. `orientation`
+    /// defaults to `Orientation::NoTransforms` (rather than failing the
+    /// whole request) if it can't be read - a source with malformed EXIF
+    /// should still decode and process, just without autorotation; the raw
+    /// EXIF blob (used only when `!params.strip_metadata`) similarly
+    /// defaults to `None` rather than failing the request.
     ///
     /// This is the only decode path for PNG/WebP, and the fallback path for
     /// JPEG when `decode_jpeg_scaled` (#63 stage 2) fails - see
@@ -2770,7 +3082,7 @@ impl ImageService {
         image_bytes: &[u8],
         format: Option<ImageFormat>,
         max_src_resolution_mp: u64,
-    ) -> Result<(image::DynamicImage, Orientation, Option<Vec<u8>>)> {
+    ) -> Result<DecodedImage> {
         let mut reader = Self::make_reader(image_bytes, format)?;
         let limits = Self::build_decode_limits(max_src_resolution_mp);
         reader.limits(limits.clone());
@@ -2796,9 +3108,19 @@ impl ImageService {
 
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let icc_profile = decoder.icc_profile().ok().flatten();
+        // #5: read alongside `icc_profile`/`orientation`, for the same
+        // reason - the `ImageDecoder` is consumed by `from_decoder` right
+        // below, so anything not read off it now is gone. `Ok(None)` is
+        // `ImageDecoder::exif_metadata`'s own default for formats/decoders
+        // that don't implement it (`image-0.25.10/src/io/decoder.rs`) - a
+        // source with no EXIF segment at all (or a format this crate
+        // doesn't extract EXIF from) is indistinguishable from "read
+        // failed", and both mean "nothing to forward", so `.ok().flatten()`
+        // treats them the same, mirroring `icc_profile` immediately above.
+        let exif_metadata = decoder.exif_metadata().ok().flatten();
 
         let img = image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
-        Ok((img, orientation, icc_profile))
+        Ok((img, orientation, icc_profile, exif_metadata))
     }
 
     /// JPEG-only DCT-scaled decode via mozjpeg/libjpeg-turbo (#63 stage 2):
@@ -2819,7 +3141,8 @@ impl ImageService {
     ///   itself already ran in the caller, against the header-peeked
     ///   dimensions, before `decode_with_limits` is ever reached - not
     ///   repeated here.)
-    /// - #33's EXIF orientation and ICC profile are read off it too.
+    /// - #33's EXIF orientation and ICC profile are read off it too, and so
+    ///   (#5) is the raw EXIF metadata blob.
     ///
     /// Every JPEG decode - DCT-scaled or not - hands off to mozjpeg for the
     /// actual pixel decode (#67): `scale_num == 8` just means
@@ -2833,7 +3156,7 @@ impl ImageService {
         image_bytes: &[u8],
         max_src_resolution_mp: u64,
         params: &ResizeQuery,
-    ) -> Result<(DynamicImage, Orientation, Option<Vec<u8>>)> {
+    ) -> Result<DecodedImage> {
         let mut reader = Self::make_reader(image_bytes, Some(ImageFormat::Jpeg))?;
         let limits = Self::build_decode_limits(max_src_resolution_mp);
         reader.limits(limits.clone());
@@ -2857,6 +3180,14 @@ impl ImageService {
 
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let icc_profile = decoder.icc_profile().ok().flatten();
+        // #5: same "read off the `ImageDecoder` before it's dropped" reasoning
+        // as `decode_with_image_crate` - see that function's doc comment.
+        // `decoder.orientation()` above already forced the JPEG decoder to
+        // parse the EXIF segment once and cache it (see
+        // `image-0.25.10/src/codecs/jpeg/decoder.rs`'s `exif_metadata` doc
+        // comment: "caches the orientation, so call it if orientation hasn't
+        // been set yet"), so this second call is cheap.
+        let exif_metadata = decoder.exif_metadata().ok().flatten();
         let (header_width, header_height) = decoder.dimensions();
 
         // `Orientation::Rotate90`/`Rotate270`/`Rotate90FlipH`/`Rotate270FlipH`
@@ -2953,7 +3284,7 @@ impl ImageService {
 
         let img = Self::mozjpeg_decode(image_bytes, scale_num)?;
 
-        Ok((img, orientation, icc_profile))
+        Ok((img, orientation, icc_profile, exif_metadata))
     }
 
     /// Predicts the exact target dimensions the resize stage in
@@ -6761,5 +7092,384 @@ mod tests {
             .expect("should fall back to the configured default watermark URL");
         let decoded = image::load_from_memory(&output).unwrap().to_rgba8();
         assert_eq!(decoded.get_pixel(5, 5).0, [0, 255, 0, 255]);
+    }
+
+    // ---- #5: strip_metadata ----
+
+    /// Decodes `bytes` as `format` and returns whatever raw Exif blob (if
+    /// any) `image`'s own decoder finds - used below to check the *actual*
+    /// encoded output, not just that `strip_metadata` parsed.
+    fn decoded_exif(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
+        image::ImageReader::with_format(Cursor::new(bytes), format)
+            .into_decoder()
+            .expect("test fixture/output should have a valid header")
+            .exif_metadata()
+            .expect("exif_metadata() read should not itself fail")
+    }
+
+    /// The exact GPS `GPSLatitudeRef` marker byte (`fixtures::jpeg_with_gps_exif`
+    /// encodes latitude ref `"N"`) - a small, distinctive fingerprint used
+    /// by the AVIF test below, which (unlike JPEG/PNG/WebP) this crate has
+    /// no decoder for at all (`ImageFormat::Avif`'s own doc comment,
+    /// `src/models/params.rs`: AVIF is encode-only here), so raw byte
+    /// presence is the only way to check its output.
+    const GPS_LATITUDE_REF_NORTH: &[u8] = b"N\0\0\0";
+
+    /// #5: `sm` absent must default to *stripping* EXIF - imgproxy's own
+    /// `IMGPROXY_STRIP_METADATA` default, and the behaviour change this
+    /// issue exists to make deliberate. `fixtures::jpeg_with_gps_exif(1)`
+    /// carries a real GPS location (Golden Gate Bridge) in its source Exif;
+    /// orientation `1` (`Normal`) keeps this test isolated from the
+    /// orientation-neutralization behaviour covered separately below.
+    #[test]
+    fn strip_metadata_defaults_to_stripping_exif_from_jpeg_output() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        // Sanity check on the fixture itself - if this ever fails, the
+        // fixture stopped carrying Exif at all and every assertion below
+        // would be vacuous.
+        assert!(
+            decoded_exif(&bytes, ImageFormat::Jpeg).is_some(),
+            "fixture sanity check: the source must actually carry Exif"
+        );
+
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query(None, None) // strip_metadata left unset -> defaults true
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        assert_eq!(
+            decoded_exif(&output, ImageFormat::Jpeg),
+            None,
+            "default (sm unset) must strip Exif - including GPS - from JPEG output"
+        );
+    }
+
+    /// #5: `sm:0`/`strip_metadata: false` must forward the source's Exif -
+    /// GPS included - to JPEG output via the raw `APP1` marker
+    /// `encode_jpeg_inner` writes by hand (mozjpeg has no higher-level Exif
+    /// API, unlike PNG/AVIF's `set_exif_metadata`).
+    #[test]
+    fn strip_metadata_false_keeps_gps_in_jpeg_output() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            strip_metadata: false,
+            ..query(None, None)
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        let exif = decoded_exif(&output, ImageFormat::Jpeg)
+            .expect("sm:0 must keep Exif metadata in JPEG output");
+        assert!(
+            exif.windows(GPS_LATITUDE_REF_NORTH.len())
+                .any(|w| w == GPS_LATITUDE_REF_NORTH),
+            "kept Exif must still contain the real GPSLatitudeRef field, not just an empty/\
+             truncated APP1 segment"
+        );
+    }
+
+    /// Correctness requirement from the issue: a strip and a keep request
+    /// for the otherwise-identical parameters must produce genuinely
+    /// different encoded bytes, not just a parsed-but-inert option - the
+    /// exact "flag that silently does nothing" failure mode the JPEG
+    /// progressive bug (`.bench-baseline/BASELINE.md`) already shipped once.
+    #[test]
+    fn strip_metadata_true_and_false_produce_different_jpeg_bytes() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        let config = PerformanceConfig::default();
+
+        let stripped = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            strip_metadata: true,
+            ..query(None, None)
+        };
+        let kept = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            strip_metadata: false,
+            ..query(None, None)
+        };
+
+        let (out_stripped, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &stripped, &config)
+                .expect("processing should succeed");
+        let (out_kept, _) = ImageService::process_image_blocking_with_limits(&bytes, &kept, &config)
+            .expect("processing should succeed");
+
+        assert_ne!(
+            out_stripped, out_kept,
+            "strip_metadata=true and =false must produce different encoded bytes"
+        );
+    }
+
+    /// The double-rotation guard: `fixtures::jpeg_with_gps_exif(6)` is
+    /// tagged EXIF orientation `6` (`Rotate90` per `apply_orientation`'s own
+    /// match arms). With `autorotate` on (the default) and metadata kept,
+    /// the *pixels* get rotated - so the *kept* Exif's own Orientation tag
+    /// must read back as `1` (`Orientation::Normal`) in the output, proving
+    /// `Self::neutralize_exif_orientation` actually ran rather than
+    /// forwarding a now-stale "rotate me" instruction that would
+    /// double-rotate the image in any EXIF-aware viewer. GPS must still
+    /// survive untouched - only the one field changes.
+    #[test]
+    fn kept_metadata_neutralizes_stale_orientation_to_avoid_double_rotation() {
+        let bytes = fixtures::jpeg_with_gps_exif(6);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            strip_metadata: false,
+            autorotate: true,
+            ..query(None, None)
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        let mut decoder = image::ImageReader::with_format(Cursor::new(&output), ImageFormat::Jpeg)
+            .into_decoder()
+            .expect("output should have a valid JPEG header");
+        assert_eq!(
+            decoder.orientation().expect("orientation read should not fail"),
+            Orientation::NoTransforms,
+            "the kept Exif's Orientation tag must be neutralized to 1/NoTransforms once \
+             autorotate has already rotated the pixels, or a viewer would rotate twice"
+        );
+
+        let exif = decoder
+            .exif_metadata()
+            .expect("exif_metadata read should not fail")
+            .expect("Exif must still be present (kept, just orientation-neutralized)");
+        assert!(
+            exif.windows(GPS_LATITUDE_REF_NORTH.len())
+                .any(|w| w == GPS_LATITUDE_REF_NORTH),
+            "neutralizing the Orientation tag must not disturb the unrelated GPS fields"
+        );
+    }
+
+    /// When `autorotate` is off, the pixels are never touched, so the
+    /// original (still-accurate) Orientation tag must survive a `sm:0`
+    /// request completely unchanged - `neutralize_exif_orientation` must
+    /// not even be invoked in this case (`exif_orientation_applied` is
+    /// `false`).
+    #[test]
+    fn kept_metadata_preserves_orientation_tag_when_autorotate_is_disabled() {
+        let bytes = fixtures::jpeg_with_gps_exif(6);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            strip_metadata: false,
+            autorotate: false,
+            ..query(None, None)
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        let orientation = image::ImageReader::with_format(Cursor::new(&output), ImageFormat::Jpeg)
+            .into_decoder()
+            .expect("output should have a valid JPEG header")
+            .orientation()
+            .expect("orientation read should not fail");
+        assert_eq!(
+            orientation,
+            Orientation::Rotate90,
+            "autorotate:false must leave the original Orientation tag (6/Rotate90) untouched - \
+             the pixels were never rotated, so the tag is still accurate"
+        );
+    }
+
+    /// #5's per-format matrix: PNG carries a real `eXIf` chunk
+    /// (`image::codecs::png::PngEncoder::set_exif_metadata`), so metadata
+    /// kept from a JPEG *source* must still reach a PNG *output* - proving
+    /// this isn't JPEG-specific plumbing.
+    #[test]
+    fn strip_metadata_false_keeps_gps_in_png_output() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            strip_metadata: false,
+            ..query(None, None)
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        let exif =
+            decoded_exif(&output, ImageFormat::Png).expect("sm:0 must keep Exif in PNG output");
+        assert!(
+            exif.windows(GPS_LATITUDE_REF_NORTH.len())
+                .any(|w| w == GPS_LATITUDE_REF_NORTH),
+            "kept Exif forwarded into a PNG output must still contain the GPS field"
+        );
+    }
+
+    /// The default (strip) must apply identically to a PNG *output*, not
+    /// just JPEG - same fixture, opposite of the test above.
+    #[test]
+    fn strip_metadata_defaults_to_stripping_exif_from_png_output() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Png,
+            ..query(None, None)
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        assert_eq!(decoded_exif(&output, ImageFormat::Png), None);
+    }
+
+    /// #5's per-format matrix: this crate's lossy WebP output goes through
+    /// the standalone `webp` crate (`Self::encode_webp`), whose `Encoder`
+    /// has no Exif/ICC API at all - `sm:0` against a `.webp` output is a
+    /// real, documented no-op, not a bug. Proven directly against the
+    /// output bytes rather than just asserting `encode_single_image` didn't
+    /// panic, so a future encoder swap that silently starts (or stops)
+    /// carrying metadata would be caught here.
+    #[test]
+    fn strip_metadata_false_has_no_effect_on_webp_output() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Webp,
+            strip_metadata: false,
+            ..query(None, None)
+        };
+
+        let (output, _) = ImageService::process_image_blocking_with_limits(&bytes, &params, &config)
+            .expect("processing should succeed");
+
+        assert_eq!(
+            decoded_exif(&output, ImageFormat::WebP),
+            None,
+            "the webp crate's Encoder has no Exif API - sm:0 cannot be honoured for WebP output"
+        );
+    }
+
+    /// #5's per-format matrix: unlike ICC (which AVIF's encoder genuinely
+    /// cannot carry at all), AVIF output *can* keep Exif -
+    /// `image::codecs::avif::AvifEncoder` overrides `set_exif_metadata`
+    /// (verified against `image-0.25.10/src/codecs/avif/encoder.rs`). This
+    /// crate has no AVIF *decoder* (`ImageFormat::Avif`'s own doc comment),
+    /// so the only way to check the actual output is a raw byte search for
+    /// the GPS fingerprint, rather than decoding it back - unlike every
+    /// other format-matrix test above.
+    #[test]
+    fn strip_metadata_false_keeps_gps_in_avif_output() {
+        let bytes = fixtures::jpeg_with_gps_exif(1);
+        let config = PerformanceConfig::default();
+
+        let kept = ResizeQuery {
+            format: ApiImageFormat::Avif,
+            strip_metadata: false,
+            ..query(None, None)
+        };
+        let stripped = ResizeQuery {
+            format: ApiImageFormat::Avif,
+            strip_metadata: true,
+            ..query(None, None)
+        };
+
+        let (out_kept, _) = ImageService::process_image_blocking_with_limits(&bytes, &kept, &config)
+            .expect("processing should succeed");
+        let (out_stripped, _) =
+            ImageService::process_image_blocking_with_limits(&bytes, &stripped, &config)
+                .expect("processing should succeed");
+
+        assert!(
+            out_kept
+                .windows(GPS_LATITUDE_REF_NORTH.len())
+                .any(|w| w == GPS_LATITUDE_REF_NORTH),
+            "sm:0 against an AVIF output must still carry the GPS field"
+        );
+        assert!(
+            !out_stripped
+                .windows(GPS_LATITUDE_REF_NORTH.len())
+                .any(|w| w == GPS_LATITUDE_REF_NORTH),
+            "default (strip) AVIF output must not carry the GPS field"
+        );
+    }
+
+    /// Direct unit tests of `neutralize_exif_orientation`, independent of
+    /// the full encode pipeline above - covers the fail-closed cases the
+    /// end-to-end tests can't easily exercise (malformed input, no
+    /// Orientation tag present at all) plus both TIFF byte orders.
+    #[test]
+    fn neutralize_exif_orientation_rewrites_value_to_one_little_endian() {
+        let mut exif = Vec::new();
+        exif.extend_from_slice(b"II");
+        exif.extend_from_slice(&42u16.to_le_bytes());
+        exif.extend_from_slice(&8u32.to_le_bytes());
+        exif.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
+        exif.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif.extend_from_slice(&3u16.to_le_bytes());
+        exif.extend_from_slice(&1u32.to_le_bytes());
+        exif.extend_from_slice(&6u16.to_le_bytes()); // orientation 6
+        exif.extend_from_slice(&0u16.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes());
+
+        let patched =
+            ImageService::neutralize_exif_orientation(&exif).expect("well-formed input");
+        assert_eq!(&patched[18..20], &1u16.to_le_bytes());
+        // Nothing else in the blob should have moved.
+        assert_eq!(patched.len(), exif.len());
+        assert_eq!(&patched[..18], &exif[..18]);
+    }
+
+    #[test]
+    fn neutralize_exif_orientation_rewrites_value_to_one_big_endian() {
+        let mut exif = Vec::new();
+        exif.extend_from_slice(b"MM");
+        exif.extend_from_slice(&42u16.to_be_bytes());
+        exif.extend_from_slice(&8u32.to_be_bytes());
+        exif.extend_from_slice(&1u16.to_be_bytes());
+        exif.extend_from_slice(&0x0112u16.to_be_bytes());
+        exif.extend_from_slice(&3u16.to_be_bytes());
+        exif.extend_from_slice(&1u32.to_be_bytes());
+        exif.extend_from_slice(&8u16.to_be_bytes()); // orientation 8
+        exif.extend_from_slice(&0u16.to_be_bytes());
+        exif.extend_from_slice(&0u32.to_be_bytes());
+
+        let patched =
+            ImageService::neutralize_exif_orientation(&exif).expect("well-formed input");
+        assert_eq!(&patched[18..20], &1u16.to_be_bytes());
+    }
+
+    #[test]
+    fn neutralize_exif_orientation_returns_none_for_malformed_input() {
+        assert_eq!(ImageService::neutralize_exif_orientation(&[]), None);
+        assert_eq!(ImageService::neutralize_exif_orientation(b"not tiff"), None);
+        assert_eq!(
+            ImageService::neutralize_exif_orientation(b"II\x2a\x00\xff\xff\xff\xff"),
+            None,
+            "an IFD0 offset pointing past the end of the blob must fail closed"
+        );
+    }
+
+    #[test]
+    fn neutralize_exif_orientation_returns_none_when_tag_absent() {
+        // Well-formed TIFF/IFD0 with a single, unrelated tag (ImageWidth,
+        // 0x0100) instead of Orientation.
+        let mut exif = Vec::new();
+        exif.extend_from_slice(b"II");
+        exif.extend_from_slice(&42u16.to_le_bytes());
+        exif.extend_from_slice(&8u32.to_le_bytes());
+        exif.extend_from_slice(&1u16.to_le_bytes());
+        exif.extend_from_slice(&0x0100u16.to_le_bytes());
+        exif.extend_from_slice(&3u16.to_le_bytes());
+        exif.extend_from_slice(&1u32.to_le_bytes());
+        exif.extend_from_slice(&100u16.to_le_bytes());
+        exif.extend_from_slice(&0u16.to_le_bytes());
+        exif.extend_from_slice(&0u32.to_le_bytes());
+
+        assert_eq!(ImageService::neutralize_exif_orientation(&exif), None);
     }
 }

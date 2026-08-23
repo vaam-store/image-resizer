@@ -206,6 +206,7 @@ impl ParsedRequest {
             max_bytes: self.options.max_bytes,
             background: self.options.background,
             autorotate: self.options.autorotate.unwrap_or(true),
+            strip_metadata: self.options.strip_metadata.unwrap_or(true),
             crop: self.options.crop,
             gravity: self.options.gravity,
             // #51: geometry operations - see `ProcessingOptions`'s doc
@@ -263,7 +264,7 @@ mod tests {
         // Exercises every option the grammar accepts in one path, so a new
         // option that silently fails to round-trip shows up here.
         let path = format!(
-            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/ar:0/c:150:150:noea/gr:sowe/{encoded}.webp"
+            "/SIG/rs:fill:300:300/q:80/fq:webp:90/webpo:lossless/bl:5/g:true/el:1/bg:255:0:0/ar:0/sm:0/c:150:150:noea/gr:sowe/{encoded}.webp"
         );
         let signed = split(&path).unwrap();
         let parsed = signed.parse().unwrap();
@@ -283,6 +284,10 @@ mod tests {
         assert_eq!(query.format, ImageFormat::Webp);
         assert_eq!(query.background, Some([255, 0, 0]));
         assert!(!query.autorotate, "ar:0 in the URL must disable autorotate");
+        assert!(
+            !query.strip_metadata,
+            "sm:0 in the URL must disable metadata stripping"
+        );
 
         // #50: `c:`'s own gravity token (`noea`) wins over the top-level
         // `gr:` value (`sowe`) for the crop itself, but the top-level
@@ -327,6 +332,11 @@ mod tests {
         assert!(
             query.autorotate,
             "autorotate must default to true when no `ar` segment is present"
+        );
+        assert!(
+            query.strip_metadata,
+            "strip_metadata must default to true (strip) when no `sm` segment is present, \
+             matching imgproxy's own IMGPROXY_STRIP_METADATA default"
         );
         assert_eq!(query.crop, None);
         assert_eq!(query.gravity, crate::models::params::Gravity::default());

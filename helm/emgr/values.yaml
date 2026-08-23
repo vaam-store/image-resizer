@@ -128,6 +128,53 @@ controllers:
           - configMapRef:
               identifier: config
 
+        # -- GH #84: #27 made signed-URL verification fail closed
+        # (SIGNING_KEY/SIGNING_SALT, or an explicit
+        # ALLOW_UNSIGNED_REQUESTS=true) and #77 did the same for
+        # METRICS_AUTH_TOKEN on an otel-enabled image - neither was ever
+        # wired into this chart, so every pod crash-looped on boot.
+        #
+        # This is a real cluster, not a local compose.yaml, so it does NOT
+        # default to ALLOW_UNSIGNED_REQUESTS=true/
+        # ALLOW_UNAUTHENTICATED_METRICS=true - that would silently trade
+        # security for convenience. Instead it points at a Secret named
+        # `emgr-signing` that you create yourself (kubectl create secret
+        # generic emgr-signing --from-literal=signing-key=... --from-literal
+        # =signing-salt=... --from-literal=metrics-auth-token=...; this
+        # chart intentionally does not create it, so the secret material
+        # never lives in values.yaml or a values override). If that Secret
+        # is missing, the pod fails loudly (CreateContainerConfigError)
+        # instead of starting insecurely. METRICS_AUTH_TOKEN only matters
+        # once `global.version` points at an `*_otel` image tag (see
+        # below) - it is harmless, just unread, on the default `fs-latest`.
+        env:
+          SIGNING_KEY:
+            valueFrom:
+              secretKeyRef:
+                name: emgr-signing
+                key: signing-key
+          SIGNING_SALT:
+            valueFrom:
+              secretKeyRef:
+                name: emgr-signing
+                key: signing-salt
+          METRICS_AUTH_TOKEN:
+            valueFrom:
+              secretKeyRef:
+                name: emgr-signing
+                key: metrics-auth-token
+                # `optional: true` (GH #77/#84): METRICS_AUTH_TOKEN is only
+                # read by an `*_otel` image - the endpoint it protects does
+                # not exist without that feature. Without `optional`, a
+                # default (non-otel) deployment would fail with
+                # CreateContainerConfigError over a key it never reads,
+                # forcing operators to invent a dummy value. Marked optional
+                # so a non-otel pod starts; an *otel* pod with no token still
+                # fails closed, but at application startup with the error
+                # that names both remedies, which is far more actionable than
+                # a kubelet config error.
+                optional: true
+
 service:
   app:
     enabled: true

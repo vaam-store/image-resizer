@@ -16,21 +16,18 @@ All read by `envconfig` in `src/modules/env/env.rs` and converted into a
 | `HTTP_TIMEOUT_SECS` | `30` | HTTP client timeout in seconds |
 | `MAX_IMAGE_SIZE_MB` | `50` | Maximum source image size in megabytes, enforced per downloaded chunk (#22) |
 | `CPU_THREAD_POOL_SIZE` | CPU count | Advisory only - see the note below |
-| `ENABLE_HTTP2` | `true` in code's own `Default`/preset values, but **`false`** in practice when unset - see the note below | Enable HTTP/2 for downloads |
+| `ENABLE_HTTP2` | `true` | Enable HTTP/2 for downloads |
 | `CONNECTION_POOL_SIZE` | `50` | Connection pool size per host |
 | `KEEP_ALIVE_TIMEOUT_SECS` | `60` | Keep-alive timeout for connections in seconds |
 
-> **`ENABLE_HTTP2` default discrepancy, verified against
-> `src/config/performance.rs`:** `PerformanceConfig::default()` and the
-> `high_throughput`/`low_latency` presets below all set `enable_http2:
-> true`. But the code path actually used at startup with no
-> `PERFORMANCE_PROFILE` set - the fallback arm of `impl From<&EnvConfig>
-> for PerformanceConfig` - reads `env_config.enable_http2.unwrap_or(false)`.
-> A deployment that sets neither `PERFORMANCE_PROFILE` nor `ENABLE_HTTP2`
-> therefore runs with HTTP/2 **disabled**, not enabled as every other
-> default in this file would suggest. Set `ENABLE_HTTP2=true` explicitly if
-> you want it and aren't using one of the profiles below (both of which set
-> it via their own struct literal, independent of this fallback).
+> **`ENABLE_HTTP2` (#83, fixed):** `PerformanceConfig::default()` and every
+> profile except `memory_efficient` (which deliberately opts out - HTTP/1.1
+> uses less memory) set `enable_http2: true`. The no-profile fallback in
+> `PerformanceConfig::try_from(&EnvConfig)` (`src/config/performance.rs`)
+> now agrees: with neither `PERFORMANCE_PROFILE` nor `ENABLE_HTTP2` set,
+> HTTP/2 is **enabled**, matching `Default::default()`. Set
+> `ENABLE_HTTP2=false` explicitly if you want it off outside of the
+> `memory_efficient` profile.
 >
 > **`CPU_THREAD_POOL_SIZE` is read and stored (`PerformanceConfig::cpu_thread_pool_size`,
 > exposed via `get_cpu_thread_pool_size()`) but nothing in `src/` currently
@@ -71,6 +68,21 @@ You can use predefined performance profiles by setting the `PERFORMANCE_PROFILE`
 | `memory_efficient` | Optimized for minimal memory usage |
 
 When using a profile, individual environment variables will override the profile defaults.
+
+Profile matching is case-insensitive, and an empty or whitespace-only
+`PERFORMANCE_PROFILE` is treated the same as unset (falls back to the
+individually-configured/default settings below, not an error).
+
+**An unrecognised `PERFORMANCE_PROFILE` value is a startup error (#83),
+not a silent fallback.** Earlier versions silently fell through to the
+non-profile configuration for any value that didn't match one of the three
+names above - so a typo like `PERFORMANCE_PROFILE=hgh_throughput` would
+quietly run with different settings than intended, with no indication
+anything was wrong. The service now refuses to start in that case:
+
+```
+PERFORMANCE_PROFILE="hgh_throughput" is not a recognised profile - valid values are high_throughput, low_latency, memory_efficient (case-insensitive), or unset/empty to use the individually-configured (or default) settings instead.
+```
 
 ## Examples
 

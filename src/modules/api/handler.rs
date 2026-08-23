@@ -61,8 +61,11 @@ impl ApiService {
         let allowed_options =
             AllowedOptions::parse(config.allowed_processing_options.as_deref().unwrap_or(""));
 
-        // Create performance configuration from environment
-        let performance_config = PerformanceConfig::from(&config);
+        // Create performance configuration from environment. Fails closed
+        // (#83) if `PERFORMANCE_PROFILE` is set to an unrecognised value,
+        // mirroring `signing`/`metrics_auth` above rather than silently
+        // falling through to different behaviour than what was requested.
+        let performance_config = PerformanceConfig::try_from(&config)?;
 
         // Initialize cache service
         let cache_service = CacheServiceBuilder::default()

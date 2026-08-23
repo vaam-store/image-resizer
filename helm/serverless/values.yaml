@@ -21,9 +21,26 @@ podLabels: ~
 podAnnotations: ~
 
 image:
-  registry: ghcr.io
+  # GH #85: `repository` below already includes the registry host, and
+  # the Bitnami `common.images.image` helper this chart uses concatenates
+  # `registry`/`repository` unconditionally - setting `registry: ghcr.io`
+  # here rendered the doubled, non-existent `ghcr.io/ghcr.io/...`
+  # reference. Leave this empty; `repository` carries the full path.
+  registry: ""
   repository: ghcr.io/vaam-store/image-resizer
-  tag: "latest"
+  # GH #85: `latest` matches no tag `.github/workflows/build.yml` actually
+  # publishes - every published tag is flavour-prefixed (fs-latest,
+  # fs_otel-latest, s3-latest, s3_otel-latest, plus per-commit
+  # `<flavor>-<sha>`; see docs/deployment/docker.md). This chart's `env`
+  # below is wired for S3/MinIO storage and sends OTLP_*/LOG_LEVEL
+  # variables that only matter on an otel-enabled image, so `s3_otel` is
+  # the matching flavour. `s3_otel-latest` is still a floating tag (moves
+  # on every push to main - build.yml has no release-tag trigger today,
+  # so there is no immutable semver tag to default to instead, the same
+  # constraint documented on helm/emgr's values.yaml `global.version`).
+  # Pin to a specific `s3_otel-<sha>` for anything beyond a quick smoke
+  # test.
+  tag: "s3_otel-latest"
   digest: ""
   ## Specify a imagePullPolicy
   ## ref: https://kubernetes.io/docs/concepts/containers/images/#pre-pulled-images
@@ -60,13 +77,54 @@ env:
 
   CDN_BASE_URL: http://localhost:19000/emgr
 
-  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # GH #85: `${LOG_LEVEL:-info}` is Docker Compose's `${VAR:-default}`
+  # shell-parameter-expansion syntax. Helm's templating engine never
+  # evaluates it, so the container received the literal string
+  # `${LOG_LEVEL:-info}` as LOG_LEVEL, not a resolved default. Use a plain
+  # value here - override it directly (`--set env.LOG_LEVEL=debug`) if you
+  # want something other than the default.
+  LOG_LEVEL: info
   OTLP_SPAN_ENDPOINT: http://tracking:4317
   OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
   OTLP_SERVICE_NAME: image-resizer
   ENABLE_HTTP2: false
   PERFORMANCE_PROFILE: high_throughput
   MAX_CONCURRENT_PROCESSING: 4
+
+  # GH #84: #27 made signed-URL verification fail closed (SIGNING_KEY/
+  # SIGNING_SALT, or an explicit ALLOW_UNSIGNED_REQUESTS=true) and #77 did
+  # the same for METRICS_AUTH_TOKEN on this otel-enabled image - neither
+  # was ever wired into this chart, so every revision failed its startup
+  # probe and never went Ready.
+  #
+  # This is a real cluster, not a local compose.yaml, so it does NOT
+  # default to ALLOW_UNSIGNED_REQUESTS=true/
+  # ALLOW_UNAUTHENTICATED_METRICS=true - that would silently trade
+  # security for convenience. Instead it points at a Secret named
+  # `emgr-signing` (same convention as helm/emgr) that you create
+  # yourself, the same way `minio` already supplies
+  # MINIO_ACCESS_KEY_ID/MINIO_SECRET_ACCESS_KEY above. If that Secret is
+  # missing, the revision fails loudly instead of starting insecurely.
+  SIGNING_KEY:
+    secretKeyRef:
+      name: emgr-signing
+      key: signing-key
+  SIGNING_SALT:
+    secretKeyRef:
+      name: emgr-signing
+      key: signing-salt
+  METRICS_AUTH_TOKEN:
+    secretKeyRef:
+      name: emgr-signing
+      key: metrics-auth-token
+      # optional (GH #77/#84): METRICS_AUTH_TOKEN is only read by an
+      # `*_otel` image - the endpoint it protects does not exist without
+      # that feature. Without this, a non-otel revision would fail over a
+      # key it never reads, forcing operators to invent a dummy value. An
+      # *otel* revision with no token still fails closed, but at
+      # application startup with the error naming both remedies, which is
+      # far more actionable than a kubelet-level config error.
+      optional: true
 
 ports:
   http1: # kservice requirements

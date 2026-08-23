@@ -110,7 +110,23 @@ use sha2::{Digest, Sha256};
 /// a worse trade than letting old entries age out naturally. If a future
 /// change to this path is *perceptible*, that calculus flips and it should
 /// bump.
-const CACHE_KEY_VERSION: u8 = 9;
+///
+/// v10 covers `strip_metadata` (#5). It is genuinely output-affecting: the
+/// default (`true`) drops EXIF, `sm:0` forwards it, and JPEG/PNG/AVIF output
+/// bytes differ between the two (see `ImageService::encode_single_image`,
+/// `src/services/image/handler.rs`). Two requests differing only in `sm`
+/// must not collide onto a v9 key that never hashed it.
+///
+/// This bump also matters for a reason no new field usually carries.
+/// Stripping metadata is now the *default*, where the previous behaviour
+/// forwarded whatever the encoder happened to emit. Every v9 entry produced
+/// before this change may therefore hold EXIF - including GPS coordinates
+/// from a user upload - that a post-#5 request for the same URL would
+/// deliberately not produce. Without the bump those entries would keep
+/// being served indefinitely, so the privacy default would silently not
+/// apply to anything already cached. That makes this bump a correctness
+/// requirement rather than a courtesy.
+const CACHE_KEY_VERSION: u8 = 10;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {
@@ -357,6 +373,21 @@ impl CacheService {
         }
         // --- #51 additions end.
 
+        // `strip_metadata` (#5) changes the encoded output bytes directly
+        // whenever the source actually carries EXIF metadata and the
+        // request keeps it (`sm:0`): JPEG gains a raw APP1 marker, PNG/AVIF
+        // gain a `set_exif_metadata` chunk, that the default (`sm`
+        // absent/`sm:1`, strip) output never has - see
+        // `ImageService::encode_single_image`'s doc comment
+        // (`src/services/image/handler.rs`) for the exact per-format
+        // matrix. Two requests differing only in `strip_metadata` must not
+        // collide onto the same cache key, like every other output-affecting
+        // field above - see this constant's own doc comment for why the
+        // required version bump is left to the integrator rather than
+        // claimed here. Always-present (not `Option<bool>`), so no "None"
+        // bucket is needed here, same as `autorotate`.
+        Self::update_field(&mut hasher, params.strip_metadata.to_string().as_bytes());
+
         let result = hasher.finalize();
         format!("{:}{:x}.{}", self.minio_sub_path, result, params.format)
     }
@@ -576,6 +607,35 @@ mod tests {
                 Some(false),
                 enlarge,
             )
+        };
+
+        assert_ne!(
+            cache.generate_key(&base(true)),
+            cache.generate_key(&base(false))
+        );
+    }
+
+    /// #5: `strip_metadata` changes the encoded output bytes whenever the
+    /// source carries EXIF metadata and the request keeps it, so a `sm:1`
+    /// (default, strip) and a `sm:0` (keep) request for the otherwise
+    /// identical parameters must not collide onto the same cache key -
+    /// otherwise a "keep metadata" request could be served bytes cached
+    /// under "strip metadata" (privacy leak in reverse: the caller thinks
+    /// they asked to keep GPS/EXIF, but the cached response never had it),
+    /// or vice versa (a stale response that still carries metadata a caller
+    /// explicitly asked to strip).
+    #[test]
+    fn strip_metadata_true_and_false_produce_distinct_keys() {
+        let cache = cache_service();
+
+        let base = |strip_metadata: bool| ResizeQuery {
+            url: "https://ex.com/a.jpg".to_string(),
+            width: Some(100),
+            height: Some(100),
+            resize_type: ResizeType::Fit,
+            format: ImageFormat::Jpg,
+            strip_metadata,
+            ..Default::default()
         };
 
         assert_ne!(
