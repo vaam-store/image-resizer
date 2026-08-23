@@ -3036,6 +3036,12 @@ impl ImageService {
     /// rather than failing the request outright (#4), logging a warning so a
     /// real regression in the mozjpeg path stays visible instead of quietly
     /// becoming the normal path for every request.
+    ///
+    /// #88: `params.strip_metadata` is resolved to a plain `want_metadata`
+    /// bool exactly once, here, and threaded into both decode paths below,
+    /// so neither one has to ask "is this wanted?" itself - see
+    /// `decode_with_image_crate`'s doc comment for why that's a bare `bool`
+    /// rather than the full `params`.
     fn decode_with_limits(
         image_bytes: &[u8],
         format: Option<ImageFormat>,
@@ -3054,7 +3060,12 @@ impl ImageService {
             }
         }
 
-        Self::decode_with_image_crate(image_bytes, format, max_src_resolution_mp)
+        Self::decode_with_image_crate(
+            image_bytes,
+            format,
+            max_src_resolution_mp,
+            !params.strip_metadata,
+        )
     }
 
     /// Decodes `image_bytes` with explicit `image::Limits` derived from
@@ -3078,10 +3089,21 @@ impl ImageService {
     /// This is the only decode path for PNG/WebP, and the fallback path for
     /// JPEG when `decode_jpeg_scaled` (#63 stage 2) fails - see
     /// `decode_with_limits`.
+    ///
+    /// #88: `want_metadata` (`!params.strip_metadata`, resolved once by the
+    /// caller) gates whether `exif_metadata()` is even called - previously
+    /// it always was, and the discard decision was made later, in
+    /// `encode_single_image` (`params.strip_metadata`), after the blob had
+    /// already been extracted. A bare `bool` rather than threading the full
+    /// `&ResizeQuery` through: this function uses nothing else from it, and
+    /// `decode_jpeg_scaled` (which does need more of `params`, for
+    /// `autorotate`/`effective_resize_target`) already takes it directly -
+    /// no need to widen this one's dependency surface to match.
     fn decode_with_image_crate(
         image_bytes: &[u8],
         format: Option<ImageFormat>,
         max_src_resolution_mp: u64,
+        want_metadata: bool,
     ) -> Result<DecodedImage> {
         let mut reader = Self::make_reader(image_bytes, format)?;
         let limits = Self::build_decode_limits(max_src_resolution_mp);
@@ -3108,16 +3130,32 @@ impl ImageService {
 
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let icc_profile = decoder.icc_profile().ok().flatten();
-        // #5: read alongside `icc_profile`/`orientation`, for the same
-        // reason - the `ImageDecoder` is consumed by `from_decoder` right
-        // below, so anything not read off it now is gone. `Ok(None)` is
-        // `ImageDecoder::exif_metadata`'s own default for formats/decoders
-        // that don't implement it (`image-0.25.10/src/io/decoder.rs`) - a
-        // source with no EXIF segment at all (or a format this crate
-        // doesn't extract EXIF from) is indistinguishable from "read
-        // failed", and both mean "nothing to forward", so `.ok().flatten()`
-        // treats them the same, mirroring `icc_profile` immediately above.
-        let exif_metadata = decoder.exif_metadata().ok().flatten();
+        // #5, narrowed by #88: read alongside `icc_profile`/`orientation`,
+        // for the same reason - the `ImageDecoder` is consumed by
+        // `from_decoder` right below, so anything not read off it now is
+        // gone. But only when `want_metadata` says the caller will actually
+        // keep it (`!params.strip_metadata`, the default is `false` here) -
+        // otherwise this is skipped entirely rather than extracting a blob
+        // just to throw it away in `encode_single_image`. `orientation()`
+        // just above is unaffected by this and always runs: for the PNG/
+        // WebP decoders reached through this function it's cheap (PNG: a
+        // clone of an already-parsed header field; WebP: same double-call
+        // shape as JPEG's own decoder, see `decode_jpeg_scaled`'s
+        // `exif_metadata` comment) and, more importantly, `autorotate`
+        // depends on it regardless of `strip_metadata`.
+        //
+        // `Ok(None)` is `ImageDecoder::exif_metadata`'s own default for
+        // formats/decoders that don't implement it
+        // (`image-0.25.10/src/io/decoder.rs`) - a source with no EXIF
+        // segment at all (or a format this crate doesn't extract EXIF from)
+        // is indistinguishable from "read failed", and both mean "nothing
+        // to forward", so `.ok().flatten()` treats them the same, mirroring
+        // `icc_profile` immediately above.
+        let exif_metadata = if want_metadata {
+            decoder.exif_metadata().ok().flatten()
+        } else {
+            None
+        };
 
         let img = image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
         Ok((img, orientation, icc_profile, exif_metadata))
@@ -3180,14 +3218,37 @@ impl ImageService {
 
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let icc_profile = decoder.icc_profile().ok().flatten();
-        // #5: same "read off the `ImageDecoder` before it's dropped" reasoning
-        // as `decode_with_image_crate` - see that function's doc comment.
-        // `decoder.orientation()` above already forced the JPEG decoder to
-        // parse the EXIF segment once and cache it (see
-        // `image-0.25.10/src/codecs/jpeg/decoder.rs`'s `exif_metadata` doc
-        // comment: "caches the orientation, so call it if orientation hasn't
-        // been set yet"), so this second call is cheap.
-        let exif_metadata = decoder.exif_metadata().ok().flatten();
+        // #5, narrowed by #88: same "read off the `ImageDecoder` before
+        // it's dropped" reasoning as `decode_with_image_crate` - see that
+        // function's doc comment for the `want_metadata` gating this
+        // mirrors (`decode_with_limits` already has `params` in scope here,
+        // so this checks `params.strip_metadata` directly instead of
+        // needing a separate bool threaded in).
+        //
+        // Correction to what used to be claimed here: `decoder.orientation()`
+        // above does *not* make this call cheap. Its own doc comment says
+        // "`exif_metadata` caches the orientation, so call it if orientation
+        // hasn't been set yet" - i.e. `orientation()` calls *into*
+        // `exif_metadata()` (image-0.25.10's `JpegDecoder::orientation`,
+        // `src/codecs/jpeg/decoder.rs:140-146`) to compute and cache the
+        // `Orientation`, then discards the blob that call produced
+        // (`let _ = self.exif_metadata()?;`). Only the orientation is
+        // cached - `JpegDecoder::exif_metadata` itself
+        // (`src/codecs/jpeg/decoder.rs:97-138`) caches nothing and redoes
+        // the full parse from scratch on every call: a fresh
+        // `zune_jpeg::JpegDecoder`, `decode_headers()`, and
+        // `exif().cloned()`. So before this change, a JPEG going through
+        // this path paid for that parse *twice* per request regardless of
+        // `strip_metadata` - once inside `orientation()` (result thrown
+        // away) and once here. Gating this call on `!params.strip_metadata`
+        // both skips the unwanted copy on the default path and removes the
+        // redundant second parse on the `sm:0` path (`orientation()` still
+        // runs the first one, since autorotate needs it unconditionally).
+        let exif_metadata = if params.strip_metadata {
+            None
+        } else {
+            decoder.exif_metadata().ok().flatten()
+        };
         let (header_width, header_height) = decoder.dimensions();
 
         // `Orientation::Rotate90`/`Rotate270`/`Rotate90FlipH`/`Rotate270FlipH`
