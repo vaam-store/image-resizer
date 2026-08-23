@@ -4544,50 +4544,79 @@ mod tests {
         );
     }
 
-    /// #30: under genuine concurrent load with a single permit, some calls
-    /// must succeed and at least one must be shed rather than every call
-    /// queueing up and eventually succeeding - proving the semaphore
-    /// actually bounds concurrency instead of merely being threaded through
-    /// unused (the state before this change).
+    /// #30: with the processing semaphore's only permit already held, every
+    /// concurrent `process_image` call must be shed with a "permit" error,
+    /// and a call made *after* the permit is released must succeed -
+    /// proving the semaphore actually bounds concurrency instead of merely
+    /// being threaded through unused (the state before this change).
+    ///
+    /// GH #90: this used to spawn 8 real concurrent `process_image` calls
+    /// against a real-sized fixture and *infer* saturation from whether
+    /// enough of them overlapped in practice - i.e. it hoped the scheduler
+    /// interleaved decodes such that at least one arrived while another was
+    /// still running. That inference is exactly the kind of timing
+    /// dependence a test for a concurrency *bound* should not have, and it
+    /// flaked twice in CI (never locally) for a reason unrelated to the
+    /// semaphore at all: `fixtures::photo_like()`'s on-disk cache
+    /// (`benches/fixtures.rs`) had its own genuine race on a cold cache -
+    /// concurrently-running tests could read a torn/truncated copy of the
+    /// cached fixture while another thread was still writing it, surfacing
+    /// as "Failed to read image dimensions" from whichever task happened to
+    /// decode the corrupted bytes. That race is fixed at the source now
+    /// (`cached`'s doc comment has the full mechanism), but this test no
+    /// longer needs real contention to prove its point either way: holding
+    /// the permit directly turns "hope the scheduler interleaves this
+    /// right" into a fixed sequence that cannot pass by luck and cannot
+    /// fail by bad luck.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrency_limit_sheds_excess_requests_under_real_load() {
+    async fn concurrency_limit_sheds_excess_requests_while_permit_held() {
         let config = PerformanceConfig {
             max_concurrent_processing: 1,
             ..PerformanceConfig::default()
         };
         let service = Arc::new(ImageService::with_config(config).unwrap());
-        // A real-sized image so processing takes long enough for concurrent
-        // callers to actually contend on the single permit, rather than
-        // each finishing before the next one is even scheduled.
         let bytes = Bytes::from(fixtures::photo_like());
+        let params = query(Some(640), Some(480));
 
+        // Acquire the only permit ourselves, standing in for "a job is
+        // already running" - the test controls saturation directly instead
+        // of hoping real concurrent decodes overlap.
+        let held_permit = Arc::clone(&service.processing_semaphore)
+            .try_acquire_owned()
+            .expect("the only permit should be free before any processing starts");
+
+        // With the permit held, every one of several concurrent calls must
+        // be shed - deterministically all of them, not racily "at least
+        // one", since none can possibly acquire a permit that isn't there.
         let mut handles = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..4 {
             let service = Arc::clone(&service);
             let bytes = bytes.clone();
+            let params = params.clone();
             handles.push(tokio::spawn(async move {
-                let params = query(Some(640), Some(480));
                 service.process_image(&bytes, &params).await
             }));
         }
 
-        let mut successes = 0;
-        let mut shed = 0;
         for handle in handles {
-            match handle.await.expect("spawned task should not panic") {
-                Ok(_) => successes += 1,
-                Err(err) if err.to_string().to_lowercase().contains("permit") => shed += 1,
-                Err(err) => panic!("unexpected error: {err}"),
-            }
+            let result = handle.await.expect("spawned task should not panic");
+            let err = result.expect_err(
+                "a request made while the only permit is held must be shed, not succeed - \
+                 the semaphore does not appear to be bounding concurrency",
+            );
+            assert!(
+                err.to_string().to_lowercase().contains("permit"),
+                "expected a 'permit' error (maps to 503) while saturated, got: {err}"
+            );
         }
 
-        assert!(successes >= 1, "expected at least one request to succeed");
-        assert!(
-            shed >= 1,
-            "expected at least one of 8 concurrent requests to be shed with only 1 permit \
-             available (got {successes} successes, {shed} shed) - the semaphore does not \
-             appear to be bounding concurrency"
-        );
+        // Release the permit and prove the semaphore actually recovers: a
+        // request made afterwards must succeed rather than staying shed.
+        drop(held_permit);
+        service
+            .process_image(&bytes, &params)
+            .await
+            .expect("a request made after the permit is released should succeed");
     }
 
     /// #31: the `Bytes`-threaded path (`ImageService::process_image`, used
