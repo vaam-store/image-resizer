@@ -114,40 +114,25 @@ target, backed by a local MinIO), plus a Jaeger all-in-one container for
 the OTel traces both services emit - both are `*_otel_deploy` builds, so
 both need `/metrics` auth configured, not just signing.
 
-**As committed, neither service will start.** `compose.yaml`'s
-`environment:` blocks for `app` and `app-s3` don't reference
-`SIGNING_KEY`/`SIGNING_SALT`/`ALLOW_UNSIGNED_REQUESTS` or
-`METRICS_AUTH_TOKEN`/`ALLOW_UNAUTHENTICATED_METRICS` at all - `.env`
-(`cp .env.example .env`) does not fix this on its own, since Compose only
-uses a root `.env` file for `${VAR}` substitution *inside* `compose.yaml`,
-and nothing in `compose.yaml` reads those five variables into either
-service. Confirm this yourself with `docker compose config` - the
-resolved `environment:` for `app`/`app-s3` has no signing- or
-metrics-auth-related keys, with or without a populated `.env`.
-
-Until `compose.yaml` is updated to forward them, add an override file
-(auto-loaded by `docker compose` alongside `compose.yaml`, no `-f` flag
-needed):
-
-```yaml
-# compose.override.yaml (local only - not tracked in git)
-services:
-  app:
-    environment:
-      SIGNING_KEY: ${SIGNING_KEY}
-      SIGNING_SALT: ${SIGNING_SALT}
-      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN}
-  app-s3:
-    environment:
-      SIGNING_KEY: ${SIGNING_KEY}
-      SIGNING_SALT: ${SIGNING_SALT}
-      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN}
-```
+`compose.yaml`'s `environment:` blocks for `app` and `app-s3` forward
+`SIGNING_KEY`/`SIGNING_SALT`/`METRICS_AUTH_TOKEN` from your shell/`.env`
+(empty by default), and default `ALLOW_UNSIGNED_REQUESTS` and
+`ALLOW_UNAUTHENTICATED_METRICS` to `true` (GH #84). `compose.yaml` exists
+for local development, so that default is deliberate - you can
+`docker compose up` with no `.env` at all and get a running service,
+without generating an HMAC key first. If you set real
+`SIGNING_KEY`/`SIGNING_SALT`/`METRICS_AUTH_TOKEN` values in `.env`, they
+take effect regardless of the `ALLOW_*` defaults - a real key/salt is
+checked independently of `ALLOW_UNSIGNED_REQUESTS`
+(`src/modules/signing/config.rs`), so the two never conflict.
 
 ```bash
-cp .env.example .env   # also uncomment/set SIGNING_KEY, SIGNING_SALT, METRICS_AUTH_TOKEN in it
+# Start everything (no .env needed - signing/metrics auth default to
+# disabled for local development)
+docker compose up -d --build
 
-# Start everything
+# Or, to exercise real signing/metrics auth locally:
+cp .env.example .env   # uncomment/set SIGNING_KEY, SIGNING_SALT, METRICS_AUTH_TOKEN in it
 docker compose up -d --build
 
 # Stop
@@ -159,8 +144,7 @@ docker compose logs -f
 
 The `Makefile` wraps the same compose invocations (`make up`, `make down`,
 `make logs`, `make ps` - see `make help` for the full list) with the
-project name pinned to `emgr`; the override file above applies to those
-too, since `make` doesn't pass `-f`.
+project name pinned to `emgr`.
 
 ## Managing the container
 

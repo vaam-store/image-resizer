@@ -57,6 +57,25 @@ services:
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
       ENABLE_HTTP2: false
+      # GH #84: #27 made signed-URL verification fail closed (SIGNING_KEY/
+      # SIGNING_SALT, or an explicit ALLOW_UNSIGNED_REQUESTS=true) and #77
+      # did the same for METRICS_AUTH_TOKEN on this otel target - neither
+      # was ever forwarded here, so this service could never start.
+      # compose.yaml exists for local development, so defaulting the two
+      # opt-outs to "true" (a developer should not need to generate an
+      # HMAC key just to see the thing run) is the right call here - unlike
+      # the Helm charts, which deploy to real clusters and must not default
+      # to insecure. SIGNING_KEY/SIGNING_SALT/METRICS_AUTH_TOKEN are still
+      # forwarded from the environment (via .env, see .env.example) so a
+      # real key overrides the unsigned/unauthenticated defaults - signing
+      # a real key/salt is checked independently of ALLOW_UNSIGNED_REQUESTS
+      # (src/modules/signing/config.rs), so setting one does not conflict
+      # with the other.
+      ALLOW_UNSIGNED_REQUESTS: ${ALLOW_UNSIGNED_REQUESTS:-true}
+      SIGNING_KEY: ${SIGNING_KEY:-}
+      SIGNING_SALT: ${SIGNING_SALT:-}
+      ALLOW_UNAUTHENTICATED_METRICS: ${ALLOW_UNAUTHENTICATED_METRICS:-true}
+      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
       # PERFORMANCE_PROFILE sizes concurrency off the *container's* core
       # count (num_cpus, see src/config/performance.rs's
       # high_throughput()), not a fixed number - it used to be paired with
@@ -99,6 +118,13 @@ services:
       OTLP_METRIC_ENDPOINT: http://tracking:4318/v1/metrics
       OTLP_SERVICE_NAME: image-resizer
       ENABLE_HTTP2: false
+      # GH #84: see the identical comment on the `app` service above - same
+      # fail-closed startup checks, same local-development default.
+      ALLOW_UNSIGNED_REQUESTS: ${ALLOW_UNSIGNED_REQUESTS:-true}
+      SIGNING_KEY: ${SIGNING_KEY:-}
+      SIGNING_SALT: ${SIGNING_SALT:-}
+      ALLOW_UNAUTHENTICATED_METRICS: ${ALLOW_UNAUTHENTICATED_METRICS:-true}
+      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
       # PERFORMANCE_PROFILE sizes concurrency off the *container's* core
       # count (num_cpus, see src/config/performance.rs's
       # high_throughput()), not a fixed number - it used to be paired with

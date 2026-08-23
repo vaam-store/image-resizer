@@ -65,47 +65,50 @@ mounted `ReadWriteMany` PVC to uid/gid `1001` before the app container
 (which runs as that non-root user, `defaultPodOptions.securityContext`)
 starts.
 
-### What the chart does *not* configure - you must add it
+### Signing / metrics-auth secrets (GH #84)
 
-**The chart as shipped does not set `SIGNING_KEY`/`SIGNING_SALT` (or
-`ALLOW_UNSIGNED_REQUESTS`), and does not set `METRICS_AUTH_TOKEN` (or
-`ALLOW_UNAUTHENTICATED_METRICS`).** `emgr` fails closed at startup without
-these (see [Installation](../getting-started/installation.md#configure-the-two-startup-checks)),
-so a pod deployed from this chart's defaults will crash-loop. Add them
-yourself in a values override - the bjw-s common library supports either
-plain values or a `Secret`-backed reference on the same container:
+`emgr` fails closed at startup without `SIGNING_KEY`/`SIGNING_SALT` (or
+`ALLOW_UNSIGNED_REQUESTS`), and without `METRICS_AUTH_TOKEN` (or
+`ALLOW_UNAUTHENTICATED_METRICS`) on an `otel`-enabled image (see
+[Installation](../getting-started/installation.md#configure-the-two-startup-checks)).
+
+This is a real cluster, not a local `compose.yaml`, so the chart does
+**not** default `ALLOW_UNSIGNED_REQUESTS`/`ALLOW_UNAUTHENTICATED_METRICS`
+to `true` the way `compose.yaml` does for local development - that would
+silently trade security for convenience. Instead `values.yaml`'s
+`controllers.main.containers.app.env` already wires all three variables to
+a `Secret` named `emgr-signing`:
 
 ```yaml
-# values-signing.yaml
-controllers:
-  main:
-    containers:
-      app:
-        env:
-          SIGNING_KEY:
-            valueFrom:
-              secretKeyRef:
-                name: emgr-signing
-                key: signing-key
-          SIGNING_SALT:
-            valueFrom:
-              secretKeyRef:
-                name: emgr-signing
-                key: signing-salt
-          METRICS_AUTH_TOKEN:
-            valueFrom:
-              secretKeyRef:
-                name: emgr-signing
-                key: metrics-auth-token
+env:
+  SIGNING_KEY:
+    valueFrom:
+      secretKeyRef: { name: emgr-signing, key: signing-key }
+  SIGNING_SALT:
+    valueFrom:
+      secretKeyRef: { name: emgr-signing, key: signing-salt }
+  METRICS_AUTH_TOKEN:
+    valueFrom:
+      secretKeyRef: { name: emgr-signing, key: metrics-auth-token }
 ```
 
-(with `emgr-signing` a `Secret` you create separately - the chart does not
-create one for you) - or the equivalent inline `env` map if you don't want
-a `Secret`. See the
+You must create that `Secret` yourself - the chart deliberately does not,
+so the key/salt/token never live in `values.yaml` or a values override:
+
+```bash
+kubectl create secret generic emgr-signing --namespace emgr \
+  --from-literal=signing-key="$(openssl rand -hex 32)" \
+  --from-literal=signing-salt="$(openssl rand -hex 16)" \
+  --from-literal=metrics-auth-token="$(openssl rand -hex 32)"
+```
+
+If the `Secret` is missing, the pod fails loudly
+(`CreateContainerConfigError`, visible in `kubectl describe pod`) instead
+of starting insecurely. To point at a differently-named `Secret`, override
+the `name:` fields above in your own values file. See the
 [bjw-s common library's `env`/`envFrom` docs](https://bjw-s-labs.github.io/helm-charts/docs/common-library/values/#env-and-envfrom)
-for the full schema. The image itself must also be an `otel`-enabled
-build for `METRICS_AUTH_TOKEN` to matter at all - see the image tag note
-below.
+for the full schema. `METRICS_AUTH_TOKEN` only matters once the image
+itself is an `otel`-enabled build - see the image tag note below.
 
 ### Image tag
 
@@ -126,9 +129,11 @@ different builds under the same tag name.
 ```bash
 # From the local chart directory (no chart repository is published today)
 helm dependency build ./helm/emgr
-helm install emgr ./helm/emgr \
-  --namespace emgr --create-namespace \
-  -f values-signing.yaml   # your own override, see above
+
+# Create the emgr-signing Secret first (see above) - the chart's values.yaml
+# already points at it, no values override needed unless you want to
+# rename the Secret or its keys.
+helm install emgr ./helm/emgr --namespace emgr --create-namespace
 
 kubectl get pods -n emgr
 kubectl get svc -n emgr
@@ -137,7 +142,7 @@ kubectl get svc -n emgr
 Upgrade / uninstall:
 
 ```bash
-helm upgrade emgr ./helm/emgr --namespace emgr -f values-signing.yaml
+helm upgrade emgr ./helm/emgr --namespace emgr
 helm uninstall emgr --namespace emgr
 ```
 
@@ -175,14 +180,12 @@ env:
   # ...
 ```
 
-### What the chart does *not* configure - you must add it
+### Signing / metrics-auth secrets (GH #84)
 
-Exactly like the `emgr` chart above, **no `SIGNING_KEY`/`SIGNING_SALT`
-(or `ALLOW_UNSIGNED_REQUESTS`) and no `METRICS_AUTH_TOKEN` (or
-`ALLOW_UNAUTHENTICATED_METRICS`) are set**, so a Knative revision deployed
-from these defaults will fail its startup probe and never go Ready. Add
-them to `values.yaml`'s `env` map using the same `secretKeyRef` shape
-already used for `MINIO_ACCESS_KEY_ID` above, e.g.:
+Exactly like the `emgr` chart above, `values.yaml`'s `env` map already
+wires `SIGNING_KEY`/`SIGNING_SALT`/`METRICS_AUTH_TOKEN` to a `Secret`
+named `emgr-signing`, using the same `secretKeyRef` shape as
+`MINIO_ACCESS_KEY_ID` above:
 
 ```yaml
 env:
@@ -191,51 +194,37 @@ env:
   METRICS_AUTH_TOKEN: { secretKeyRef: { name: emgr-signing, key: metrics-auth-token } }
 ```
 
-### Image tag - two confirmed problems, not just a stale default
+Create that `Secret` yourself before installing (see the `kubectl create
+secret` command in the `emgr` chart section above - the same Secret works
+for both charts). Without it, the Knative revision fails its startup probe
+and never goes Ready, instead of serving unsigned requests or an open
+`/metrics`.
 
-`values.yaml`'s `image.tag` defaults to a plain `"latest"` - **this does
-not correspond to any image `.github/workflows/build.yml` actually
-publishes.** Every published tag is flavour-prefixed (`fs-latest`,
-`fs_otel-latest`, `s3-latest`, `s3_otel-latest`, plus per-commit
-`<flavor>-<sha>` - see [Docker deployment](docker.md)); there is no
-bare `latest`. Given this chart's `env` defaults assume S3/MinIO storage
-and it sends `LOG_LEVEL`/`OTLP_*` variables (meaningful only on an `otel`
-build), you'd want `s3_otel-latest` or a pinned `s3_otel-<sha>` instead.
+### Image tag and registry (GH #85, fixed)
 
-Overriding `image.tag` alone still won't produce a working image
-reference, though - `helm template ./helm/serverless` (verified directly)
-renders:
+`values.yaml`'s `image.registry` is empty and `image.repository` carries
+the full `ghcr.io/vaam-store/image-resizer` path - `helm template` used to
+render a doubled `ghcr.io/ghcr.io/...` reference when both fields set a
+registry host; only `repository` does now. `image.tag` defaults to
+`s3_otel-latest`, matching this chart's `env` defaults (S3/MinIO storage,
+`OTLP_*` variables meaningful only on an `otel` build) and an image
+flavour `.github/workflows/build.yml` actually publishes (see
+[Docker deployment](docker.md) for the full tag list). Like
+`helm/emgr`'s `global.version`, this is still a **floating** tag - pin to
+a specific `s3_otel-<sha>` for anything beyond a quick smoke test.
 
-```yaml
-- image: ghcr.io/ghcr.io/vaam-store/image-resizer:latest
-```
-
-`values.yaml` sets both `image.registry: ghcr.io` **and**
-`image.repository: ghcr.io/vaam-store/image-resizer` (the repository
-already includes the registry host), and the Bitnami `common.images.image`
-helper this chart uses concatenates `registry`/`repository` unconditionally
-- producing a doubled, non-existent `ghcr.io/ghcr.io/...` reference. Until
-this is fixed in the chart, override `image.registry: ""` (empty) in your
-values, alongside `image.tag`, or set `image.repository` to just
-`vaam-store/image-resizer`.
-
-Separately (also verified via `helm template`), `values.yaml`'s
-`env.LOG_LEVEL: ${LOG_LEVEL:-info}` is Docker Compose's `${VAR:-default}`
-substitution syntax, which Helm does not evaluate - it renders as the
-**literal string** `${LOG_LEVEL:-info}` for the container's `LOG_LEVEL`
-env var, not a resolved default. Override `env.LOG_LEVEL` to an actual
-level (e.g. `info`) in your values file.
+`values.yaml`'s `env.LOG_LEVEL` is a plain `info` - it used to be Docker
+Compose's `${LOG_LEVEL:-info}` shell-substitution syntax, which Helm never
+evaluates and rendered as that literal string. Override `env.LOG_LEVEL`
+directly (`--set env.LOG_LEVEL=debug`) if you want something else.
 
 ### Deployment steps
 
 ```bash
 helm dependency build ./helm/serverless
-helm install emgr-serverless ./helm/serverless \
-  --namespace emgr --create-namespace \
-  --set image.registry="" \
-  --set image.tag=s3_otel-latest \
-  --set env.LOG_LEVEL=info \
-  -f values-signing.yaml
+
+# Create the emgr-signing Secret first (see above).
+helm install emgr-serverless ./helm/serverless --namespace emgr --create-namespace
 
 kubectl get ksvc -n emgr
 ```
@@ -243,7 +232,7 @@ kubectl get ksvc -n emgr
 Upgrade / uninstall:
 
 ```bash
-helm upgrade emgr-serverless ./helm/serverless --namespace emgr -f values-signing.yaml
+helm upgrade emgr-serverless ./helm/serverless --namespace emgr
 helm uninstall emgr-serverless --namespace emgr
 ```
 
@@ -257,3 +246,7 @@ helm uninstall emgr-serverless --namespace emgr
   guard, resolution limits, presets) works the same way: add the env var
   from [Configuration](../getting-started/configuration.md) to whichever
   chart's env mechanism you're using.
+- `.github/workflows/ci.yml`'s `helm-verify` job runs `helm dependency
+  build`, `helm lint` and `helm template` for both charts on every PR (GH
+  #84 / #85) - a rendering defect like the ones described above now fails
+  a build instead of reaching a user.
