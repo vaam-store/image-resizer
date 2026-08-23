@@ -1,5 +1,19 @@
 # ADR 0004: AVIF vs. JPEG/WebP byte-size and encode-time, measured on real photos at matched perceptual quality
 
+> **⚠️ SUPERSEDED — 2026-08-23, by [`adr/0005-avif-measurement-libavif-mozjpeg.md`](0005-avif-measurement-libavif-mozjpeg.md).**
+> **Every number below describes encoders this service no longer ships. Do not quote them.**
+>
+> The *method* here is sound and ADR 0005 reuses it almost unchanged. What expired is the
+> measurement, on three independent axes:
+>
+> 1. **The JPEG baseline** — measured `image`'s `JpegEncoder`; production moved to **mozjpeg** (#76).
+> 2. **The AVIF encoder** — measured `ravif`/`rav1e`; production moved to **libavif/AOM** (#67/#68).
+> 3. **The AVIF speed setting** — measured at `DEFAULT_AVIF_SPEED = 4`; it is **6** today.
+>
+> Two figures in particular get quoted and are both wrong now: **AVIF/JPEG 0.7241x** (0.7612x
+> against mozjpeg) and **AVIF encode 367.8 ms** (119.2 ms with AOM — a 3x speedup, and the tail
+> collapses from 986 ms to 197 ms). Tracked as #93.
+
 - Status: **Informational** — first real measurement of AVIF against JPEG and WebP for this
   project on `origin/main` (only ADRs 0001-0003 exist there: `git ls-tree origin/main adr/`).
   ADR 0001's original AVIF numbers (0.79x at q75, 0.42x at q50) were produced by the same flawed

@@ -102,9 +102,12 @@ use sha2::{Digest, Sha256};
 ///   swap this project already accepted as imperceptible.
 /// - A bump invalidates *every* cached entry in *every* format, forcing a
 ///   full reprocessing storm on the next request for each. With AVIF
-///   encode measured up to 986 ms (`adr/0004`), that cost is real and
-///   falls entirely on the cold path this project is already 3.65x behind
-///   imgproxy on.
+///   encode measured up to 197 ms (`adr/0005`; it was 986 ms under the
+///   removed `ravif` encoder, which is the figure this note used to cite),
+///   that cost is real and falls entirely on the cold path this project is
+///   already 3.65x behind imgproxy on. The tail shrank 5x, so the argument
+///   is weaker than it was — but a storm across every format at once is
+///   still a storm.
 ///
 /// Flushing the whole cache to correct an invisible rounding difference is
 /// a worse trade than letting old entries age out naturally. If a future

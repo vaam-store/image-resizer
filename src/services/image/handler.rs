@@ -55,15 +55,26 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 75;
 /// `image::codecs::avif::AvifEncoder`, before AOM replaced it), used when
 /// `ResizeQuery::quality` (the `q:{0-100}` processing option) isn't set.
 /// `80` was `AvifEncoder::new`'s own pre-#68 default and `cavif`'s
-/// reference default; kept unchanged by #68 - the encode-time/size
-/// re-measurement this change's own report describes swept quality at 80
-/// as the fixed anchor and found no quality-driven reason to move it, only
-/// a speed-driven one (see `DEFAULT_AVIF_SPEED` below). Originally
-/// measured against real photographs in `adr/0004-avif-measurement.md`
-/// (against the now-removed `ravif` encoder - AOM's own quality scale is
-/// not guaranteed to mean the same thing, per that ADR's and adr/0003's
-/// own "nominal quality numbers aren't comparable across encoders"
-/// finding, but no re-measurement flagged a reason to change the value).
+/// reference default, and it survives a second look: `adr/0005`
+/// re-measured against the encoders actually shipped today (libavif/AOM
+/// and mozjpeg, superseding `adr/0004`, whose numbers are void) and the
+/// owner reviewed the result and chose to keep 80.
+///
+/// **Read this before "optimising" it.** At 80 an AVIF is a median 1.14x
+/// LARGER than default JPEG, larger on 19 of 24 Kodak images - because
+/// AOM's q80 is a far more conservative quality point than rav1e's q80
+/// was, roughly 2x better DSSIM. The widely-quoted "AVIF is ~24% smaller"
+/// is real but lands at quality ~66, not here. Lowering 80 -> 66 is
+/// therefore not a free saving: it buys bytes by shipping visibly worse
+/// images, roughly matching what JPEG q75 already delivers. That trade was
+/// considered and declined. AVIF is smaller than JPEG at every quality
+/// from 40 to 90 (no crossover), so 80 is not a mistake - it is a
+/// deliberately higher quality point.
+///
+/// If you change this, bump `CACHE_KEY_VERSION`: `generate_key` hashes the
+/// REQUESTED `params.quality`, which is `None` for any url without an
+/// explicit `q:` option, so the default is invisible to the cache key and
+/// old entries would keep being served at the old quality forever.
 pub const DEFAULT_AVIF_QUALITY: u8 = 80;
 
 /// AVIF encode speed (0-10, `avifEncoder.speed`'s own scale via
@@ -86,6 +97,11 @@ pub const DEFAULT_AVIF_QUALITY: u8 = 80;
 /// output - i.e. slightly *larger*, not smaller, at matched perceptual
 /// quality - materially different from the informally-cited "13%
 /// smaller" figure; see that report for why).
+///
+/// `adr/0005` re-measured this setting end to end: 119.2 ms median encode
+/// (range 81-197), 3.1x faster than the `ravif`/speed-4 configuration
+/// `adr/0004` measured, with the content-dependent tail collapsing from
+/// 986 ms to 197 ms.
 pub const DEFAULT_AVIF_SPEED: u8 = 6;
 
 /// Default background colour (#34) used both to flatten alpha before
@@ -963,7 +979,10 @@ impl ImageService {
         // default (`AvifEncoder::new`, which hardcodes quality 80/speed 4 -
         // the same defaults this crate uses, but naming them explicitly
         // lets `params.quality` (the `q:` processing option) override it,
-        // measured in `adr/0004-avif-measurement.md`). GIF is unaffected
+        // measured in `adr/0005-avif-measurement-libavif-mozjpeg.md`,
+        // which supersedes `adr/0004` - note the "quality 80/speed 4"
+        // defaults named above were `ravif`'s, and #68 replaced that
+        // encoder with libavif/AOM). GIF is unaffected
         // and keeps going through `write_to` exactly as before.
         //
         // PNG has no quality knob in `params` to honour - `CompressionType`
@@ -3542,7 +3561,9 @@ impl ImageService {
         // photographs (24-image Kodak corpus + 3 picsum.photos sources x 4
         // resolutions, 640x360 through 3840x2160 - not the synthetic
         // gradient-plus-noise fixture `benches/fixtures.rs` uses elsewhere,
-        // per the same reasoning `adr/0003`/`adr/0004` document), mozjpeg's
+        // per the same reasoning `adr/0003`/`adr/0004`/`adr/0005` all
+        // document - 0004's numbers are superseded but its method, which
+        // is what is cited here, is not), mozjpeg's
         // full-size (`scale(8)`) decode is consistently ~1.5x faster than
         // the `image`-crate path across every resolution bucket - see this
         // change's own report for the full table. "Byte-for-byte identical"
