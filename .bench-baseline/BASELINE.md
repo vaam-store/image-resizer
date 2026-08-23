@@ -528,3 +528,270 @@ in production exactly as `write_to` would measure it, and AVIF goes through
 `AvifEncoder::new_with_speed_quality` with `DEFAULT_AVIF_QUALITY`/
 `DEFAULT_AVIF_SPEED`. Neither was added here, to keep this change scoped to
 the PNG defect and the audit that found it.
+
+## Real-photo fixtures — the fourth instance of the synthetic-fixture trap (`bench/real-fixtures`, 2026-08-23)
+
+**This is the same class of measurement trap as `decode/jpeg`'s `zune-jpeg`
+version bump, `pipeline alpha -> resize webp`'s encoder swap, and the PNG
+encode correction above — a fourth confirmed instance, not a new kind of
+bug.** `benches/fixtures.rs`'s `gradient_noise_rgb` (smooth gradient + i.i.d.
+per-pixel noise) has produced a wrong answer four separate times this month:
+WebP decode direction inverted, AVIF decode inflated, PNG encode measured a
+path production never runs (corrected above), and — see below — the
+end-to-end corpus exercised none of the codec paths #66/#67/#68 recently
+changed. `adr/0003-webp-measurement.md` and `adr/0004-avif-measurement.md`
+diagnosed the first two from standalone scratch-crate measurements against
+the Kodak corpus; this change adds the same real/synthetic split directly
+into `benches/decode.rs`/`benches/encode.rs`/`benches/pipeline.rs` so the
+distinction is visible in `cargo bench` output itself, not only in a
+one-off ADR.
+
+### Corpus decision: two committed real photographs, not a Kodak fetch
+
+`adr/0003`/`0004` fetched the 24-image Kodak True Color suite over the
+network into scratch crates for their measurements. A criterion benchmark
+that fetches over the network at run time was rejected outright (would
+break `cargo bench` offline and in CI); generating a *photographic-like*
+fixture procedurally (e.g. layered coloured noise with a more natural
+frequency spectrum) was considered but rejected too — the whole point of
+this change is to measure genuine photographic content, and a better
+synthetic approximation is still an approximation with its own unverified
+bias.
+
+Instead, two real NASA photographs (public domain, 17 U.S.C. §105 — not
+the Kodak corpus, whose redistribution licence was flagged as unverified
+for committing into this repository) are embedded via `include_bytes!`:
+`benches/fixtures/real/blue-marble.jpg` (2200×1100, "Blue Marble 2002",
+NASA Earth Observatory — cloud/ocean/land texture) and
+`benches/fixtures/real/earthrise.jpg` (1280×1280, Apollo 8 "Earthrise" —
+near-black space + lunar regolith + a small high-detail Earth, structurally
+different content so the comparison doesn't rest on one photo's particular
+compressibility). Full provenance, licence confirmation, and the exact
+resize/re-encode steps are in `benches/fixtures/real/ATTRIBUTION.md`.
+**Combined size: 368 KB** (294 KB + 80 KB) committed to the repo — the
+synthetic fixtures generate at run time and add nothing to repo size, so
+this 368 KB is the entire cost. Both images are downscaled to comfortably
+exceed every fixture size this suite requests (max 1920×1080), so every
+derived fixture (`fixtures::real_photo_sized`, a cover-crop + Lanczos3
+resize, mirroring `photo_like_sized`'s signature) is a pure downscale,
+never an upscale.
+
+The synthetic fixture is **kept, not deleted** — it is still a legitimate
+worst case (screenshots of already-compressed frames, sensor noise, hostile
+input) and this suite has tracked relative regressions against it for
+months. Every decode/encode case now runs both, named so the distinction is
+visible: `decode/webp/synthetic/1920x1080` vs `decode/webp/photo/1920x1080`,
+`encode/webp/synthetic` vs `encode/webp/photo`,
+`pipeline/process_image_blocking/photo_like/thumbnail_jpg` vs
+`pipeline/process_image_blocking/photo_real/thumbnail_jpg`.
+
+### Decode: real photos measure 1.3×–2.0× faster than synthetic noise, every codec, every size
+
+Command: `cargo bench --features local_fs -- --sample-size 20
+--measurement-time 2 --warm-up-time 1`. Machine: darwin/arm64, rustc
+1.95.0, commit `603ba9d`. All figures are medians.
+
+| Bench | synthetic | photo | photo/synthetic |
+|---|---:|---:|---:|
+| decode/jpeg 640x360 | 822.4 µs | 597.8 µs | 0.73× |
+| decode/jpeg 1280x720 | 3.271 ms | 2.231 ms | 0.68× |
+| decode/jpeg 1920x1080 | 7.319 ms | 4.893 ms | 0.67× |
+| decode/png 640x360 | 1.582 ms | 902.3 µs | 0.57× |
+| decode/png 1280x720 | 6.360 ms | 3.184 ms | 0.50× |
+| decode/png 1920x1080 | 14.00 ms | 8.002 ms | 0.57× |
+| decode/webp 640x360 | 3.630 ms | 2.192 ms | 0.60× |
+| decode/webp 1280x720 | 14.28 ms | 8.093 ms | 0.57× |
+| **decode/webp 1920x1080** | **32.27 ms** | **18.19 ms** | **0.56× (1.77× faster)** |
+| decode/avif 640x360 | 5.960 ms | 4.544 ms | 0.76× |
+| decode/avif 1280x720 | 24.19 ms | 15.02 ms | 0.62× |
+| **decode/avif 1920x1080** | **55.13 ms** | **31.54 ms** | **0.57× (1.75× faster)** |
+
+Every single decode case is faster on the real photo, every codec, every
+size — the synthetic fixture's incompressible noise is consistently the
+more expensive case to decode, exactly as `adr/0003`/`0004` predicted, now
+visible directly in this suite rather than only in a scratch-crate report.
+
+**WebP direction: confirms the inversion, with a caveat on what's being
+compared.** The evidence motivating this change was that `libwebp_decode`
+(#66) measures ~29% *slower* than the pure-Rust `image-webp` decoder it
+replaced on the synthetic fixture, but ~2.24× *faster* on 24 real Kodak
+photographs (DSSIM 0.00000000, pixel-identical) — i.e. trusting the
+synthetic-only bench would have rejected a real win. `image-webp` is no
+longer in this bench (or in production) to re-run that exact two-decoder
+comparison, but the same-decoder, fixture-only comparison above reproduces
+the *shape* of that finding: `libwebp_decode` on the real photo is 1.77×
+faster than on synthetic noise at 1920×1080, consistent across all three
+sizes (1.66×–1.77×). The synthetic number here (32.27 ms) also lands close
+to the historical "after the switch" figure this repo already had on
+record (33.24 ms, cited in the task brief) — so the synthetic fixture is
+still making the same real decoder look the same amount worse than it is.
+**Direction confirmed.**
+
+**AVIF magnitude: does NOT reproduce as cited — flagging this explicitly,
+per instruction.** The evidence cited `decode/avif 1920x1080` at 54.50 ms
+on synthetic noise against "~1.77 ms median on real Kodak photos" — roughly
+a 30× inflation. This run's real number is **31.54 ms**, not ~1.77 ms — a
+1.75× difference from synthetic, not ~30×. The *direction* is the same
+(real is faster) and the magnitude is in the same range as the WebP
+finding right above it (1.75×–1.77× for both codecs), which is internally
+consistent — but a 30× claim and a 1.75× measurement are not reconcilable
+as the same fact. Checked whether file-size explains it: computed from
+each case's own `thrpt` figure, the synthetic AVIF file is 744 KB against
+the real photo's 224 KB (3.3× smaller) — a real, meaningful compressibility
+difference, but decode time dropping only 1.75× against a 3.3× byte-size
+drop is unsurprising (AVIF decode cost isn't strictly linear in bytes) and
+nowhere near a 30× story either way. **Best guess: the ~1.77 ms figure in
+the original evidence was not measuring the same operation this bench
+measures** (possibly a much smaller/simpler Kodak image, a different
+quality/speed setting, or a transcription error) — but this is a guess, not
+a finding; the reproducible, verifiable number from this exact corpus and
+this exact decoder is 31.54 ms, and the earlier ~1.77 ms/~30× figure should
+not be relied on until it's re-derived with a stated method the way the
+number above was.
+
+### Encode: mostly faster on real photos, but JPEG progressive/444-progressive are notably *slower*
+
+Same command, `encode/*` group, 800×450 source (post-resize, matching what
+actually reaches the encode step in production). Real photo source:
+`fixtures::real_photo_sized(800, 450, Jpeg)` (cover-crop of the embedded
+Blue Marble photo). All figures are medians.
+
+| Bench | synthetic | photo | photo/synthetic |
+|---|---:|---:|---:|
+| encode/png_default | 1.689 ms | 1.277 ms | 0.76× |
+| encode/png_best | 98.93 ms | 66.41 ms | 0.67× |
+| encode/webp | 23.66 ms | 20.29 ms | 0.86× |
+| encode/jpeg_baseline | 930.0 µs | 934.1 µs | 1.00× (noise) |
+| **encode/jpeg_progressive** | **17.58 ms** | **25.36 ms** | **1.44× (slower)** |
+| encode/jpeg_444 | 1.253 ms | 1.297 ms | 1.04× |
+| **encode/jpeg_444_progressive** | **24.23 ms** | **34.29 ms** | **1.42× (slower)** |
+| encode/avif | 65.89 ms | 64.23 ms | 0.97× |
+
+**Not a uniform "real is faster" story, and that's worth recording in its
+own right.** PNG/WebP/AVIF encode faster on the real photo (matching the
+decode-side pattern above), but mozjpeg's progressive modes are ~1.4×
+*slower* on the real photo than on synthetic noise — plausibly because
+trellis/progressive-scan search has more genuine structure to spend time
+optimising against in real photographic content than in i.i.d. noise,
+where there's comparatively little the search can exploit either way. A
+synthetic-only bench would have *understated* progressive JPEG's real cost
+by a similar margin to how it overstated AVIF/WebP decode cost — the
+direction of the fixture's distortion is not consistent across
+codecs/operations, which is itself a reason to keep measuring both rather
+than assuming synthetic is a uniformly-conservative stand-in.
+
+### Pipeline: real-photo cases added, largest-source case not directly comparable
+
+| Bench | Median |
+|---|---:|
+| pipeline/photo_like/thumbnail_jpg (synthetic, 1920x1080→300x300) | 6.148 ms |
+| **pipeline/photo_real/thumbnail_jpg** (real, 1920x1080→300x300) | **3.628 ms (1.69× faster)** |
+| pipeline/photo_4k/large_downscale_thumbnail_jpg (synthetic, 3840x2160→200x113) | 19.59 ms |
+| pipeline/photo_real_large/large_downscale_thumbnail_jpg (real, **2200x1100**→200x113) | 3.405 ms |
+| pipeline/photo_real_earthrise/thumbnail_jpg (real, 1280x1280→300x300, second photo) | 2.580 ms |
+
+The `photo_real_large` row is **not** a clean synthetic-vs-real comparison
+like the others — the committed real source tops out at 2200×1100 (see
+`ATTRIBUTION.md`; a true 3840×2160 real fixture wasn't available without
+either upscaling a committed image or committing a much larger file), so
+part of its speedup against `photo_4k` is a smaller source, not just real
+vs. synthetic content. `photo_real/thumbnail_jpg` (same 1920×1080 source
+size as `photo_like`) and `photo_real_earthrise` (a second, independent
+real photo) are the clean comparisons, and both land in the same 1.7×–2.4×
+faster range the decode-level numbers above show — consistent, not an
+outlier.
+
+### End-to-end (`bench-imgproxy/`): WebP/AVIF source fixtures and AVIF output added
+
+`bench-imgproxy/fixtures/generate.py` previously produced JPEG/PNG sources
+only (all still `gradient_noise_rgb` synthetic — that part is unchanged
+here, out of scope for this pass), so the harness could not exercise WebP
+source decode (libwebp, #66) or AVIF source/output (libavif+dav1d/AOM,
+#67/#68) at all. Added: `photo_1080p.webp` and `photo_1080p.avif` (same
+underlying pixel content as `photo_1080p.jpg`, re-encoded — see
+`generate.py`'s own comment), and `avif` joined the default `FORMATS` sweep
+(`driver/k6-script.js`, was `jpg,png,webp`).
+
+**Judgement call: AVIF stays in the default sweep, not a separate opt-in
+scenario.** At this project's current default (`DEFAULT_AVIF_SPEED = 6`,
+not the `4` `adr/0004` measured — moved specifically to make the default
+path affordable), AVIF encode measures ~64 ms in the criterion `encode/avif`
+case above, the same order of magnitude as `png_best`'s ~66-99 ms
+(`CompressionType::Best`) already in this same default rotation — AVIF is
+not disproportionately more expensive than a format already there.
+Measured directly rather than assumed: an emgr cold-cache, VUS=2, 15s run
+with `FORMATS=jpg,png,webp` (pre-AVIF) landed p50/p90/p99
+108.4/237.6/450.0 ms, 14.26 images/s; the same run with `FORMATS` at its
+new default (`jpg,png,webp,avif`, plus the two new source fixtures) landed
+105.1/200.1/361.9 ms, 16.49 images/s — **no meaningful slowdown**, within
+run-to-run noise, and if anything slightly better (the two new source
+fixtures also widen `COMBOS`, diluting any one format's share of total
+requests). Override with `FORMATS=jpg,png,webp` to reproduce a pre-AVIF
+run if a leaner sweep is ever needed.
+
+**Concurrency trap encountered and worked around, not a regression from
+this change:** `driver/run.sh`'s default `CONCURRENCIES="1 10"` produces
+real 503s from emgr/emgr_s3 at VUS=10 cold cache (`outcome_non2xx`: 161/104
+for emgr, 129/96 for emgr_s3) — confirmed by direct probing, not
+speculation: every failing response body reads `"service unavailable: No
+processing permit available: 2 concurrent image processing jobs already
+running"`. This is `compose.yaml`'s own `MAX_CONCURRENT_PROCESSING: "2"`
+correctly shedding load once concurrent demand exceeds capacity — expected
+backpressure, not a bug, and not caused by the WebP/AVIF fixtures added
+here (reproduced identically with only the original jpg/png corpus). It
+explains why every previously-published "Validated" three-way comparison
+in this file used **VUS=2** (matching `MAX_CONCURRENT_PROCESSING`), not the
+script's own `1 10` default — VUS=10 was never part of the validated
+comparison. Numbers below use VUS=2 for exactly this reason.
+
+Cold cache, VUS=2, 15s, `FORMATS=jpg,png,webp,avif` (new default), every
+run verified `outcome_non2xx = outcome_timeout = outcome_conn_error = 0`:
+
+| engine | p50 ms | p90 ms | p99 ms | images/s | req/image |
+|---|---:|---:|---:|---:|---:|
+| imgproxy | 40.61 | 100.64 | 172.28 | 39.66 | 1.00 |
+| emgr local_fs | 105.09 | 200.06 | 361.88 | 16.49 | 2.00 |
+| emgr s3 | 110.90 | 214.06 | 396.06 | 15.10 | 2.00 |
+
+Warm cache, same run set:
+
+| engine | p50 ms | p90 ms | p99 ms | images/s |
+|---|---:|---:|---:|---:|
+| imgproxy | 41.48 | 98.52 | 163.81 | 39.87 |
+| emgr local_fs | 0.39 | 0.51 | 0.91 | 4752.63 |
+| emgr s3 | 0.63 | 0.91 | 1.77 | 2839.04 |
+
+These are **not directly comparable to the "Post-#67 baseline" three-way
+table above** — that table used `FORMATS=jpg,png,webp` (no AVIF) and a
+different fixture/size mix. The shapes are consistent (imgproxy fastest
+cold, emgr's warm result-cache advantage unchanged, local_fs vs s3 close
+together), but absolute numbers moved because a fourth, more expensive
+output format is now in the default rotation on both engines being
+compared, plus 2 more source fixtures. Re-run with `FORMATS=jpg,png,webp`
+for a number directly diffable against the older tables.
+
+### Harness bugs: one fixed, one investigated and found not to be a bug
+
+`driver/run.sh`'s healthcheck loop (and, found while fixing it, the
+`minio_init` wait loop right after) unconditionally waited on
+`origin minio imgproxy emgr emgr_s3` regardless of `$ENGINES` — a run that
+never started `emgr_s3`/`minio` (e.g. `ENGINES="imgproxy emgr"`) would spin
+the full 60×2s retry budget against an empty container id and hard-fail
+before a single request was sent. **Fixed**: both loops now compute their
+service list the same way `docker compose up`'s own `$services` list
+already did, conditioned on `$ENGINES`. Verified by the successful 12-run
+sweep and the follow-up 6-run VUS=2 sweep in this section, both of which
+exercised the fixed loop directly (`==> Waiting for healthchecks: origin
+imgproxy emgr minio emgr_s3` — computed, not hardcoded).
+
+The second reported issue — "`emgr_s3`'s published port is `18087:3001`
+while the others use `3000`" — was investigated and is **not a functional
+bug**. `compose.yaml`'s internal container-to-container URLs
+(`driver/run.sh`'s `engine_base_url()`, used by every k6 request) already
+correctly use `emgr_s3:3001` and `emgr:3000` — the differing numbers
+(`3000`/`3001`) are two containers' own `PORT` env vars, correctly
+propagated to both the app and its Docker `HEALTHCHECK` (which reads the
+same `PORT` var, verified in `src/bin/healthcheck.rs`). The `18081`/`18087`
+host-published ports are for manual host-side debugging only and were
+never used by the driver. No code change made; documented here so this
+doesn't get re-investigated as a live bug next time.

@@ -44,7 +44,23 @@ case " $ENGINES " in *" emgr_s3 "*) services="$services minio minio_init emgr_s3
 # shellcheck disable=SC2086 # word splitting is intended: $services is a list
 docker compose up -d --build $services
 
-echo "==> Waiting for origin, minio, imgproxy, emgr and emgr_s3 healthchecks"
+# Health-checked services actually started for this $ENGINES, mirroring
+# the same conditional membership as $services above (minus the two
+# one-shot containers, volume_init/minio_init, which have no Docker
+# HEALTHCHECK and are polled separately by exit code below). Bug fixed
+# 2026-08-23: this loop used to be the unconditional
+# "origin minio imgproxy emgr emgr_s3" list regardless of $ENGINES, so a
+# run with e.g. ENGINES="imgproxy emgr" (emgr_s3/minio never brought up)
+# would spin the full 60 retries against an empty container id and then
+# hard-fail the whole sweep before a single request was sent -- the exact
+# failure mode the `services` fix above already solved for `docker compose
+# up`, just one step later in the same script.
+health_services="origin"
+case " $ENGINES " in *" imgproxy "*) health_services="$health_services imgproxy";; esac
+case " $ENGINES " in *" emgr "*) health_services="$health_services emgr";; esac
+case " $ENGINES " in *" emgr_s3 "*) health_services="$health_services minio emgr_s3";; esac
+
+echo "==> Waiting for healthchecks: $health_services"
 # #57: emgr/emgr_s3 are on the normal `bench` bridge network now (see
 # compose.yaml's header comment), each with its own container identity and
 # its own Docker HEALTHCHECK (inherited from the image, Dockerfile's
@@ -52,7 +68,7 @@ echo "==> Waiting for origin, minio, imgproxy, emgr and emgr_s3 healthchecks"
 # origin/minio/imgproxy always were. This used to need a separate
 # curl-against-a-tunneled-port loop back when they shared `origin`'s
 # network namespace and had no health status of their own visible here.
-for svc in origin minio imgproxy emgr emgr_s3; do
+for svc in $health_services; do
   cid="$(docker compose ps -q "$svc")"
   for _ in $(seq 1 60); do
     status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo starting)"
@@ -67,6 +83,13 @@ for svc in origin minio imgproxy emgr emgr_s3; do
   fi
 done
 
+# minio_init only ever runs (and only ever needs waiting on) when emgr_s3
+# is part of this sweep -- same unconditional-wait bug as the healthcheck
+# loop above would otherwise reproduce here: a run without emgr_s3 never
+# started minio_init at all, so `docker compose ps -a -q minio_init` would
+# stay empty for the full 60 retries and this step would hard-fail a sweep
+# that never needed MinIO in the first place.
+case " $ENGINES " in *" emgr_s3 "*)
 echo "==> Waiting for minio_init (bucket creation) to complete"
 for _ in $(seq 1 60); do
   # -a: a one-shot container that has already exited is invisible to
@@ -84,6 +107,8 @@ if [ "${exit_code:-}" != "0" ]; then
   exit 1
 fi
 echo "    minio_init: done"
+;;
+esac
 
 engine_base_url() {
   # #57: all three engines have their own service identity on the `bench`

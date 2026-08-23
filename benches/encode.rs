@@ -1,4 +1,11 @@
-//! Encode-stage benchmarks: each output format the service supports.
+//! Encode-stage benchmarks: each output format the service supports, on
+//! two source-image kinds - `synthetic` (`fixtures::photo_like`, gradient +
+//! i.i.d. noise) and `photo` (`fixtures::real_photo_sized`, a real NASA
+//! photograph - see `benches/fixtures/real/ATTRIBUTION.md`). See
+//! `benches/decode.rs`'s module doc comment for why both exist rather than
+//! just the synthetic one: noise compresses toward an incompressible floor
+//! that flattens real differences between codecs, and that distortion
+//! turns out to affect encode cost too, not just size.
 //!
 //! **PNG trap, found and fixed 2026-08-23 (see `.bench-baseline/BASELINE.md`'s
 //! "PNG encode correction" section):** this file used to encode PNG via
@@ -35,15 +42,12 @@
 //! ("typically 2-10% smaller") - see this change's own report for the
 //! actual measured numbers on this corpus.
 //!
-//! AVIF and GIF are not benched here at all - not a "measures the wrong
-//! thing" defect like PNG was, just missing coverage. GIF keeps going
-//! through plain `write_to` in production (undisturbed since before #35/
-//! #33/#49 carved out explicit encoders for the other formats), so a GIF
-//! case here would in fact match `write_to` - it's simply not present yet.
-//! AVIF goes through `AvifEncoder::new_with_speed_quality` with its own
-//! quality/speed defaults and has no case here either. Both are flagged in
-//! this change's report rather than added, to keep this change scoped to
-//! fixing the PNG defect and auditing for others of the same kind.
+//! GIF is not benched here at all - not a "measures the wrong thing" defect
+//! like PNG was, just missing coverage. GIF keeps going through plain
+//! `write_to` in production (undisturbed since before #35/#33/#49 carved
+//! out explicit encoders for the other formats), so a GIF case here would
+//! in fact match `write_to` - it's simply not present yet, flagged rather
+//! than added to keep this change scoped.
 
 #[path = "fixtures.rs"]
 mod fixtures;
@@ -58,100 +62,123 @@ use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncode
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 
-/// A resized (800x450) photo-like image, representative of what actually
+/// The two source-image kinds this file benches every encoder against.
+const KINDS: [&str; 2] = ["synthetic", "photo"];
+
+/// A resized (800x450) source image, representative of what actually
 /// reaches the encode step in production (post-download, post-resize).
-fn source_image() -> DynamicImage {
-    let bytes = fixtures::photo_like();
-    image::load_from_memory_with_format(&bytes, ImageFormat::Jpeg)
-        .expect("decode photo_like fixture")
-        .resize(800, 450, image::imageops::FilterType::Triangle)
+/// `"synthetic"` resizes the in-repo generated `photo_like` fixture with a
+/// plain `Triangle` filter (as before this change); `"photo"` goes through
+/// `fixtures::real_photo_sized`, which cover-crops the embedded real NASA
+/// photograph (Lanczos3) to the same 800x450 box - see
+/// `benches/fixtures/real/ATTRIBUTION.md`.
+fn source_image(kind: &str) -> DynamicImage {
+    match kind {
+        "synthetic" => {
+            let bytes = fixtures::photo_like();
+            image::load_from_memory_with_format(&bytes, ImageFormat::Jpeg)
+                .expect("decode photo_like fixture")
+                .resize(800, 450, image::imageops::FilterType::Triangle)
+        }
+        "photo" => {
+            let bytes = fixtures::real_photo_sized(800, 450, ImageFormat::Jpeg);
+            image::load_from_memory_with_format(&bytes, ImageFormat::Jpeg)
+                .expect("decode real_photo fixture")
+        }
+        other => panic!("unknown source kind {other:?} (expected \"synthetic\" or \"photo\")"),
+    }
 }
 
 fn bench_encode(c: &mut Criterion) {
-    let img = source_image();
+    let imgs: Vec<(&str, DynamicImage)> = KINDS.iter().map(|&k| (k, source_image(k))).collect();
     let mut group = c.benchmark_group("encode");
 
-    // `png_default`: the `image` crate's default `CompressionType` (`Fast`)
-    // via `write_to`. Not what production runs - kept only so the cost of
-    // `Best` below stays visible as a delta rather than an unexplained
-    // number.
-    group.bench_function(BenchmarkId::from_parameter("png_default"), |b| {
-        b.iter(|| {
-            let mut buf = Cursor::new(Vec::new());
-            img.write_to(&mut buf, ImageFormat::Png)
-                .expect("encode fixture");
-            buf.into_inner()
+    for (kind, img) in &imgs {
+        // `png_default`: the `image` crate's default `CompressionType`
+        // (`Fast`) via `write_to`. Not what production runs - kept only so
+        // the cost of `Best` below stays visible as a delta rather than an
+        // unexplained number.
+        group.bench_function(BenchmarkId::new("png_default", *kind), |b| {
+            b.iter(|| {
+                let mut buf = Cursor::new(Vec::new());
+                img.write_to(&mut buf, ImageFormat::Png)
+                    .expect("encode fixture");
+                buf.into_inner()
+            });
         });
-    });
 
-    // `png_best`: exactly `encode_single_image`'s `ImageFormat::Png` arm
-    // (`src/services/image/handler.rs`) - `CompressionType::Best` +
-    // `FilterType::Adaptive`, no ICC/EXIF payload set (this fixture carries
-    // neither, matching the common case those calls are skipped for). This
-    // is the production path; see the module doc comment above for why it's
-    // duplicated here rather than called through a shared function.
-    group.bench_function(BenchmarkId::from_parameter("png_best"), |b| {
-        b.iter(|| {
-            let mut buf = Cursor::new(Vec::new());
-            let encoder = PngEncoder::new_with_quality(
-                &mut buf,
-                CompressionType::Best,
-                PngFilterType::Adaptive,
-            );
-            img.write_with_encoder(encoder).expect("encode fixture");
-            buf.into_inner()
+        // `png_best`: exactly `encode_single_image`'s `ImageFormat::Png` arm
+        // (`src/services/image/handler.rs`) - `CompressionType::Best` +
+        // `FilterType::Adaptive`, no ICC/EXIF payload set (these fixtures
+        // carry neither, matching the common case those calls are skipped
+        // for). This is the production path; see the module doc comment
+        // above for why it's duplicated here rather than called through a
+        // shared function.
+        group.bench_function(BenchmarkId::new("png_best", *kind), |b| {
+            b.iter(|| {
+                let mut buf = Cursor::new(Vec::new());
+                let encoder = PngEncoder::new_with_quality(
+                    &mut buf,
+                    CompressionType::Best,
+                    PngFilterType::Adaptive,
+                );
+                img.write_with_encoder(encoder).expect("encode fixture");
+                buf.into_inner()
+            });
         });
-    });
 
-    group.bench_function(BenchmarkId::from_parameter("webp"), |b| {
-        b.iter(|| {
-            ImageService::encode_webp(&img, DEFAULT_WEBP_QUALITY, false).expect("encode fixture")
-        });
-    });
-
-    // #76: JPEG now goes through `ImageService::encode_jpeg` (mozjpeg), not
-    // `write_to` - see this file's own doc comment. Four variants cover the
-    // two knobs #76 adds, each independently: baseline (pre-#76-equivalent
-    // default: 4:2:2, sequential), progressive (4:2:2 + progressive scans),
-    // and 4:4:4 (no_subsampling) at both scan modes, so the encode-time and
-    // output-size cost of each knob can be read off independently rather
-    // than conflated into one number.
-    for (name, progressive, no_subsampling) in [
-        ("jpeg_baseline", false, false),
-        ("jpeg_progressive", true, false),
-        ("jpeg_444", false, true),
-        ("jpeg_444_progressive", true, true),
-    ] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(name),
-            &(progressive, no_subsampling),
-            |b, &(progressive, no_subsampling)| {
-                b.iter(|| {
-                    ImageService::encode_jpeg(
-                        &img,
-                        DEFAULT_JPEG_QUALITY,
-                        progressive,
-                        no_subsampling,
-                        None,
-                        None,
-                    )
+        group.bench_function(BenchmarkId::new("webp", *kind), |b| {
+            b.iter(|| {
+                ImageService::encode_webp(img, DEFAULT_WEBP_QUALITY, false)
                     .expect("encode fixture")
-                });
-            },
-        );
-    }
-
-    // #68: AVIF via `avif_codec::encode` (`libavif`+AOM), replacing
-    // `image::codecs::avif::AvifEncoder` (`ravif`/`rav1e`, removed
-    // entirely) - see that function's own doc comment and
-    // `DEFAULT_AVIF_SPEED`'s in `handler.rs` for why its value changed
-    // from what `ravif` used.
-    group.bench_with_input(BenchmarkId::from_parameter("avif"), &img, |b, img| {
-        b.iter(|| {
-            avif_codec::encode(img, DEFAULT_AVIF_QUALITY, DEFAULT_AVIF_SPEED, None)
-                .expect("encode fixture")
+            });
         });
-    });
+
+        // #76: JPEG now goes through `ImageService::encode_jpeg` (mozjpeg),
+        // not `write_to` - see this file's own doc comment. Four variants
+        // cover the two knobs #76 adds, each independently: baseline
+        // (pre-#76-equivalent default: 4:2:2, sequential), progressive
+        // (4:2:2 + progressive scans), and 4:4:4 (no_subsampling) at both
+        // scan modes, so the encode-time and output-size cost of each knob
+        // can be read off independently rather than conflated into one
+        // number.
+        for (name, progressive, no_subsampling) in [
+            ("jpeg_baseline", false, false),
+            ("jpeg_progressive", true, false),
+            ("jpeg_444", false, true),
+            ("jpeg_444_progressive", true, true),
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(name, *kind),
+                &(progressive, no_subsampling),
+                |b, &(progressive, no_subsampling)| {
+                    b.iter(|| {
+                        ImageService::encode_jpeg(
+                            img,
+                            DEFAULT_JPEG_QUALITY,
+                            progressive,
+                            no_subsampling,
+                            None,
+                            None,
+                        )
+                        .expect("encode fixture")
+                    });
+                },
+            );
+        }
+
+        // #68: AVIF via `avif_codec::encode` (`libavif`+AOM), replacing
+        // `image::codecs::avif::AvifEncoder` (`ravif`/`rav1e`, removed
+        // entirely) - see that function's own doc comment and
+        // `DEFAULT_AVIF_SPEED`'s in `handler.rs` for why its value changed
+        // from what `ravif` used.
+        group.bench_with_input(BenchmarkId::new("avif", *kind), img, |b, img| {
+            b.iter(|| {
+                avif_codec::encode(img, DEFAULT_AVIF_QUALITY, DEFAULT_AVIF_SPEED, None)
+                    .expect("encode fixture")
+            });
+        });
+    }
 
     group.finish();
 }

@@ -4,6 +4,18 @@
 //! it as an external crate). This is decode + resize + optional filters +
 //! encode, exactly as production runs it, for a few representative fixture
 //! / parameter combinations.
+//!
+//! `photo_real/*` cases mirror their `photo_like/*`/`photo_4k/*` synthetic
+//! counterparts but decode a real NASA photograph instead of
+//! `gradient_noise_rgb` - see `benches/decode.rs`'s module doc comment for
+//! why the synthetic-only corpus this file used to have gives a distorted
+//! picture of decode cost, and `benches/fixtures/real/ATTRIBUTION.md` for
+//! the fixtures' provenance/licence. `photo_real_large` uses the primary
+//! real source at its native 2200x1100 (the largest size available without
+//! upscaling a committed fixture - see that file's own doc comment) rather
+//! than a true 3840x2160 like `photo_4k`; `photo_real_earthrise` uses the
+//! second, structurally different real source (near-black space + lunar
+//! regolith texture) so this comparison isn't resting on one photo.
 
 #[path = "fixtures.rs"]
 mod fixtures;
@@ -57,8 +69,13 @@ fn bench_pipeline(c: &mut Criterion) {
     // for why every other case above is structurally blind to
     // metadata-handling cost.
     let photo_with_exif = fixtures::photo_like_with_exif();
+    // Real-photo counterparts (see this file's own module doc comment and
+    // `benches/fixtures/real/ATTRIBUTION.md`).
+    let photo_real = fixtures::real_photo_sized(1920, 1080, ImageFormat::Jpeg);
+    let photo_real_large = fixtures::real_photo_sized(2200, 1100, ImageFormat::Jpeg);
+    let photo_real_earthrise = fixtures::real_photo_secondary_sized(1280, 1280, ImageFormat::Jpeg);
 
-    let cases: [(&str, &[u8], ResizeQuery); 6] = [
+    let cases: [(&str, &[u8], ResizeQuery); 9] = [
         (
             "photo_like/thumbnail_jpg",
             &photo,
@@ -93,6 +110,21 @@ fn bench_pipeline(c: &mut Criterion) {
             "photo_with_exif/keep_metadata_sm0",
             &photo_with_exif,
             query_with_metadata(Some(300), Some(300), ApiImageFormat::Jpg, false),
+        ),
+        (
+            "photo_real/thumbnail_jpg",
+            &photo_real,
+            query(Some(300), Some(300), ApiImageFormat::Jpg),
+        ),
+        (
+            "photo_real_large/large_downscale_thumbnail_jpg",
+            &photo_real_large,
+            query(Some(200), Some(113), ApiImageFormat::Jpg),
+        ),
+        (
+            "photo_real_earthrise/thumbnail_jpg",
+            &photo_real_earthrise,
+            query(Some(300), Some(300), ApiImageFormat::Jpg),
         ),
     ];
 
