@@ -53,11 +53,15 @@ allow = [
     "MPL-2.0",
     # Permissive, OSI-approved, FSF-free. Pulled in transitively via
     # image -> ravif -> rav1e -> libfuzzer-sys (rav1e's own fuzz harness,
-    # not something this crate calls). `image`'s default features enable
-    # avif support even though Cargo.toml only lists jpeg/png/webp - the
-    # Cargo.toml owner may want `default-features = false` on the `image`
-    # dependency to drop this (and the rest of the avif/rav1e stack)
-    # entirely rather than allow-listing around it.
+    # not something this crate calls). This entry used to note that the
+    # avif/rav1e stack arrived only incidentally, via `image`'s default
+    # features, and suggest `default-features = false` to drop it. That
+    # is no longer an option: #49 makes AVIF a real output format, and
+    # `Cargo.toml` now lists `avif` explicitly in `image`'s feature list.
+    # `ravif` IS the AVIF encoder this service ships (see
+    # `ImageService::encode_single_image`'s `ImageFormat::Avif` arm,
+    # `src/services/image/handler.rs`), so the stack is load-bearing and
+    # this allow-list entry is permanent rather than a stopgap.
     "NCSA",
 
     # mozjpeg / mozjpeg-sys (#63 stage 2), for DCT-scaled JPEG decode. IJG is
