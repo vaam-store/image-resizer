@@ -24,17 +24,18 @@ ignore = [
     # Every other advisory present on 2026-08-19 was cleared by `cargo update`.
     "RUSTSEC-2024-0436",
 
-    # --- All four below share ONE root cause and are NOT fixable from this
-    # repo: `aws-smithy-http-client v1.3.0` (via `aws-config`/`aws-sdk-s3`,
-    # i.e. only the optional `s3` feature) pins rustls 0.21.12 /
-    # rustls-webpki 0.101.7 / h2 0.3.27. `cargo update` cannot move them;
-    # the AWS SDK must bump its own TLS stack first. Tracked in GH #56.
-    # Re-check on every aws-sdk-s3 bump and delete these the moment the
-    # smithy client moves to rustls 0.23 / h2 0.4.
-    "RUSTSEC-2026-0258",  # h2 empty DATA frames. Upstream rates it LOW severity.
-    "RUSTSEC-2026-0098",  # webpki: name constraints wrongly accepted for URI names.
-    "RUSTSEC-2026-0099",  # webpki: name constraints accepted for wildcard certs.
-    "RUSTSEC-2026-0104",  # webpki: panic parsing CRLs. We do not use CRLs, so unreachable here.
+    # RUSTSEC-2026-0258/0098/0099/0104 (h2 empty DATA frames; rustls-webpki
+    # name-constraint and CRL-panic issues) were previously ignored here: GH #56
+    # found `aws-sdk-s3`'s own `default` feature set pulled in BOTH TLS stacks
+    # at once - `default-https-client` (the modern hyper-1/rustls-0.23/h2-0.4
+    # connector actually used at runtime under BehaviorVersion::latest()) AND
+    # `rustls` (a misleadingly-named feature that in fact wires up the
+    # *legacy* hyper-0.14/rustls-0.21.12/rustls-webpki-0.101.7/h2-0.3.27
+    # connector - unused dead code at runtime here, but still present in the
+    # resolved dependency graph `cargo deny` scans). Dropping the `rustls`
+    # feature from the `aws-sdk-s3` dependency in Cargo.toml (default-features
+    # = false + explicit feature list) removed the legacy stack from the
+    # graph entirely - no upstream release was needed. See GH #56.
 ]
 
 [licenses]

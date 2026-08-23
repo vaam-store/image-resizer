@@ -68,7 +68,14 @@ bytes = "1.5" # Efficient byte handling
 futures = "0.3" # Stream processing utilities
 
 aws-config = { version = "1.6", optional = true, features = ["behavior-version-latest"] } # AWS SDK configuration (for MinIO)
-aws-sdk-s3 = { version = "1.90", optional = true, features = ["behavior-version-latest"] } # AWS S3 client (MinIO compatible)
+# default-features = false + explicit feature list (GH #56): aws-sdk-s3's own
+# `default` feature set pulls in BOTH TLS stacks at once - "rustls" (misleading
+# name; it actually means the *legacy* hyper-0.14/rustls-0.21/h2-0.3 connector,
+# vulnerable to RUSTSEC-2026-0258/0098/0099/0104) alongside "default-https-client"
+# (the modern hyper-1/rustls-0.23/h2-0.4 connector that is actually used at
+# runtime under BehaviorVersion::latest()). Dropping "rustls" removes the legacy
+# stack from the dependency graph entirely instead of merely leaving it unused.
+aws-sdk-s3 = { version = "1.90", optional = true, default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] } # AWS S3 client (MinIO compatible)
 
 envconfig = { version = "0.11" }
 derive_builder = { version = "0.20" }
