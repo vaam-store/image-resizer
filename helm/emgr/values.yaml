@@ -163,6 +163,17 @@ controllers:
               secretKeyRef:
                 name: emgr-signing
                 key: metrics-auth-token
+                # `optional: true` (GH #77/#84): METRICS_AUTH_TOKEN is only
+                # read by an `*_otel` image - the endpoint it protects does
+                # not exist without that feature. Without `optional`, a
+                # default (non-otel) deployment would fail with
+                # CreateContainerConfigError over a key it never reads,
+                # forcing operators to invent a dummy value. Marked optional
+                # so a non-otel pod starts; an *otel* pod with no token still
+                # fails closed, but at application startup with the error
+                # that names both remedies, which is far more actionable than
+                # a kubelet config error.
+                optional: true
 
 service:
   app:

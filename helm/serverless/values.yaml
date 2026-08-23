@@ -117,6 +117,14 @@ env:
     secretKeyRef:
       name: emgr-signing
       key: metrics-auth-token
+      # optional (GH #77/#84): METRICS_AUTH_TOKEN is only read by an
+      # `*_otel` image - the endpoint it protects does not exist without
+      # that feature. Without this, a non-otel revision would fail over a
+      # key it never reads, forcing operators to invent a dummy value. An
+      # *otel* revision with no token still fails closed, but at
+      # application startup with the error naming both remedies, which is
+      # far more actionable than a kubelet-level config error.
+      optional: true
 
 ports:
   http1: # kservice requirements
