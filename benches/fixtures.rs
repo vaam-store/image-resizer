@@ -18,6 +18,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Fixed seed so every fixture is byte-identical across runs and machines.
 const SEED: u64 = 0x1BAD_1DEA_C0FF_EE42;
@@ -36,6 +37,34 @@ fn cache_root() -> PathBuf {
 /// Read `name` from the on-disk fixture cache, generating (and caching) it
 /// on first use. Falls back to plain in-memory generation if the cache
 /// directory can't be created/written (e.g. a read-only checkout).
+///
+/// This crate has 20+ call sites sharing this cache across many test/bench
+/// binaries, most of which run their tests in parallel threads within one
+/// process. On a cold cache (first run against an empty `target/fixtures/`,
+/// e.g. after a CI cache miss), many of those threads can race to populate
+/// the *same* fixture file at once. A naive `fs::write(&path, &bytes)`
+/// there is a real bug, not a hypothetical one: `File::create` truncates
+/// the file to zero length up front, and `write_all` for a multi-hundred-KB
+/// payload is not guaranteed to land in a single `write()` syscall - so a
+/// concurrent reader's `fs::read` can observe a truncated file mid-write.
+/// For a fixture like `photo_like()` that still leaves the JPEG's
+/// magic-byte header intact, that reads back as a corrupt-but-format-
+/// detectable file: format sniffing succeeds, but parsing the rest of the
+/// header (dimensions) fails - exactly the "unexpected error: Failed to
+/// read image dimensions" flake this was chased down for (GH #90).
+/// Confirmed locally: a standalone reproduction of `open+truncate,
+/// write_all` racing a concurrent `fs::read` on this same filesystem
+/// reliably observes a short/torn read once the write is given any window
+/// at all (e.g. writing in chunks under mild delay) - CI's shared,
+/// contended two-core runner is exactly the kind of environment that opens
+/// that window without needing any code change to do it.
+///
+/// Fixed with the standard write-then-rename pattern: write the full
+/// payload to a process-and-thread-unique temp file first, then
+/// `rename` it into place. `rename(2)` atomically repoints the directory
+/// entry - a concurrent reader either sees the old state (file absent, so
+/// it falls through to `generate()` itself) or the complete new file,
+/// never a partially written one.
 fn cached(name: &str, generate: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
     let dir = cache_root();
     let path = dir.join(name);
@@ -47,7 +76,28 @@ fn cached(name: &str, generate: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
     let bytes = generate();
 
     if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(&path, &bytes);
+        // Unique per-process-and-thread suffix so concurrent writers never
+        // collide on the temp file itself - only the final `rename` needs
+        // to be atomic, not the write leading up to it.
+        let unique = format!(
+            "{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let tmp_path = dir.join(format!("{name}.{unique}.tmp"));
+        if std::fs::write(&tmp_path, &bytes).is_ok() {
+            // Best-effort: if another writer already renamed its own copy
+            // into place first, this rename still succeeds (same content,
+            // deterministic generation) and just replaces it in kind.
+            let _ = std::fs::rename(&tmp_path, &path);
+            // Clean up defensively in case rename failed (e.g. cross-device
+            // temp dir) and left the temp file behind.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
     }
 
     bytes
