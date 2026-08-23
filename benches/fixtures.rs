@@ -266,6 +266,29 @@ pub fn photo_like_sized(width: u32, height: u32, format: ImageFormat) -> Vec<u8>
     })
 }
 
+/// Same photo-like content, at an arbitrary size, AVIF-encoded via the
+/// caller-supplied `encode_fn` (#67/#68) - deliberately *not* calling
+/// `avif_codec::encode` directly here (unlike `photo_like_sized`'s
+/// `image::write_to` call above): this module is `#[path]`-included from
+/// three different compilation contexts (`handler.rs`'s own test module,
+/// inside the `emgr` lib crate itself; `benches/*.rs` and `tests/*.rs`,
+/// separate crates that depend on `emgr` externally), and those two
+/// contexts need opposite spellings (`crate::services::...` inside the
+/// lib, `emgr::services::...` outside it) to name the same function -
+/// there is no single path that resolves in both. Accepting the encoder
+/// as a parameter sidesteps that entirely: each caller passes whichever
+/// spelling is correct for its own compilation context.
+pub fn photo_like_sized_avif(
+    width: u32,
+    height: u32,
+    encode_fn: impl FnOnce(&DynamicImage) -> Vec<u8>,
+) -> Vec<u8> {
+    cached(&format!("photo_like_{width}x{height}.avif"), || {
+        let img = DynamicImage::ImageRgb8(gradient_noise_rgb(width, height));
+        encode_fn(&img)
+    })
+}
+
 pub const ORIENTED_W: u32 = 120;
 pub const ORIENTED_H: u32 = 80;
 /// Marker block side length, in canonical (already-upright) pixels - well
@@ -492,6 +515,84 @@ pub fn jpeg_with_gps_exif(exif_orientation: u8) -> Vec<u8> {
             .write_with_encoder(encoder)
             .expect("fixture encoding should never fail");
         buf.into_inner()
+    })
+}
+
+/// Realistic EXIF payload size for phone/camera JPEGs (#88) - large enough
+/// that the extraction cost the #88 bug was about actually shows up in a
+/// benchmark, unlike every fixture above (all EXIF-free, verified: none of
+/// `photo_like`/`flat`/`alpha`/`tiny`/`bomb`/`gravity_marker`/
+/// `photo_like_sized` ever calls `set_exif_metadata`) and unlike
+/// `exif_orientation_and_gps`'s ~140-byte blob (enough to prove correctness,
+/// nowhere near enough to show up against decode/resize/encode time in a
+/// benchmark). Comfortably under the 65531-byte hard limit a single JPEG
+/// APP1 segment can carry (`JpegEncoder::write_segment`'s `u16` length
+/// field, `image-0.25.10/src/codecs/jpeg/encoder.rs:284-288` - `data.len()
+/// as u16 + 2` silently wraps past `u16::MAX` with no size check ahead of
+/// it) - the same ceiling real camera/phone EXIF is bounded by, since it
+/// also has to fit in one APP1 marker.
+pub const REALISTIC_EXIF_SIZE: usize = 45 * 1024;
+
+/// Extends [`exif_orientation_and_gps`] with a trailing "thumbnail" blob -
+/// real embedded EXIF carries a small JPEG's compressed bytes in exactly
+/// this position (referenced by an `IFD1`/`JPEGInterchangeFormat` pointer
+/// this fixture doesn't bother wiring up, since nothing under test here
+/// ever tries to *decode* the thumbnail, only to pay the cost of copying it
+/// off the source) - padded with deterministic filler to
+/// `REALISTIC_EXIF_SIZE` total, matching the tens-of-KB EXIF+thumbnail
+/// blobs real camera/phone JPEGs carry.
+///
+/// Safe to just append: `zune_jpeg::headers::parse_app1` (the decode-side
+/// reader) copies the *entire* APP1 payload verbatim into `exif_data`
+/// (`zune-jpeg-0.5.15/src/headers.rs:553-555`) rather than parsing it
+/// structurally, and `exif_orientation_and_gps`'s own IFD0/GPS-IFD
+/// "next-IFD offset: none" terminators mean nothing tries to walk past this
+/// trailing data as more IFD structure - from the decoder's point of view
+/// it's inert padding, exactly like an unreferenced `IFD1` would be.
+fn exif_orientation_gps_and_thumbnail(exif_orientation: u8) -> Vec<u8> {
+    let mut buf = exif_orientation_and_gps(exif_orientation);
+
+    // A genuine small JPEG - the same shape of bytes a real embedded
+    // thumbnail is, not synthetic filler pretending to be one.
+    let thumb = encode(
+        &DynamicImage::ImageRgb8(gradient_noise_rgb(160, 120)),
+        ImageFormat::Jpeg,
+    );
+    buf.extend_from_slice(&thumb);
+
+    // Pad deterministically (seeded, not zeros - so this can't accidentally
+    // compress away to nothing if anything downstream ever re-encodes it)
+    // up to the realistic total size.
+    let mut rng = rng_for("exif_thumbnail_padding");
+    while buf.len() < REALISTIC_EXIF_SIZE {
+        buf.push(rng.r#gen());
+    }
+    buf.truncate(REALISTIC_EXIF_SIZE);
+    buf
+}
+
+/// 1920x1080 photo-like JPEG carrying a realistic (~45KB) EXIF blob - GPS +
+/// orientation + an embedded thumbnail-shaped payload (#88). Every other
+/// JPEG fixture in this file is EXIF-free by construction, which is exactly
+/// how the #88 bug (EXIF extracted unconditionally in
+/// `ImageService::decode_with_limits`, even on the default `strip_metadata`
+/// path that immediately discards it in `encode_single_image`) went
+/// unmeasured: nothing in this corpus paid the cost extracting a
+/// real-world-sized blob would incur. This fixture exists so
+/// `benches/pipeline.rs` can see that cost, strip vs keep.
+pub fn photo_like_with_exif() -> Vec<u8> {
+    cached("photo_like_with_exif.jpg", || {
+        let img = DynamicImage::ImageRgb8(gradient_noise_rgb(PHOTO_LIKE_W, PHOTO_LIKE_H));
+
+        use image::ImageEncoder;
+        let mut out = Cursor::new(Vec::new());
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut out);
+        encoder
+            .set_exif_metadata(exif_orientation_gps_and_thumbnail(1))
+            .expect("JpegEncoder supports Exif metadata");
+        img.write_with_encoder(encoder)
+            .expect("fixture encoding should never fail");
+        out.into_inner()
     })
 }
 

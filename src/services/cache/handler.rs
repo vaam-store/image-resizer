@@ -126,7 +126,25 @@ use sha2::{Digest, Sha256};
 /// being served indefinitely, so the privacy default would silently not
 /// apply to anything already cached. That makes this bump a correctness
 /// requirement rather than a courtesy.
-const CACHE_KEY_VERSION: u8 = 10;
+/// v11 covers the AVIF encoder cutover: `ravif`/`rav1e` was replaced by
+/// libavif with the AOM backend, and `DEFAULT_AVIF_SPEED` changed from 4 to
+/// 6 because AOM's speed axis is not calibrated like rav1e's (measured: the
+/// old constant cost ~900ms per encode on AOM for no size benefit over a
+/// 6x-faster setting). Every AVIF response therefore differs byte-for-byte
+/// from a v10 one, produced by an encoder that is no longer in the tree.
+///
+/// No new field is hashed - this is not a request-parameter change, it is
+/// the same request producing different bytes. Without the bump, cached
+/// AVIF entries would keep being served from the retired encoder
+/// indefinitely, so the cutover would silently not apply to anything
+/// already cached.
+///
+/// WebP decode also moved to libwebp in the same change, but that is
+/// deliberately *not* part of this justification: it measured pixel-
+/// identical (DSSIM 0.00000000) across 24 real photographs. Empirical
+/// equivalence on one corpus is not a guarantee for every bitstream, but it
+/// is not a reason to invalidate a cache on its own.
+const CACHE_KEY_VERSION: u8 = 11;
 
 #[derive(Clone, Builder)]
 pub struct CacheService {

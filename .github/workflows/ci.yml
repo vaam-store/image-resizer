@@ -54,6 +54,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # libdav1d-sys builds dav1d from source via meson/ninja, and
+      # libavif-sys/libaom-sys build libavif and AOM via cmake with nasm for
+      # SIMD. The Dockerfile installs these for the image build; the runners
+      # that compile the crate directly need them too. Adding them to the
+      # Dockerfile alone is what broke this job on its first run - a build
+      # dependency declared in one place and not the other.
+      - name: install native codec build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake meson ninja-build nasm
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -71,6 +83,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      # libdav1d-sys builds dav1d from source via meson/ninja, and
+      # libavif-sys/libaom-sys build libavif and AOM via cmake with nasm for
+      # SIMD. The Dockerfile installs these for the image build; the runners
+      # that compile the crate directly need them too. Adding them to the
+      # Dockerfile alone is what broke this job on its first run - a build
+      # dependency declared in one place and not the other.
+      - name: install native codec build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake meson ninja-build nasm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -186,6 +210,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # libdav1d-sys builds dav1d from source via meson/ninja, and
+      # libavif-sys/libaom-sys build libavif and AOM via cmake with nasm for
+      # SIMD. The Dockerfile installs these for the image build; the runners
+      # that compile the crate directly need them too. Adding them to the
+      # Dockerfile alone is what broke this job on its first run - a build
+      # dependency declared in one place and not the other.
+      - name: install native codec build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake meson ninja-build nasm
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -224,6 +260,18 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+
+      # libdav1d-sys builds dav1d from source via meson/ninja, and
+      # libavif-sys/libaom-sys build libavif and AOM via cmake with nasm for
+      # SIMD. The Dockerfile installs these for the image build; the runners
+      # that compile the crate directly need them too. Adding them to the
+      # Dockerfile alone is what broke this job on its first run - a build
+      # dependency declared in one place and not the other.
+      - name: install native codec build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake meson ninja-build nasm
 
       - uses: dtolnay/rust-toolchain@stable
 

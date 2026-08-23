@@ -25,6 +25,22 @@ fn query(width: Option<u32>, height: Option<u32>, format: ApiImageFormat) -> Res
     }
 }
 
+/// Same as `query`, but with `strip_metadata` set explicitly rather than
+/// left at its `Default` (`true`) - used by the #88 `photo_like_with_exif`
+/// cases below to cover both the default "strip" path and `sm:0` ("keep")
+/// against the same EXIF-carrying source.
+fn query_with_metadata(
+    width: Option<u32>,
+    height: Option<u32>,
+    format: ApiImageFormat,
+    strip_metadata: bool,
+) -> ResizeQuery {
+    ResizeQuery {
+        strip_metadata,
+        ..query(width, height, format)
+    }
+}
+
 fn bench_pipeline(c: &mut Criterion) {
     let photo = fixtures::photo_like();
     let flat = fixtures::flat();
@@ -36,8 +52,13 @@ fn bench_pipeline(c: &mut Criterion) {
     // prototype measurement quoted in the #63 issue thread: 4K -> 200x113,
     // decode + resize, 58.03ms (full decode) vs 26.21ms (1/8-scale decode).
     let photo_4k = fixtures::photo_like_sized(3840, 2160, ImageFormat::Jpeg);
+    // #88: the only fixture in the corpus carrying a realistic (~45KB)
+    // EXIF blob - see `fixtures::photo_like_with_exif`'s own doc comment
+    // for why every other case above is structurally blind to
+    // metadata-handling cost.
+    let photo_with_exif = fixtures::photo_like_with_exif();
 
-    let cases: [(&str, &[u8], ResizeQuery); 4] = [
+    let cases: [(&str, &[u8], ResizeQuery); 6] = [
         (
             "photo_like/thumbnail_jpg",
             &photo,
@@ -57,6 +78,21 @@ fn bench_pipeline(c: &mut Criterion) {
             "photo_4k/large_downscale_thumbnail_jpg",
             &photo_4k,
             query(Some(200), Some(113), ApiImageFormat::Jpg),
+        ),
+        // #88: decode + resize + encode of the same EXIF-carrying source,
+        // strip (default `sm`) vs keep (`sm:0`) - the pair this issue asks
+        // to make measurable. Both resize to the same thumbnail box as
+        // `photo_like/thumbnail_jpg` above so the *only* deliberate
+        // variable between this pair is `strip_metadata`.
+        (
+            "photo_with_exif/strip_metadata_default",
+            &photo_with_exif,
+            query_with_metadata(Some(300), Some(300), ApiImageFormat::Jpg, true),
+        ),
+        (
+            "photo_with_exif/keep_metadata_sm0",
+            &photo_with_exif,
+            query_with_metadata(Some(300), Some(300), ApiImageFormat::Jpg, false),
         ),
     ];
 
