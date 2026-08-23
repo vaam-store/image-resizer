@@ -294,28 +294,66 @@ impl PerformanceConfig {
             .map(str::to_string)
             .collect();
 
-        if list.is_empty() { None } else { Some(list) }
+        if list.is_empty() {
+            None
+        } else {
+            Some(list)
+        }
     }
 
     /// Get optimal CPU thread pool size
     pub fn get_cpu_thread_pool_size(&self) -> usize {
-        self.cpu_thread_pool_size.unwrap_or_else(effective_cpu_count)
+        self.cpu_thread_pool_size
+            .unwrap_or_else(effective_cpu_count)
     }
 }
 
-impl From<&EnvConfig> for PerformanceConfig {
-    fn from(env_config: &EnvConfig) -> Self {
-        // Handle performance profile presets
-        if let Some(ref profile) = env_config.performance_profile {
+/// Valid values for `PERFORMANCE_PROFILE`, kept as a single source of truth
+/// so the error message below can never drift from the `match` arms that
+/// actually recognise them.
+const VALID_PERFORMANCE_PROFILES: [&str; 3] =
+    ["high_throughput", "low_latency", "memory_efficient"];
+
+impl TryFrom<&EnvConfig> for PerformanceConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(env_config: &EnvConfig) -> Result<Self, Self::Error> {
+        // Handle performance profile presets. An empty/whitespace-only
+        // value is treated the same as unset (falls through to the custom
+        // configuration below), mirroring `MetricsAuthConfig::from_env`'s
+        // handling of `METRICS_AUTH_TOKEN` (`src/modules/metrics_auth/config.rs`)
+        // rather than treating whitespace as a real-but-unrecognised value.
+        if let Some(profile) = env_config
+            .performance_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             match profile.to_lowercase().as_str() {
-                "high_throughput" => return Self::high_throughput_from_env(env_config),
-                "low_latency" => return Self::low_latency_from_env(env_config),
-                "memory_efficient" => return Self::memory_efficient_from_env(env_config),
-                _ => {} // Fall through to custom configuration
+                "high_throughput" => return Ok(Self::high_throughput_from_env(env_config)),
+                "low_latency" => return Ok(Self::low_latency_from_env(env_config)),
+                "memory_efficient" => return Ok(Self::memory_efficient_from_env(env_config)),
+                _ => {
+                    // Fail closed rather than silently falling through to
+                    // custom configuration (#83) - this codebase's
+                    // convention elsewhere (`SigningConfig::from_env`,
+                    // `MetricsAuthConfig::from_env`) is to refuse to start
+                    // on malformed config rather than guess, and a typo'd
+                    // profile name (`PERFORMANCE_PROFILE=hgh_throughput`)
+                    // silently yielding different behaviour than the
+                    // operator asked for is exactly the kind of surprise
+                    // that convention exists to prevent.
+                    anyhow::bail!(
+                        "PERFORMANCE_PROFILE={profile:?} is not a recognised profile - valid \
+                         values are {} (case-insensitive), or unset/empty to use the \
+                         individually-configured (or default) settings instead.",
+                        VALID_PERFORMANCE_PROFILES.join(", ")
+                    );
+                }
             }
         }
 
-        Self {
+        Ok(Self {
             max_concurrent_downloads: env_config.max_concurrent_downloads.unwrap_or_else(|| 20),
             max_concurrent_processing: env_config
                 .max_concurrent_processing
@@ -323,7 +361,14 @@ impl From<&EnvConfig> for PerformanceConfig {
             http_timeout: Duration::from_secs(env_config.http_timeout_secs.unwrap_or_else(|| 30)),
             max_image_size: env_config.max_image_size_mb.unwrap_or_else(|| 50) * 1024 * 1024,
             cpu_thread_pool_size: env_config.cpu_thread_pool_size,
-            enable_http2: env_config.enable_http2.unwrap_or(false),
+            // Matches `Default::default()` (line ~88): HTTP/2 multiplexing
+            // is worth having for an image service handling many
+            // concurrent per-derivative requests (#83). `memory_efficient`
+            // is the only profile that deliberately opts out (see its own
+            // comment above) - the ordinary, no-profile path should not
+            // silently diverge from what `PerformanceConfig::default()`
+            // documents.
+            enable_http2: env_config.enable_http2.unwrap_or(true),
             connection_pool_size: env_config.connection_pool_size.unwrap_or(50),
             keep_alive_timeout: Duration::from_secs(
                 env_config.keep_alive_timeout_secs.unwrap_or(60),
@@ -346,7 +391,7 @@ impl From<&EnvConfig> for PerformanceConfig {
             watermark_url: env_config.watermark_url.clone(),
             jpeg_progressive_default: env_config.jpeg_progressive.unwrap_or(false),
             jpeg_no_subsampling_default: env_config.jpeg_no_subsampling.unwrap_or(false),
-        }
+        })
     }
 }
 
@@ -461,7 +506,8 @@ mod tests {
             allow_unauthenticated_metrics: None,
         };
 
-        let perf_config = PerformanceConfig::from(&env_config);
+        let perf_config =
+            PerformanceConfig::try_from(&env_config).expect("valid config should resolve");
 
         assert_eq!(perf_config.max_concurrent_downloads, 20);
         assert_eq!(perf_config.max_concurrent_processing, effective_cpu_count());
@@ -546,7 +592,8 @@ mod tests {
             allow_unauthenticated_metrics: None,
         };
 
-        let perf_config = PerformanceConfig::from(&env_config);
+        let perf_config =
+            PerformanceConfig::try_from(&env_config).expect("valid config should resolve");
 
         assert_eq!(perf_config.max_concurrent_downloads, 100);
         assert_eq!(perf_config.max_concurrent_processing, 8);
@@ -582,5 +629,142 @@ mod tests {
     fn test_allowed_sources_blank_value_is_none() {
         let raw = "  , ,";
         assert_eq!(PerformanceConfig::parse_allowed_sources(raw), None);
+    }
+
+    /// A bare `EnvConfig` with every field at its `envconfig` default (i.e.
+    /// `None` for everything performance-related) - mirrors the helper
+    /// pattern already used in `signing/config.rs` and
+    /// `metrics_auth/config.rs`'s own test modules, rather than the fully
+    /// spelled-out struct literals the two tests above use.
+    fn base_env_config() -> EnvConfig {
+        use envconfig::Envconfig;
+        EnvConfig::init_from_hashmap(&std::collections::HashMap::new())
+            .expect("EnvConfig has defaults for every field envconfig knows about")
+    }
+
+    /// The gap that let #83 through: `enable_http2: None` with no
+    /// `PERFORMANCE_PROFILE` set is the *ordinary* configuration - neither
+    /// existing test above exercises it, both set `enable_http2` explicitly.
+    /// The resolved value must agree with `Default::default()`.
+    #[test]
+    fn enable_http2_none_with_no_profile_matches_default() {
+        let env_config = base_env_config();
+        assert_eq!(env_config.enable_http2, None);
+        assert_eq!(env_config.performance_profile, None);
+
+        let perf_config =
+            PerformanceConfig::try_from(&env_config).expect("no profile set should never error");
+
+        assert_eq!(
+            perf_config.enable_http2,
+            PerformanceConfig::default().enable_http2
+        );
+        assert!(
+            perf_config.enable_http2,
+            "the ordinary no-profile path must default to HTTP/2 on"
+        );
+    }
+
+    #[test]
+    fn high_throughput_profile_resolves_to_high_throughput_preset() {
+        let env_config = EnvConfig {
+            performance_profile: Some("high_throughput".to_string()),
+            ..base_env_config()
+        };
+        let perf_config =
+            PerformanceConfig::try_from(&env_config).expect("recognised profile should resolve");
+        assert_eq!(perf_config.max_concurrent_downloads, 50);
+        assert_eq!(perf_config.connection_pool_size, 100);
+        assert!(perf_config.enable_http2);
+    }
+
+    #[test]
+    fn low_latency_profile_resolves_to_low_latency_preset() {
+        let env_config = EnvConfig {
+            performance_profile: Some("low_latency".to_string()),
+            ..base_env_config()
+        };
+        let perf_config =
+            PerformanceConfig::try_from(&env_config).expect("recognised profile should resolve");
+        assert_eq!(perf_config.max_concurrent_downloads, 10);
+        assert_eq!(perf_config.connection_pool_size, 25);
+        assert!(perf_config.enable_http2);
+    }
+
+    #[test]
+    fn memory_efficient_profile_resolves_to_memory_efficient_preset() {
+        let env_config = EnvConfig {
+            performance_profile: Some("memory_efficient".to_string()),
+            ..base_env_config()
+        };
+        let perf_config =
+            PerformanceConfig::try_from(&env_config).expect("recognised profile should resolve");
+        assert_eq!(perf_config.max_concurrent_downloads, 5);
+        assert_eq!(perf_config.connection_pool_size, 10);
+        // The one deliberate divergence from `Default::default()` in the
+        // whole file - see the comment on `memory_efficient()` above.
+        assert!(!perf_config.enable_http2);
+    }
+
+    #[test]
+    fn profile_names_are_case_insensitive() {
+        let env_config = EnvConfig {
+            performance_profile: Some("HIGH_THROUGHPUT".to_string()),
+            ..base_env_config()
+        };
+        let perf_config = PerformanceConfig::try_from(&env_config)
+            .expect("profile matching should be case-insensitive");
+        assert_eq!(perf_config.max_concurrent_downloads, 50);
+    }
+
+    /// #83's other half: an unrecognised `PERFORMANCE_PROFILE` (e.g. a
+    /// typo like `hgh_throughput`) must fail closed at startup, not
+    /// silently fall through to the custom/no-profile branch.
+    #[test]
+    fn unrecognised_profile_value_fails_closed_at_startup() {
+        let env_config = EnvConfig {
+            performance_profile: Some("hgh_throughput".to_string()),
+            ..base_env_config()
+        };
+        let err = PerformanceConfig::try_from(&env_config)
+            .expect_err("a typo'd profile name must not silently succeed");
+        let message = err.to_string();
+        assert!(message.contains("hgh_throughput"));
+        assert!(message.contains("high_throughput"));
+        assert!(message.contains("low_latency"));
+        assert!(message.contains("memory_efficient"));
+    }
+
+    /// Empty/whitespace-only `PERFORMANCE_PROFILE` is treated the same as
+    /// unset (custom branch), matching how `MetricsAuthConfig::from_env`
+    /// treats an empty/whitespace `METRICS_AUTH_TOKEN` as "not configured"
+    /// rather than as a value to validate.
+    #[test]
+    fn empty_profile_value_is_treated_as_unset() {
+        let env_config = EnvConfig {
+            performance_profile: Some("".to_string()),
+            ..base_env_config()
+        };
+        let perf_config = PerformanceConfig::try_from(&env_config)
+            .expect("empty profile must not error, and must not be treated as unrecognised");
+        assert_eq!(
+            perf_config.enable_http2,
+            PerformanceConfig::default().enable_http2
+        );
+    }
+
+    #[test]
+    fn whitespace_only_profile_value_is_treated_as_unset() {
+        let env_config = EnvConfig {
+            performance_profile: Some("   ".to_string()),
+            ..base_env_config()
+        };
+        let perf_config = PerformanceConfig::try_from(&env_config).expect(
+            "whitespace-only profile must not error, and must not be treated as unrecognised",
+        );
+        assert_eq!(
+            perf_config.enable_http2,
+            PerformanceConfig::default().enable_http2
+        );
     }
 }
