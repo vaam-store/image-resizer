@@ -23,9 +23,10 @@
 ///   extension, resolved to a concrete format by `Accept`-driven content
 ///   negotiation (`crate::modules::negotiation`) at the HTTP edge
 ///   (`crate::modules::api::resize::handle`) before a `ResizeQuery` is ever
-///   built. Every other layer - `CacheService::generate_key`, `ImageService`
-///   - only ever sees a concrete format; `Auto` reaching either is a bug in
-///   the negotiation call site, not a real request shape.
+///   built. Every other layer - `CacheService::generate_key`,
+///   `ImageService` - only ever sees a concrete format; `Auto` reaching
+///   either is a bug in the negotiation call site, not a real request
+///   shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ImageFormat {
     #[default]

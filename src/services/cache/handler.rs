@@ -1101,7 +1101,20 @@ mod tests {
         ];
         let widths: [Option<u32>; 3] = [None, Some(1), Some(12)];
         let heights: [Option<u32>; 3] = [None, Some(3), Some(23)];
-        let formats = [ImageFormat::Jpg, ImageFormat::Png, ImageFormat::Webp];
+        // #49: `Avif`/`Gif` included alongside the original three so the
+        // sweep actually exercises every real output format, not just the
+        // pre-#49 set. `Auto` is deliberately absent - it is resolved to a
+        // concrete format by `crate::modules::negotiation` before any
+        // `ResizeQuery` reaches `generate_key`, so hashing it here would
+        // assert over a state that cannot occur (see `ImageFormat`'s doc
+        // comment in `src/models/params.rs`).
+        let formats = [
+            ImageFormat::Jpg,
+            ImageFormat::Png,
+            ImageFormat::Webp,
+            ImageFormat::Avif,
+            ImageFormat::Gif,
+        ];
         let blur_sigmas: [Option<f32>; 4] = [None, Some(0.0), Some(1.5), Some(2.0)];
         let grayscales: [Option<bool>; 3] = [None, Some(true), Some(false)];
         let enlarges = [false, true];
@@ -1158,6 +1171,47 @@ mod tests {
                 "duplicate cache key produced for a distinct parameter tuple"
             );
         }
+    }
+
+    /// #49: the output format alone must separate two otherwise-identical
+    /// requests. This is the collision that would matter most in practice -
+    /// same source URL, same dimensions, only the extension differs - so an
+    /// AVIF render can never be served the JPEG bytes cached for the same
+    /// image (or vice versa). `format` has been hashed since the original
+    /// scheme, so this is a regression guard rather than a fix; it is
+    /// spelled out as its own test because adding a new output format is
+    /// exactly the change that would break it silently.
+    #[test]
+    fn every_output_format_produces_a_distinct_key() {
+        let cache = cache_service();
+
+        let formats = [
+            ImageFormat::Jpg,
+            ImageFormat::Png,
+            ImageFormat::Webp,
+            ImageFormat::Avif,
+            ImageFormat::Gif,
+        ];
+
+        let keys: HashSet<String> = formats
+            .into_iter()
+            .map(|format| {
+                cache.generate_key(&ResizeQuery {
+                    url: "https://ex.com/photo.jpg".to_string(),
+                    width: Some(800),
+                    height: Some(600),
+                    format,
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        assert_eq!(
+            keys.len(),
+            formats.len(),
+            "each output format must produce a distinct cache key for the \
+             same source URL and dimensions"
+        );
     }
 
     /// #52: a watermarked request must not collide with the otherwise-

@@ -542,10 +542,10 @@ impl ImageService {
     /// requested output format can itself carry animation (`Gif`/`Webp`)
     /// *and* the detected source format can too, this dispatches to
     /// [`Self::decode_animation_source`]/[`Self::encode_animation`] instead
-    /// of the single-`DynamicImage` pipeline below. Every other combination
-    /// - including an animated source requested as a non-animatable format
-    /// like `.jpg` - is unaffected and keeps the pre-#49 behaviour of
-    /// decoding (and encoding) only the first frame.
+    /// of the single-`DynamicImage` pipeline below. Every other
+    /// combination - including an animated source requested as a
+    /// non-animatable format like `.jpg` - is unaffected and keeps the
+    /// pre-#49 behaviour of decoding (and encoding) only the first frame.
     ///
     /// `watermark_bytes` (#52) is `Some(..)` exactly when `params.watermark`
     /// is also `Some(..)` (the caller - `process_image` - only fetches it in
