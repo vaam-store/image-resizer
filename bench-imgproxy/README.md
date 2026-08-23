@@ -85,6 +85,8 @@ Corpus contents:
 | `photo_4k.jpg` | 3840x2160 | Gradient + per-pixel noise ("photo-like"), JPEG q90 |
 | `photo_1080p.jpg` | 1920x1080 | Same generator, JPEG q90 |
 | `photo_800x600.jpg` | 800x600 | Same generator, JPEG q90 |
+| `photo_1080p.webp` | 1920x1080 | Same pixel content as `photo_1080p.jpg`, re-encoded WebP q90 -- exercises libwebp source decode (#66), previously untested by this harness |
+| `photo_1080p.avif` | 1920x1080 | Same pixel content again, AVIF q85 -- exercises libavif/dav1d source decode (#67), previously untested by this harness |
 | `alpha_1024.png` | 1024x1024 | RGBA with a fully-transparent border whose RGB channels are garbage -- exercises alpha-flattening on PNG->JPEG/WebP conversion |
 | `flat_1024.png` | 1024x1024 | Single solid colour, compresses to ~4.5KB |
 
@@ -401,10 +403,14 @@ ramp-up period muddying the numbers.
 
 ### Format / resolution mix
 
-Every valid combination of the 5 corpus fixtures, 3 target sizes
-(`300x300`, `640x480`, `1200x800` by default), and 3 output formats
-(`jpg`, `png`, `webp`) is exercised within a single run, rotated
-round-robin across iterations -- see `COMBOS` in `driver/k6-script.js`.
+Every valid combination of the 7 corpus fixtures, 3 target sizes
+(`300x300`, `640x480`, `1200x800` by default), and 4 output formats
+(`jpg`, `png`, `webp`, `avif` by default -- `avif` added so the harness
+exercises libavif encode (#68) in addition to the source-side libwebp/
+libavif decode the two new `photo_1080p.webp`/`photo_1080p.avif` fixtures
+above add; override with `FORMATS=jpg,png,webp` to reproduce a pre-AVIF
+run) is exercised within a single run, rotated round-robin across
+iterations -- see `COMBOS` in `driver/k6-script.js`.
 
 ### Output size at comparable quality
 

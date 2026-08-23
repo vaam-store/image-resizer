@@ -40,6 +40,13 @@ const FIXTURES = (__ENV.FIXTURES || [
   'photo_4k.jpg:3840x2160',
   'photo_1080p.jpg:1920x1080',
   'photo_800x600.jpg:800x600',
+  // WebP/AVIF *source* fixtures (same underlying pixel content as
+  // `photo_1080p.jpg`, see `fixtures/generate.py`) -- until now the
+  // corpus was jpg/png only, so neither engine's WebP-decode (libwebp,
+  // #66) or AVIF-decode (libavif+dav1d, #67) path was ever exercised by
+  // this end-to-end harness.
+  'photo_1080p.webp:1920x1080',
+  'photo_1080p.avif:1920x1080',
   'alpha_1024.png:1024x1024',
   'flat_1024.png:1024x1024',
 ].join(',')).split(',').map((entry) => {
@@ -53,7 +60,19 @@ const SIZES = (__ENV.SIZES || '300x300,640x480,1200x800').split(',').map((s) => 
   return { w, h };
 });
 
-const FORMATS = (__ENV.FORMATS || 'jpg,png,webp').split(',');
+// `avif` output added to the default sweep (previously jpg/png/webp only)
+// -- AVIF encode (libavif+AOM, #68) is one of the codec paths this corpus
+// exists to exercise, and at this project's current default speed/quality
+// (`DEFAULT_AVIF_SPEED = 6`, moved from 4 specifically to make the default
+// path affordable -- see that constant's own doc comment in
+// `src/services/image/handler.rs`) it measures ~64ms per encode, the same
+// order of magnitude as `png_best`'s ~99ms CompressionType::Best cost
+// (`.bench-baseline/BASELINE.md`'s "PNG encode correction" entry) already
+// in this same default rotation -- i.e. AVIF is not disproportionately
+// more expensive than a format this sweep already includes by default, so
+// there's no strong case for exiling it to a separate opt-in scenario.
+// Override with FORMATS=jpg,png,webp to reproduce a pre-AVIF-era run.
+const FORMATS = (__ENV.FORMATS || 'jpg,png,webp,avif').split(',');
 
 // Every (fixture, size, format) combo that doesn't require upscaling
 // either dimension -- this is the actual request matrix both engines see.

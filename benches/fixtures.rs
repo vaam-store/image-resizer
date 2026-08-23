@@ -289,6 +289,125 @@ pub fn photo_like_sized_avif(
     })
 }
 
+// ---------------------------------------------------------------------
+// Real-photo fixtures
+//
+// `gradient_noise_rgb` above (smooth gradient + i.i.d. per-pixel noise) is
+// close to incompressible high-frequency noise, which `adr/0003-webp-
+// measurement.md` and `adr/0004-avif-measurement.md` both found gives
+// codec comparisons the wrong answer - sometimes inverted (WebP decode
+// measured *slower* than the pure-Rust decoder it replaced on this
+// synthetic fixture; ~2.24x *faster* on real photos), sometimes wildly
+// off-scale (AVIF decode ~30x slower on synthetic noise than on real
+// photos, because there's far more compressed residual to walk through).
+// These two embedded photographs give the decode/encode/pipeline benches
+// a real photographic-content axis to measure alongside the synthetic
+// one, instead of only ever seeing noise.
+//
+// Both are NASA public-domain photographs (17 U.S.C. §105 - a work of the
+// U.S. federal government), re-encoded and downscaled from their
+// Wikimedia Commons originals; see `benches/fixtures/real/ATTRIBUTION.md`
+// for the exact source URLs, licence confirmation, and processing steps.
+// Deliberately not the Kodak True Color corpus those two ADRs used for
+// their own scratch-crate measurements - Kodak's redistribution licence
+// isn't established as permissive enough to commit into this repository.
+//
+// Embedded via `include_bytes!` (not read from disk at bench time): this
+// file is pulled into three different compilation units via `#[path]`
+// (see the module doc comment at the top of this file), each with a
+// different process working directory, so a runtime `std::fs::read`
+// relative path would be fragile in a way a compile-time include isn't.
+// `include_bytes!`'s path is resolved relative to this physical source
+// file's own directory (`benches/`), regardless of which crate includes
+// it.
+const REAL_PHOTO_PRIMARY_BYTES: &[u8] = include_bytes!("fixtures/real/blue-marble.jpg");
+const REAL_PHOTO_SECONDARY_BYTES: &[u8] = include_bytes!("fixtures/real/earthrise.jpg");
+
+/// Decode one of the embedded real-photo sources. Not cached on disk like
+/// the generated fixtures below - decoding a ~300KB/~80KB JPEG once per
+/// process is cheap enough not to need it, and the *output* of
+/// `real_photo_sized`/`real_photo_sized_avif` (which do get disk-cached)
+/// is what repeated `cargo bench` runs actually reuse.
+fn real_photo_base(bytes: &'static [u8]) -> DynamicImage {
+    image::load_from_memory_with_format(bytes, ImageFormat::Jpeg)
+        .expect("embedded real-photo fixture should always decode")
+}
+
+/// Scale `base` to cover a `width x height` box (matching the longer of
+/// the two scale factors, like `ResizeType::Fill`'s cover-then-crop in
+/// `src/services/image/handler.rs`), then centre-crop to exactly that box.
+/// Never upscales past what `base`'s own resolution supports for the sizes
+/// this file actually requests (checked in `real_photo_sized`'s doc
+/// comment) - deliberately not calling into `handler.rs` itself here, so
+/// this fixture-generation code can't accidentally depend on the same
+/// logic the benches go on to measure.
+fn cover_resize(base: &DynamicImage, width: u32, height: u32) -> RgbImage {
+    let (bw, bh) = (base.width() as f64, base.height() as f64);
+    let scale = (width as f64 / bw).max(height as f64 / bh);
+    let rw = (bw * scale).ceil().max(width as f64) as u32;
+    let rh = (bh * scale).ceil().max(height as f64) as u32;
+    let resized = base.resize_exact(rw, rh, image::imageops::FilterType::Lanczos3);
+    let x = (resized.width() - width) / 2;
+    let y = (resized.height() - height) / 2;
+    resized.crop_imm(x, y, width, height).into_rgb8()
+}
+
+/// Real-photo content (the primary source, `blue-marble.jpg`) at an
+/// arbitrary size/format - the real-photo counterpart to
+/// `photo_like_sized` above, same signature, same disk-cache scheme. Every
+/// size this benchmark suite requests (max 1920x1080, `benches/decode.rs`'s
+/// `SIZES`) is a pure downscale of the embedded 2200x1100 source - never an
+/// upscale - by construction (see `ATTRIBUTION.md`).
+pub fn real_photo_sized(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
+    let ext = match format {
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Png => "png",
+        ImageFormat::WebP => "webp",
+        _ => "bin",
+    };
+    cached(&format!("real_photo_{width}x{height}.{ext}"), || {
+        let base = real_photo_base(REAL_PHOTO_PRIMARY_BYTES);
+        let img = DynamicImage::ImageRgb8(cover_resize(&base, width, height));
+        encode(&img, format)
+    })
+}
+
+/// AVIF counterpart to `real_photo_sized`, mirroring
+/// `photo_like_sized_avif`'s caller-supplied-encoder pattern (see that
+/// function's own doc comment for why).
+pub fn real_photo_sized_avif(
+    width: u32,
+    height: u32,
+    encode_fn: impl FnOnce(&DynamicImage) -> Vec<u8>,
+) -> Vec<u8> {
+    cached(&format!("real_photo_{width}x{height}.avif"), || {
+        let base = real_photo_base(REAL_PHOTO_PRIMARY_BYTES);
+        let img = DynamicImage::ImageRgb8(cover_resize(&base, width, height));
+        encode_fn(&img)
+    })
+}
+
+/// Real-photo content from the *secondary* source (`earthrise.jpg`) -
+/// structurally different from `blue-marble.jpg` (near-black space +
+/// high-texture lunar regolith + a small high-detail Earth, vs. Blue
+/// Marble's broad cloud/ocean/land texture), at an arbitrary size/format.
+/// Used by `benches/pipeline.rs` so the real-vs-synthetic comparison isn't
+/// resting on a single photo's particular compressibility. Native
+/// resolution 1280x1280, so this is only called at sizes at or below that.
+pub fn real_photo_secondary_sized(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
+    let ext = match format {
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Png => "png",
+        ImageFormat::WebP => "webp",
+        _ => "bin",
+    };
+    cached(&format!("real_photo_secondary_{width}x{height}.{ext}"), || {
+        let base = real_photo_base(REAL_PHOTO_SECONDARY_BYTES);
+        let img = DynamicImage::ImageRgb8(cover_resize(&base, width, height));
+        encode(&img, format)
+    })
+}
+
 pub const ORIENTED_W: u32 = 120;
 pub const ORIENTED_H: u32 = 80;
 /// Marker block side length, in canonical (already-upright) pixels - well

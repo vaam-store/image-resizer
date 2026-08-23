@@ -122,6 +122,36 @@ def main() -> None:
         img.save(path, format="JPEG", quality=90)
         print(f"wrote {path} ({path.stat().st_size} bytes, {w}x{h})")
 
+    # WebP and AVIF *source* fixtures -- until now the corpus was jpg/png
+    # only, so neither engine's WebP-decode (libwebp, #66) or AVIF-decode
+    # (libavif+dav1d, #67) path was ever exercised by this end-to-end
+    # harness, even though both changed recently. Same underlying pixel
+    # content as `photo_1080p.jpg` (same `gradient_noise_rgb` label, so the
+    # three are the identical image re-encoded three ways, not three
+    # different photos) -- one size only, not all three, to keep the
+    # corpus small; 1080p is the harness's own "typical photo" size.
+    # Requires Pillow >= 11 for built-in AVIF write support (bundled in
+    # official wheels since Pillow 11.0 -- `pip install pillow` alone is
+    # enough on any reasonably current install; verify locally with
+    # `python3 -c "from PIL import features; print(features.check('avif'))"`
+    # if generation fails with an unknown-format error).
+    photo_1080p_img = gradient_noise_rgb(1920, 1080, "photo_1920x1080")
+
+    webp_path = OUT_DIR / "photo_1080p.webp"
+    # quality=90, matching the JPEG sources' "already compressed" framing.
+    photo_1080p_img.save(webp_path, format="WEBP", quality=90)
+    print(f"wrote {webp_path} ({webp_path.stat().st_size} bytes, 1920x1080)")
+
+    avif_path = OUT_DIR / "photo_1080p.avif"
+    # quality=85 on Pillow's AVIF plugin's own 0-100 scale (not directly
+    # comparable to emgr's `DEFAULT_AVIF_QUALITY` -- see adr/0004's "nominal
+    # quality numbers aren't comparable across encoders" finding; this is a
+    # *source* image being decoded, not emgr's own encode path being
+    # measured, so exact quality-scale parity doesn't matter here the way
+    # it would for an encoder benchmark).
+    photo_1080p_img.save(avif_path, format="AVIF", quality=85)
+    print(f"wrote {avif_path} ({avif_path.stat().st_size} bytes, 1920x1080)")
+
     alpha_img = alpha_fringe_rgba(1024, "alpha_fringe_1024")
     alpha_path = OUT_DIR / "alpha_1024.png"
     alpha_img.save(alpha_path, format="PNG")
