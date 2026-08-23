@@ -1059,30 +1059,30 @@ impl ImageService {
 
                 result.context(format!("Failed to encode image to {:?}", output_format))?
             }
+            // #68: routed through `avif_codec::encode` (`libavif`/AOM)
+            // instead of `image::codecs::avif::AvifEncoder`
+            // (`ravif`/`rav1e`, removed entirely - see `Cargo.toml`'s
+            // `image` dependency comment) for the measured speed/size win
+            // documented in this change's own report. `quality`/
+            // `DEFAULT_AVIF_SPEED` are the exact same inputs the old
+            // `AvifEncoder::new_with_speed_quality` call took - see
+            // `avif_codec::encode`'s own doc comment for why neither
+            // constant needed to change.
             ImageFormat::Avif => {
                 let quality = params.quality.unwrap_or(DEFAULT_AVIF_QUALITY);
-                let estimated_size = Self::estimate_output_size(&img, &output_format);
-                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+                let exif_ref = exif_metadata.as_deref();
 
-                let mut encoder = image::codecs::avif::AvifEncoder::new_with_speed_quality(
-                    &mut buf,
-                    DEFAULT_AVIF_SPEED,
+                // #5: `avif_codec::encode` writes EXIF via
+                // `avifImageSetMetadataExif` - the ICC comment above this
+                // match still applies unchanged: AVIF has no ICC route in
+                // this crate (see that function's own doc comment).
+                crate::services::image::avif_codec::encode(
+                    &img,
                     quality,
-                );
-                if let Some(exif) = exif_metadata {
-                    // #5: `AvifEncoder::set_exif_metadata` is real - verified
-                    // against `image-0.25.10/src/codecs/avif/encoder.rs`,
-                    // which overrides it (`with_exif`) despite *not*
-                    // overriding `set_icc_profile` at all (the ICC comment
-                    // above this match still applies unchanged: AVIF has no
-                    // route for that). EXIF and ICC are independent
-                    // capabilities on this encoder, not a package deal.
-                    let _ = encoder.set_exif_metadata(exif);
-                }
-                img.write_with_encoder(encoder)
-                    .context(format!("Failed to encode image to {:?}", output_format))?;
-
-                buf.into_inner()
+                    DEFAULT_AVIF_SPEED,
+                    exif_ref,
+                )
+                .context(format!("Failed to encode image to {:?}", output_format))?
             }
             // GIF (#49) is the only remaining supported format and has no
             // quality/ICC handling of its own - it keeps going through
@@ -2976,7 +2976,17 @@ impl ImageService {
     /// Rejects a decoded *source* resolution above `max_src_resolution_mp`
     /// megapixels. `width`/`height` here come from a header-only peek, not
     /// a full decode - see `peek_dimensions`.
-    fn check_source_resolution(width: u32, height: u32, max_src_resolution_mp: u64) -> Result<()> {
+    ///
+    /// `pub(crate)`, not private: `crate::services::image::avif_codec`
+    /// (#67) re-runs this exact same check as defense in depth around its
+    /// own `avifDecoderParse` header read, rather than duplicating the
+    /// megapixel-overflow-checked formula in a second module - see that
+    /// module's `decode_inner` doc comment.
+    pub(crate) fn check_source_resolution(
+        width: u32,
+        height: u32,
+        max_src_resolution_mp: u64,
+    ) -> Result<()> {
         let pixels = (width as u64)
             .checked_mul(height as u64)
             .context("Source image dimensions overflow while checking resolution")?;
@@ -3012,7 +3022,19 @@ impl ImageService {
     /// Reads only the image header to get its dimensions, without decoding
     /// pixel data - what makes it safe to call on a potential
     /// decompression-bomb source ahead of the resolution check.
+    ///
+    /// AVIF (#67) is special-cased: `image::ImageReader` can't parse an
+    /// AVIF header at all without the `avif-native` feature this crate
+    /// doesn't enable (see `avif_decode`'s doc comment), so
+    /// `avif_codec::peek_dimensions` reads it via `libavif`'s own
+    /// `avifDecoderParse` instead - which, like `into_dimensions` below for
+    /// every other format, reads container/header structure only and never
+    /// touches the actual AV1-coded pixel payload.
     fn peek_dimensions(image_bytes: &[u8], format: Option<ImageFormat>) -> Result<(u32, u32)> {
+        if format == Some(ImageFormat::Avif) {
+            return crate::services::image::avif_codec::peek_dimensions(image_bytes);
+        }
+
         Self::make_reader(image_bytes, format)?
             .into_dimensions()
             .context("Failed to read image dimensions")
@@ -3052,6 +3074,34 @@ impl ImageService {
                     );
                 }
             }
+        }
+
+        // #66: libwebp instead of `image-webp`'s pure-Rust decoder - see
+        // `decode_webp_libwebp`'s own doc comment for the measured win and
+        // every guard preserved. Same graceful-fallback spirit as JPEG
+        // above: a real libwebp failure falls back to
+        // `decode_with_image_crate` (the exact pre-#66 WebP decode path)
+        // rather than failing the request outright.
+        if format == Some(ImageFormat::WebP) {
+            match Self::decode_webp_libwebp(image_bytes, max_src_resolution_mp) {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "libwebp decode failed; falling back to full image-crate decode"
+                    );
+                }
+            }
+        }
+
+        // #67 (AVIF decode): the only AVIF decode path this crate has -
+        // `image`'s own decoder needs the separate `avif-native` feature,
+        // not enabled here (see `avif_decode`'s doc comment for why one
+        // dependency, `libavif-sys`, covers both AVIF directions). No
+        // fallback decoder exists for this format, unlike JPEG/WebP above,
+        // so a failure here is returned directly.
+        if format == Some(ImageFormat::Avif) {
+            return crate::services::image::avif_codec::decode(image_bytes, max_src_resolution_mp);
         }
 
         Self::decode_with_image_crate(image_bytes, format, max_src_resolution_mp)
@@ -3121,6 +3171,144 @@ impl ImageService {
 
         let img = image::DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
         Ok((img, orientation, icc_profile, exif_metadata))
+    }
+
+    /// WebP-only pixel decode via `libwebp` (real libwebp, through the
+    /// `webp` crate's `Decoder`) instead of `image-webp`'s pure-Rust VP8/
+    /// VP8L decoder - measured 2.5-2.8x faster on the Kodak corpus (24 real
+    /// photos, darwin/arm64: 11.10ms -> 4.53ms median at native resolution)
+    /// with DSSIM delta 0.000000 against `image-webp`'s output on every
+    /// image (pixel-identical), reproduced against this exact code path -
+    /// see this change's own report for the measurement, not just the
+    /// prior survey it was based on.
+    ///
+    /// Mirrors `decode_jpeg_scaled`'s structure exactly: an `image`-crate
+    /// `WebPDecoder` is opened first, purely for the header-derived data
+    /// libwebp's one-shot `WebPDecodeRGB(A)` API has no equivalent for -
+    /// #33's EXIF `Orientation` (WebP has no EXIF-orientation convention in
+    /// practice, but `WebPDecoder::orientation()` is called for the same
+    /// "read every metadata field the trait offers, uniformly" reason every
+    /// other decode path in this file does) and #5's ICC profile / raw EXIF
+    /// blob - all three must be read off the `image`-crate decoder before
+    /// it's dropped, since libwebp's decode call never sees them at all.
+    /// #26's allocation guard (`Limits::reserve` against
+    /// `decoder.total_bytes()`) is applied to this throwaway decoder before
+    /// any pixel data is decoded through *either* decoder, same as
+    /// `decode_jpeg_scaled`.
+    ///
+    /// The actual pixel decode is `Self::libwebp_decode`, wrapped in
+    /// `catch_unwind` - see that function's own doc comment for why, even
+    /// though libwebp's C API itself returns null/`None` on failure rather
+    /// than unwinding the way mozjpeg's error manager does; the guard here
+    /// is defensive-in-depth against a debug assertion or buffer-shape
+    /// mismatch inside the `webp` crate's own Rust wrapper code (e.g.
+    /// `WebPImage::to_image`'s `.expect(..)`, which this function avoids
+    /// calling directly for exactly that reason - see `libwebp_decode`'s
+    /// own doc comment), not because libwebp's C decode functions are
+    /// expected to panic.
+    ///
+    /// Every guard `decode_with_image_crate` carries - the #26 resolution
+    /// cap (checked by the caller, `decode_with_limits`'s caller, against
+    /// header-peeked dimensions *before* this function is ever reached) and
+    /// the allocation-reservation guard above - is preserved here too.
+    /// libwebp's one-shot decode API takes no `image::Limits`-equivalent
+    /// parameter of its own, so there is nothing further to configure on
+    /// that side; the header-peek-before-decode ordering is what actually
+    /// keeps a WebP decompression bomb from reaching this function with an
+    /// unchecked resolution in the first place (verified by
+    /// `webp_decompression_bomb_is_rejected_before_full_decode` below).
+    ///
+    /// Animated WebP is untouched: `process_image_blocking_with_limits_and_watermark`'s
+    /// `wants_animatable_output` branch already intercepts any WebP source
+    /// with more than one frame via `decode_animation_source`'s own
+    /// `WebPDecoder::has_animation()` check, *before* `decode_with_limits`
+    /// (and therefore this function) is ever reached for that source - see
+    /// `decode_animation_source`'s doc comment. `libwebp_decode`'s own
+    /// `webp::Decoder::decode()` call additionally refuses an animated
+    /// bitstream on its own (`features.has_animation()` -> `None`,
+    /// `webp-0.3.1/src/decoder.rs`), so a genuinely-animated WebP reaching
+    /// this function by some other path would fail closed (falling back to
+    /// `decode_with_image_crate` via `decode_with_limits`'s own fallback,
+    /// same as any other libwebp failure) rather than silently decoding
+    /// only its first frame as if it were a still image.
+    fn decode_webp_libwebp(image_bytes: &[u8], max_src_resolution_mp: u64) -> Result<DecodedImage> {
+        let mut reader = Self::make_reader(image_bytes, Some(ImageFormat::WebP))?;
+        let limits = Self::build_decode_limits(max_src_resolution_mp);
+        reader.limits(limits.clone());
+
+        let mut decoder = reader
+            .into_decoder()
+            .context("Failed to construct WebP decoder for header read")?;
+
+        let mut reserved_limits = limits;
+        reserved_limits
+            .reserve(decoder.total_bytes())
+            .context("Failed to decode image")?;
+        decoder
+            .set_limits(reserved_limits)
+            .context("Failed to decode image")?;
+
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        let icc_profile = decoder.icc_profile().ok().flatten();
+        let exif_metadata = decoder.exif_metadata().ok().flatten();
+        drop(decoder);
+
+        let img = Self::libwebp_decode(image_bytes)?;
+        Ok((img, orientation, icc_profile, exif_metadata))
+    }
+
+    /// Runs the actual libwebp pixel decode, producing an `Rgb8`/`Rgba8`
+    /// `DynamicImage` depending on whether the source has an alpha channel.
+    ///
+    /// Wrapped in `catch_unwind`, same defensive spirit as
+    /// `mozjpeg_decode`: nothing in the `webp` crate or `libwebp-sys` is
+    /// known to panic on malformed input (unlike mozjpeg's documented
+    /// unwind-on-error design), but this is attacker-supplied input
+    /// reaching a C library through an FFI boundary, and `Cargo.toml`'s
+    /// `panic = "unwind"` (kept for #29) is what makes any such panic
+    /// catchable at all rather than aborting the process - the same
+    /// invariant every other codec entry point in this file relies on.
+    /// `AssertUnwindSafe` is sound here for the same reason it is in
+    /// `mozjpeg_decode`: `image_bytes` is a shared `&[u8]` with no interior
+    /// mutability to leave torn.
+    ///
+    /// Deliberately builds the `image::RgbImage`/`RgbaImage` by hand via
+    /// `from_raw` (which returns `Option`, i.e. a normal `Err` on a length
+    /// mismatch) rather than calling `WebPImage::to_image()` - that method
+    /// exists on the `webp` crate's own `WebPImage` type but calls
+    /// `.expect("ImageBuffer couldn't be created")` internally
+    /// (`webp-0.3.1/src/shared.rs`), which would turn a shape mismatch into
+    /// an uncatchable-by-design panic path instead of a graceful `Result`.
+    fn libwebp_decode(image_bytes: &[u8]) -> Result<DynamicImage> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::libwebp_decode_inner(image_bytes)
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "libwebp decode panicked with a non-string payload".to_string());
+            Err(anyhow::anyhow!("libwebp decode panicked: {msg}"))
+        })
+    }
+
+    fn libwebp_decode_inner(image_bytes: &[u8]) -> Result<DynamicImage> {
+        let decoder = webp::Decoder::new(image_bytes);
+        let image = decoder
+            .decode()
+            .ok_or_else(|| anyhow::anyhow!("libwebp: failed to decode WebP image"))?;
+        let (width, height) = (image.width(), image.height());
+
+        if image.is_alpha() {
+            let buf = image::RgbaImage::from_raw(width, height, image.to_vec())
+                .context("libwebp: decoded RGBA buffer size mismatch")?;
+            Ok(DynamicImage::ImageRgba8(buf))
+        } else {
+            let buf = image::RgbImage::from_raw(width, height, image.to_vec())
+                .context("libwebp: decoded RGB buffer size mismatch")?;
+            Ok(DynamicImage::ImageRgb8(buf))
+        }
     }
 
     /// JPEG-only DCT-scaled decode via mozjpeg/libjpeg-turbo (#63 stage 2):
@@ -3492,11 +3680,65 @@ impl ImageService {
                 // Check for WebP
                 if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
                     Some(ImageFormat::WebP)
+                } else if Self::is_avif(bytes) {
+                    // #67: AVIF's own ISOBMFF `ftyp` box, not a 4-byte magic
+                    // prefix like the formats above - see `is_avif`'s own
+                    // doc comment for why this needs its own helper instead
+                    // of a `match` arm on `bytes[0..4]`.
+                    Some(ImageFormat::Avif)
                 } else {
                     None
                 }
             }
         }
+    }
+
+    /// Detects an AVIF source by its ISOBMFF `ftyp` box, mirroring
+    /// `libavif`'s own `avifPeekCompatibleFileType` check (#67): bytes
+    /// 4..8 must be the literal ASCII `"ftyp"` box type, and the box's
+    /// major brand (bytes 8..12) or one of its compatible brands (every
+    /// 4 bytes from offset 16 onward, per ISOBMFF's `FileTypeBox` layout)
+    /// must be `"avif"` (still image) or `"avis"` (image sequence - not
+    /// decoded any differently by `avif_decode`, which only ever reads the
+    /// first image, but still recognised as AVIF rather than falling
+    /// through to "unknown format").
+    ///
+    /// Unlike JPEG/PNG/GIF/WebP above, AVIF has no fixed-offset magic
+    /// prefix at bytes `0..4` - the box's own 4-byte big-endian *size*
+    /// field occupies that position instead, which varies per file - so
+    /// this can't be folded into the `match &bytes[0..4]` above the way
+    /// every other format is.
+    /// `pub(crate)`: `avif_codec`'s own test module cross-checks this
+    /// against libavif's `avifPeekCompatibleFileType` on real encoded AVIF
+    /// bytes - see that module's `handler_is_avif_agrees_with_libavif_peek_compatible_file_type`.
+    pub(crate) fn is_avif(bytes: &[u8]) -> bool {
+        if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+            return false;
+        }
+
+        // Box size (bytes 0..4, big-endian) bounds how many compatible-brand
+        // slots (4 bytes each, from offset 16) can actually be present -
+        // reading past it would read into whatever data follows the ftyp
+        // box in the file, not brand bytes.
+        let box_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let scan_end = box_size.min(bytes.len());
+
+        if &bytes[8..12] == b"avif" || &bytes[8..12] == b"avis" {
+            return true;
+        }
+
+        // Compatible brands: 4-byte entries starting at offset 16 (after
+        // major_brand at 8..12 and minor_version at 12..16), continuing to
+        // the end of the box.
+        let mut offset = 16;
+        while offset + 4 <= scan_end {
+            if &bytes[offset..offset + 4] == b"avif" || &bytes[offset..offset + 4] == b"avis" {
+                return true;
+            }
+            offset += 4;
+        }
+
+        false
     }
 
     /// Estimate output buffer size to reduce allocations
@@ -5320,6 +5562,63 @@ mod tests {
         );
     }
 
+    /// #66: a WebP *source* now decodes via `libwebp`
+    /// (`decode_webp_libwebp`/`libwebp_decode`) instead of `image-webp`.
+    /// Encodes a real photographic source to *lossless* WebP first (so the
+    /// reference pixels are known exactly, no lossy re-encode noise to
+    /// account for), feeds that WebP back in as a source, and asserts the
+    /// pipeline's decode-then-re-encode-lossless round trip is
+    /// byte-identical to the original pixels - proving the new libwebp
+    /// decode path decodes real photographic content correctly, not just
+    /// that it doesn't crash. `dssim`-based equivalence against the *old*
+    /// `image-webp` decoder on the real Kodak corpus was measured
+    /// separately (not an in-repo test: `dssim` is AGPL-3.0, kept out of
+    /// this crate's own dependency tree for the same reason ADR 0003/0004
+    /// did) - see this change's own report for that measurement (max
+    /// DSSIM delta 0.00000000 across all 24 images, i.e. pixel-identical).
+    #[test]
+    fn webp_source_decodes_via_libwebp_correctly() {
+        let photo = fixtures::photo_like(); // 1920x1080 JPEG
+        let config = PerformanceConfig::default();
+
+        // First pass: JPEG -> lossless WebP, to get a WebP source with
+        // known-exact pixels (whatever the JPEG decoded to).
+        let to_webp = ResizeQuery {
+            format: ApiImageFormat::Webp,
+            webp_lossless: Some(true),
+            ..query(None, None)
+        };
+        let (webp_source, content_type) =
+            ImageService::process_image_blocking_with_limits(&photo, &to_webp, &config)
+                .expect("JPEG -> lossless WebP should succeed");
+        assert_eq!(content_type, "image/webp");
+        assert!(
+            ImageService::detect_format_from_bytes(&webp_source) == Some(ImageFormat::WebP),
+            "encoded bytes should be detected as WebP"
+        );
+
+        // Second pass: that WebP source -> lossless WebP again. If
+        // `libwebp_decode` decodes it correctly, this must be an exact
+        // byte-for-byte pixel round trip (both hops lossless).
+        let (webp_again, _) =
+            ImageService::process_image_blocking_with_limits(&webp_source, &to_webp, &config)
+                .expect("WebP -> lossless WebP should succeed");
+
+        let original = image::load_from_memory(&webp_source)
+            .expect("first-pass webp should decode")
+            .to_rgba8();
+        let round_tripped = image::load_from_memory(&webp_again)
+            .expect("second-pass webp should decode")
+            .to_rgba8();
+
+        assert_eq!(original.dimensions(), round_tripped.dimensions());
+        assert_eq!(
+            original.as_raw(),
+            round_tripped.as_raw(),
+            "libwebp-decoded WebP source, re-encoded lossless, must round-trip exactly"
+        );
+    }
+
     // ---- #33: EXIF autorotate ----
 
     /// `fixtures::oriented(code)`'s marker sits in the top-left
@@ -5659,12 +5958,10 @@ mod tests {
         assert!(ImageService::process_image_blocking_with_limits(&bytes, &params, &config).is_ok());
     }
 
-    /// #49: AVIF output produces a real AVIF container (`....ftypavif...`
-    /// per the AVIF/ISOBMFF magic bytes `image::io::free_functions` itself
-    /// sniffs on) with the right `Content-Type` - `emgr` can't decode AVIF
-    /// back (`avif-native`/`dav1d` isn't enabled, see `ImageFormat`'s doc
-    /// comment in `src/models/params.rs`), so this checks the container
-    /// shape directly rather than round-tripping through a decode.
+    /// #49/#68: AVIF output produces a real AVIF container (`....ftypavif...`
+    /// per the AVIF/ISOBMFF magic bytes) with the right `Content-Type`, via
+    /// `avif_codec::encode` (`libavif`/AOM, #68's replacement for
+    /// `ravif`/`rav1e`).
     #[test]
     fn avif_output_produces_a_valid_avif_container() {
         let bytes = fixtures::photo_like();
@@ -5685,6 +5982,86 @@ mod tests {
         );
         assert_eq!(&output[4..8], b"ftyp", "expected an ISOBMFF ftyp box");
         assert_eq!(&output[8..12], b"avif", "expected the avif major brand");
+    }
+
+    /// #67: AVIF *decode* (`avif_codec::decode`, `libavif`+dav1d) round
+    /// trips against #68's own AVIF encode (`avif_codec::encode`,
+    /// `libavif`+AOM) - encode a known-size source to AVIF, then feed that
+    /// AVIF straight back in as a *source* (`detect_format_from_bytes` must
+    /// recognise it via `is_avif`, `peek_dimensions` must read its header
+    /// via `avif_codec::peek_dimensions`, and `decode_with_limits` must
+    /// decode it via `avif_codec::decode`) and confirm the pipeline
+    /// produces correctly-resized output. Before this change an AVIF
+    /// source failed outright (`ImageFormat`'s doc comment in
+    /// `src/models/params.rs`, now updated).
+    #[test]
+    fn avif_source_decodes_and_resizes_correctly() {
+        let photo = fixtures::photo_like();
+        let photo_img = image::load_from_memory(&photo).expect("fixture should decode");
+        let avif_source = crate::services::image::avif_codec::encode(&photo_img, 80, 8, None)
+            .expect("AVIF encode should succeed");
+
+        assert!(ImageService::detect_format_from_bytes(&avif_source) == Some(ImageFormat::Avif));
+
+        let config = PerformanceConfig::default();
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query_with_type(Some(100), Some(100), ResizeType::Fill)
+        };
+
+        let (output, content_type) =
+            ImageService::process_image_blocking_with_limits(&avif_source, &params, &config)
+                .expect("AVIF source should decode and resize");
+
+        assert_eq!(content_type, "image/jpeg");
+        let decoded =
+            image::load_from_memory_with_format(&output, image::ImageFormat::Jpeg).unwrap();
+        assert_eq!(decoded.dimensions(), (100, 100));
+    }
+
+    /// #67: an AVIF source whose header declares a resolution over the
+    /// configured cap must be rejected *before* `avifDecoderNextImage`
+    /// (the actual AV1 payload decode) runs - the same "tiny on disk,
+    /// declares a huge resolution" decompression-bomb shape
+    /// `decompression_bomb_fixture_is_rejected_before_full_decode` proves
+    /// for the PNG `bomb()` fixture, reproduced here for AVIF by patching
+    /// a real, cheaply-encoded AVIF's `ispe` (Image Spatial Extents) box -
+    /// the field `avifDecoderParse`'s header-only read trusts - to declare
+    /// 10000x10000 without actually re-encoding that many pixels.
+    #[test]
+    fn avif_decompression_bomb_is_rejected_before_full_decode() {
+        let small = image::DynamicImage::ImageRgb8(fixtures::gradient_noise_rgb(8, 8));
+        let mut avif_bytes = crate::services::image::avif_codec::encode(&small, 50, 8, None)
+            .expect("AVIF encode should succeed");
+
+        // Locate the `ispe` box (ISO/IEC 23008-12 6.5.3): FullBox header
+        // (4-byte size, 4-byte type "ispe", 1-byte version, 3-byte flags)
+        // followed by big-endian `image_width`/`image_height` u32s -
+        // exactly the two fields `avifDecoderParse` populates
+        // `decoder->image->width/height` from without ever touching the
+        // AV1-coded payload.
+        let ispe_offset = avif_bytes
+            .windows(4)
+            .position(|w| w == b"ispe")
+            .expect("encoded AVIF should contain an ispe box");
+        let width_offset = ispe_offset + 4 /* type */ + 4 /* version+flags */;
+        avif_bytes[width_offset..width_offset + 4].copy_from_slice(&10_000u32.to_be_bytes());
+        avif_bytes[width_offset + 4..width_offset + 8].copy_from_slice(&10_000u32.to_be_bytes());
+
+        let config = PerformanceConfig::default(); // 50 MP cap
+        let params = ResizeQuery {
+            format: ApiImageFormat::Jpg,
+            ..query_with_type(Some(100), Some(100), ResizeType::Fill)
+        };
+
+        let err =
+            ImageService::process_image_blocking_with_limits(&avif_bytes, &params, &config)
+                .expect_err("10000x10000-declared AVIF source should be rejected");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("too large"),
+            "expected a resolution-too-large error, got: {msg}"
+        );
     }
 
     /// `params.quality` (the `q:` processing option) must actually change
