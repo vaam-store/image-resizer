@@ -171,4 +171,7 @@ until then, everything below is "Unreleased" in that format's sense.
   restarted ([#48](https://github.com/vaam-store/image-resizer/issues/48)).
 - ADRs recording the image-engine choice, the URL/API shape, and
   measurement writeups for the WebP and AVIF encoder decisions
-  (`adr/0001` through `adr/0004`).
+  (`adr/0001` through `adr/0005`). Note `adr/0004` is **superseded** by
+  `adr/0005`, which re-measured AVIF against the encoders actually shipped
+  (libavif/AOM and mozjpeg) after both sides of `0004`'s comparison were
+  replaced; `0004` is kept for the record, with its numbers marked void.
