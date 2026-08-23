@@ -743,13 +743,16 @@ impl ImageService {
     ///   (verified against `image-0.25.10/src/codecs/png.rs`: the decoder
     ///   already reads it too, which is where `exif_metadata` above comes
     ///   from for a PNG *source*).
-    /// - **AVIF**: `image::codecs::avif::AvifEncoder::set_exif_metadata` -
-    ///   supported despite AVIF having *no* ICC API at all (verified: that
-    ///   encoder overrides `set_exif_metadata` but not `set_icc_profile`,
-    ///   `image-0.25.10/src/codecs/avif/encoder.rs`) - the two are
-    ///   genuinely independent capabilities on this encoder, not a package
-    ///   deal. (This previously noted that AVIF was encode-only. It is not
-    ///   any more - #67 added decode via libavif/dav1d, see
+    /// - **AVIF**: `crate::services::image::avif_codec::encode`, via
+    ///   libavif's `avifImageSetMetadataExif` - #68 replaced the old
+    ///   `image::codecs::avif::AvifEncoder` with this. EXIF is supported
+    ///   even though this crate doesn't forward an ICC profile for AVIF
+    ///   output - and that's not because libavif has no ICC API to call:
+    ///   `avifImageSetProfileICC` exists too (see `avif_codec::encode`'s own
+    ///   doc comment). It's simply not wired up, a deliberate scope cut, not
+    ///   a hard capability limit the way it is for WebP/GIF below. (This
+    ///   previously noted that AVIF was encode-only. It is not any more -
+    ///   #67 added decode via libavif/dav1d, see
     ///   `crate::services::image::avif_codec` and the AVIF arm of
     ///   `decode_with_limits` above - so an AVIF *source*'s metadata now
     ///   reaches this path too, not only JPEG/PNG/WebP sources.)
@@ -975,16 +978,18 @@ impl ImageService {
         // `write_to` builds internally, it's also the only way to reach
         // `ImageEncoder::set_icc_profile` (#33), so the same encoder value
         // now carries both the requested quality and the forwarded colour
-        // profile. AVIF (#49) similarly goes through an explicit
-        // `AvifEncoder::new_with_speed_quality` rather than `write_to`'s
-        // default (`AvifEncoder::new`, which hardcodes quality 80/speed 4 -
-        // the same defaults this crate uses, but naming them explicitly
-        // lets `params.quality` (the `q:` processing option) override it,
-        // measured in `adr/0005-avif-measurement-libavif-mozjpeg.md`,
-        // which supersedes `adr/0004` - note the "quality 80/speed 4"
-        // defaults named above were `ravif`'s, and #68 replaced that
-        // encoder with libavif/AOM). GIF is unaffected
-        // and keeps going through `write_to` exactly as before.
+        // profile. AVIF (#49) similarly resolves an explicit quality rather
+        // than relying on `write_to`'s default, but as of #68 it's handed to
+        // `crate::services::image::avif_codec::encode` (libavif/AOM), not
+        // `image::codecs::avif::AvifEncoder::new_with_speed_quality` - so
+        // `params.quality` (the `q:` processing option) still overrides
+        // `DEFAULT_AVIF_QUALITY` the same way #49 originally wired it up,
+        // just against AOM's own `avifEncoder.quality`/`speed` fields now,
+        // not `ravif`'s. Measured in
+        // `adr/0005-avif-measurement-libavif-mozjpeg.md`, which supersedes
+        // `adr/0004` (whose numbers were `ravif`'s and are void post-#68).
+        // GIF is unaffected and keeps going through `write_to` exactly as
+        // before.
         //
         // PNG has no quality knob in `params` to honour - `CompressionType`
         // is a fixed lossless setting, not a continuous 0-100 scale, and
@@ -995,14 +1000,18 @@ impl ImageService {
         // #33: `icc_profile`, if the source carried one, is forwarded to
         // the PNG/JPEG encoders - both support embedding it
         // (`image-0.25.10/src/codecs/{png,jpeg/encoder}.rs`). WebP and AVIF
-        // are the formats this can't cover: the `webp` crate (0.3.1, this
-        // service's only route to *lossy* WebP encoding - see the doc
-        // comment above) and `image`'s `AvifEncoder` have no ICC-profile API
-        // at all, so a source colour profile is still dropped on those
-        // paths. Fixing that would mean either switching encoders or
-        // patching raw ICC chunks into the container format by hand - real
-        // work, not a small addition, so it's left as follow-up rather than
-        // half-done here.
+        // are the formats this can't cover today, for two different
+        // reasons: the `webp` crate (0.3.1, this service's only route to
+        // *lossy* WebP encoding - see the doc comment above) has no
+        // ICC-profile API at all, while `avif_codec::encode` (libavif/AOM,
+        // see that function's own doc comment) simply doesn't thread one
+        // through, even though libavif exposes `avifImageSetProfileICC` for
+        // exactly this - a real gap, but a "not wired up" one for AVIF, not
+        // a hard capability limit the way it is for WebP. Fixing WebP would
+        // mean switching encoders or patching raw ICC chunks into the
+        // container format by hand; fixing AVIF would mean wiring up the
+        // libavif call that already exists. Neither is a small addition, so
+        // both are left as follow-up rather than half-done here.
         //
         // #5: `exif_metadata` (resolved above, already `None` if
         // `params.strip_metadata` or unavailable) follows a *different*
@@ -1028,33 +1037,11 @@ impl ImageService {
                     .context(format!("Failed to encode image to {:?}", output_format))?
             }
             ImageFormat::Png => {
-                let estimated_size = Self::estimate_output_size(&img, &output_format);
-                let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+                let icc_ref = icc_profile.as_deref();
+                let exif_ref = exif_metadata.as_deref();
 
-                let mut encoder = image::codecs::png::PngEncoder::new_with_quality(
-                    &mut buf,
-                    image::codecs::png::CompressionType::Best,
-                    image::codecs::png::FilterType::Adaptive,
-                );
-                if let Some(icc) = icc_profile {
-                    // `PngEncoder::set_icc_profile` only fails for
-                    // genuinely unsupported encoders, never for
-                    // `PngEncoder` itself - ignore failure rather than turn
-                    // a best-effort colour-fidelity improvement into a hard
-                    // request error.
-                    let _ = encoder.set_icc_profile(icc);
-                }
-                if let Some(exif) = exif_metadata {
-                    // #5: same best-effort spirit as `set_icc_profile` just
-                    // above - `PngEncoder::set_exif_metadata` only fails for
-                    // an encoder that doesn't support it at all, never for
-                    // `PngEncoder` itself.
-                    let _ = encoder.set_exif_metadata(exif);
-                }
-                img.write_with_encoder(encoder)
-                    .context(format!("Failed to encode image to {:?}", output_format))?;
-
-                buf.into_inner()
+                Self::encode_png(&img, icc_ref, exif_ref)
+                    .context(format!("Failed to encode image to {:?}", output_format))?
             }
             // #76: routed through `Self::encode_jpeg` (mozjpeg/libjpeg-turbo)
             // instead of `image::codecs::jpeg::JpegEncoder` so
@@ -2172,6 +2159,65 @@ impl ImageService {
         };
 
         Ok(memory.to_vec())
+    }
+
+    /// Encodes `img` to PNG via an explicit `PngEncoder::new_with_quality`
+    /// rather than `DynamicImage::write_to`'s default `CompressionType`
+    /// (`Fast` - `image-0.25.10/src/codecs/png.rs`'s
+    /// `CompressionType::default()`): `CompressionType::Best` +
+    /// `FilterType::Adaptive` instead, a real, dependency-free size win for
+    /// #60 that doesn't touch `Cargo.toml` - `PngEncoder` and its
+    /// `CompressionType`/`FilterType` enums are already part of the `image`
+    /// crate's own public API under the `png` feature this crate already
+    /// depends on, not a new dependency. PNG has no quality knob in
+    /// `ResizeQuery` to honour - `CompressionType` is a fixed lossless
+    /// setting, not a continuous 0-100 scale, and `fq:png:N` is rejected at
+    /// parse time (`src/modules/url/options.rs`) rather than silently
+    /// accepted and ignored here.
+    ///
+    /// `icc_profile`/`exif_metadata` are both best-effort: `set_icc_profile`/
+    /// `set_exif_metadata` only fail for an encoder that doesn't support
+    /// them at all, never for `PngEncoder` itself, so a failure here is
+    /// silently ignored rather than turned into a hard request error - same
+    /// spirit as `encode_jpeg`'s `write_icc_profile` call below.
+    ///
+    /// `pub` (like `encode_webp` above) so `benches/encode.rs` can benchmark
+    /// the exact path production uses, instead of duplicating the
+    /// `CompressionType::Best`/`FilterType::Adaptive` settings by hand - that
+    /// duplication is exactly what let the bench drift to `write_to`'s
+    /// default `Fast` compression for months, recording every historical
+    /// `encode/png` number roughly 56x too fast (see `benches/encode.rs`'s
+    /// own module doc comment for the discovery and fix).
+    pub fn encode_png(
+        img: &DynamicImage,
+        icc_profile: Option<&[u8]>,
+        exif_metadata: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
+        let estimated_size = Self::estimate_output_size(img, &ImageFormat::Png);
+        let mut buf = Cursor::new(Vec::with_capacity(estimated_size));
+
+        let mut encoder = image::codecs::png::PngEncoder::new_with_quality(
+            &mut buf,
+            image::codecs::png::CompressionType::Best,
+            image::codecs::png::FilterType::Adaptive,
+        );
+        if let Some(icc) = icc_profile {
+            // `PngEncoder::set_icc_profile` only fails for genuinely
+            // unsupported encoders, never for `PngEncoder` itself - ignore
+            // failure rather than turn a best-effort colour-fidelity
+            // improvement into a hard request error.
+            let _ = encoder.set_icc_profile(icc.to_vec());
+        }
+        if let Some(exif) = exif_metadata {
+            // #5: same best-effort spirit as `set_icc_profile` just above -
+            // `PngEncoder::set_exif_metadata` only fails for an encoder that
+            // doesn't support it at all, never for `PngEncoder` itself.
+            let _ = encoder.set_exif_metadata(exif.to_vec());
+        }
+        img.write_with_encoder(encoder)
+            .context("Failed to encode image to Png")?;
+
+        Ok(buf.into_inner())
     }
 
     /// Encodes `img` to JPEG via `mozjpeg::Compress`/libjpeg-turbo instead
@@ -6177,7 +6223,10 @@ mod tests {
 
     /// `params.quality` (the `q:` processing option) must actually change
     /// AVIF output size - unlike the pre-existing WebP/JPEG paths, #49
-    /// wires it through to `AvifEncoder::new_with_speed_quality`.
+    /// wires it through (now, post-#68, via
+    /// `crate::services::image::avif_codec::encode`'s own `quality`
+    /// parameter, libavif/AOM's `avifEncoder.quality`, rather than the old
+    /// `AvifEncoder::new_with_speed_quality`).
     #[test]
     fn avif_quality_changes_output_size() {
         let bytes = fixtures::photo_like();
@@ -7843,14 +7892,18 @@ mod tests {
         );
     }
 
-    /// #5's per-format matrix: unlike ICC (which AVIF's encoder genuinely
-    /// cannot carry at all), AVIF output *can* keep Exif -
-    /// `image::codecs::avif::AvifEncoder` overrides `set_exif_metadata`
-    /// (verified against `image-0.25.10/src/codecs/avif/encoder.rs`). This
-    /// crate has no AVIF *decoder* (`ImageFormat::Avif`'s own doc comment),
-    /// so the only way to check the actual output is a raw byte search for
-    /// the GPS fingerprint, rather than decoding it back - unlike every
-    /// other format-matrix test above.
+    /// #5's per-format matrix: unlike ICC (not threaded through for AVIF -
+    /// see `avif_codec::encode`'s own doc comment for why that's a
+    /// "not wired up" gap, not a hard capability limit), AVIF output *can*
+    /// keep Exif - `crate::services::image::avif_codec::encode`
+    /// (libavif/AOM, #68's replacement for
+    /// `image::codecs::avif::AvifEncoder`) writes it via
+    /// `avifImageSetMetadataExif`. #67 later added an AVIF *decoder*
+    /// (`avif_codec::decode`), but it only returns pixels plus
+    /// `icc_profile`/`exif_metadata` as opaque blobs, not a way to assert on
+    /// tag-level EXIF content, so a raw byte search for the GPS fingerprint
+    /// in the encoded output is still simpler than decoding it back -
+    /// unlike every other format-matrix test above.
     #[test]
     fn strip_metadata_false_keeps_gps_in_avif_output() {
         let bytes = fixtures::jpeg_with_gps_exif(1);

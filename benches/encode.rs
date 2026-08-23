@@ -18,14 +18,15 @@
 //! trade encode time for a real size win. Every historical `encode/png`
 //! number in the baseline file therefore describes a code path that never
 //! executes in production, off by roughly 40x on this corpus. `png_best`
-//! below now calls that exact encoder configuration; `png_default` is kept
-//! alongside it, clearly labelled, so the cost of the `Best` setting stays
-//! visible instead of turning into an unexplained jump. There is no
-//! dedicated `ImageService::encode_png` function to call directly the way
-//! the WebP/JPEG cases below do (the PNG encoder is built inline inside
-//! `encode_single_image`, not factored out) - see this change's own report
-//! for a follow-up suggestion to extract one so this can't drift again
-//! silently.
+//! below now calls `ImageService::encode_png` directly, the same way the
+//! WebP/JPEG cases below call `encode_webp`/`encode_jpeg` - that inline
+//! `PngEncoder` construction has since been extracted out of
+//! `encode_single_image` into its own `pub fn encode_png`, so this case no
+//! longer duplicates the `CompressionType::Best`/`FilterType::Adaptive`
+//! settings by hand and can't drift from production again the way it did
+//! here. `png_default` is kept alongside it, clearly labelled, so the cost
+//! of the `Best` setting stays visible instead of turning into an
+//! unexplained jump.
 //!
 //! WebP calls `ImageService::encode_webp`, the dedicated lossy-WebP path
 //! (via the `webp` crate) that `process_image_blocking` actually uses - the
@@ -58,7 +59,6 @@ use emgr::services::image::handler::{
     DEFAULT_AVIF_QUALITY, DEFAULT_AVIF_SPEED, DEFAULT_JPEG_QUALITY, DEFAULT_WEBP_QUALITY,
     ImageService,
 };
-use image::codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder};
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 
@@ -107,24 +107,16 @@ fn bench_encode(c: &mut Criterion) {
             });
         });
 
-        // `png_best`: exactly `encode_single_image`'s `ImageFormat::Png` arm
-        // (`src/services/image/handler.rs`) - `CompressionType::Best` +
-        // `FilterType::Adaptive`, no ICC/EXIF payload set (these fixtures
-        // carry neither, matching the common case those calls are skipped
-        // for). This is the production path; see the module doc comment
-        // above for why it's duplicated here rather than called through a
-        // shared function.
+        // `png_best`: `ImageService::encode_png`, the exact function
+        // `encode_single_image`'s `ImageFormat::Png` arm
+        // (`src/services/image/handler.rs`) calls - `CompressionType::Best`
+        // + `FilterType::Adaptive`, no ICC/EXIF payload here (`None`/`None`,
+        // matching the common case where those calls are skipped). This is
+        // the production path, reached through the same shared function
+        // production uses - see the module doc comment above for why that
+        // matters.
         group.bench_function(BenchmarkId::new("png_best", *kind), |b| {
-            b.iter(|| {
-                let mut buf = Cursor::new(Vec::new());
-                let encoder = PngEncoder::new_with_quality(
-                    &mut buf,
-                    CompressionType::Best,
-                    PngFilterType::Adaptive,
-                );
-                img.write_with_encoder(encoder).expect("encode fixture");
-                buf.into_inner()
-            });
+            b.iter(|| ImageService::encode_png(img, None, None).expect("encode fixture"));
         });
 
         group.bench_function(BenchmarkId::new("webp", *kind), |b| {
