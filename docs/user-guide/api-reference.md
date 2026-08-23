@@ -371,21 +371,24 @@ looks like. Recognised extensions
 |---|---|---|
 | `jpg` / `jpeg` | JPEG | Encoded via `mozjpeg`/libjpeg-turbo (not `image`'s built-in encoder) so `jpgo:`/`mb:` actually reach the encoder. |
 | `png` | PNG | Fixed `CompressionType::Best`; no continuous quality knob (`fq:png:N` is rejected at parse time). |
-| `webp` | WebP | Via the `webp` crate; `webpo:lossless` for lossless. |
-| `avif` | AVIF | **Encode-only.** See the AVIF note below. |
+| `webp` | WebP | Decoded via `libwebp` (real libwebp via FFI, not `image-webp`'s pure-Rust decoder); encoded via the `webp` crate. `webpo:lossless` for lossless. |
+| `avif` | AVIF | **Encode and decode.** Both directions via `libavif` (`src/services/image/avif_codec.rs`): AOM for encode, dav1d for decode. See the AVIF note below. |
 | `gif` | GIF | Supports decode and encode, including multi-frame animation when the source is itself animated and the request is `.gif` or `.webp`. |
 | `auto` | Negotiated | Not a real format — resolved against the request's `Accept` header before any `ResizeQuery` is built. See [`.auto` content negotiation](examples.md#auto-content-negotiation) in the examples. |
 
 An unrecognised or missing extension returns `400`
 (`src/modules/url/source.rs:84-97`).
 
-**AVIF is encode-only.** This service can *produce* AVIF output (via the
-pure-Rust `ravif` encoder, part of the `image` crate's default `avif`
-feature), but it **cannot decode an AVIF source** — that needs the
-separate `avif-native` cargo feature (`dav1d`, a C library), which is not
-enabled. An `.avif` *source* URL fails to decode; an `.avif` *output*
-extension works fine (`ImageFormat`'s doc comment,
-`src/models/params.rs:8-20`).
+**AVIF now supports both directions.** This service can both *produce*
+AVIF output and *decode* an AVIF source, via `libavif` — AOM as the AV1
+encode backend, dav1d as the decode backend, both compiled from source
+and statically linked (`src/services/image/avif_codec.rs`; see that
+module's own doc comment for why this dependency was chosen over the
+alternatives evaluated and why SVT-AV1 isn't wired in as a second encode
+backend). This replaces the pure-Rust `ravif`/`rav1e` encoder this
+service previously shipped — `image`'s own `avif`/`avif-native` features
+are not used for either direction any more (`ImageFormat`'s doc comment,
+`src/models/params.rs`).
 
 **HEIC is not supported at all** — neither as a source nor as an output
 extension. `heic` is not in `KNOWN_EXTENSIONS`, so a `.heic` request

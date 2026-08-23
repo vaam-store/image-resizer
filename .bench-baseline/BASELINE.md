@@ -417,3 +417,114 @@ meant the warm path was doing decode work it should not.
 client re-fetches; the same architecture is why warm costs 0.39 ms. The cold
 penalty cannot be removed without giving up the warm win, so which one matters
 is set by production cache-miss rate — a number neither benchmark measures.
+
+## PNG encode correction — `fix/png-encode-benchmark` (2026-08-23)
+
+**Every `encode/png` figure in every table above (2.09 ms, 1.70 ms, 1.71 ms)
+measured the wrong code path — a fourth instance of the same class of trap
+this file already documents for `decode/jpeg` (dependency bump), `pipeline
+alpha -> resize webp` (encoder swap), and `encode/webp` (lossless vs. lossy).
+This one is worse than those three: it wasn't caused by an upstream change or
+a later encoder cutover invalidating an old number — the bench was wrong from
+the moment #60 shipped and stayed wrong across every table above that
+includes it.**
+
+`benches/encode.rs`'s PNG case called `DynamicImage::write_to`, which builds
+a `PngEncoder` with the `image` crate's *default* `CompressionType` (`Fast`).
+Production never calls that for PNG. #60's `encode_single_image`
+(`src/services/image/handler.rs`, `ImageFormat::Png` match arm, ~line 985)
+builds an explicit encoder instead:
+
+```rust
+let mut encoder = image::codecs::png::PngEncoder::new_with_quality(
+    &mut buf,
+    image::codecs::png::CompressionType::Best,
+    image::codecs::png::FilterType::Adaptive,
+);
+```
+
+— confirmed by reading that arm directly (not assumed from the comment
+directly above it, which names `CompressionType::Best` correctly but doesn't
+say `FilterType`; a private helper in `benches/fixtures.rs`,
+`encode_png_best_compression` — used only to generate the `bomb()` fixture,
+never wired into the actual `encode/png` benchmark — uses `FilterType::Up`
+instead of `Adaptive`, which is close enough to have been a plausible but
+wrong guess at production's actual setting if taken on trust instead of read
+from `handler.rs` itself).
+
+`CompressionType::Best` is dramatically more expensive than `Fast` — it's
+`Best`, not a free lunch — so every historical `encode/png` number describes
+an encode path that is roughly two orders of magnitude cheaper than what
+production actually pays per PNG response. **Do not read `2.09 ms` /
+`1.70 ms` / `1.71 ms` in any table above as PNG's encode cost.** They measure
+`CompressionType::Fast`, which production does not use.
+
+`benches/encode.rs` now has two PNG cases: `png_default` (the old
+`write_to`/`Fast` behaviour, kept and clearly labelled rather than deleted,
+so the cost of `Best` stays visible as an explained delta instead of turning
+into a mystery jump) and `png_best` (`CompressionType::Best` +
+`FilterType::Adaptive`, exactly `encode_single_image`'s settings — this is
+now the one that should be read as "PNG's production encode cost"). There is
+no dedicated `ImageService::encode_png` to call directly the way
+`encode_webp`/`encode_jpeg` are called (the PNG encoder is built inline
+inside `encode_single_image`, not factored into its own function), so
+`png_best` duplicates the two settings rather than calling through a shared
+path — flagged as a follow-up worth doing so this can't silently drift again.
+
+Real numbers, same command/profile/machine as every table above
+(darwin/arm64, criterion default/release,
+`cargo bench --features local_fs -- --sample-size 20 --measurement-time 2 --warm-up-time 1 encode`),
+captured on this branch:
+
+| Bench | Median | Note |
+|---|---:|---|
+| encode/png_default | 1.77 ms | `CompressionType::Fast` — what every old `encode/png` number above actually measured. Not production. |
+| encode/png_best | **99.31 ms** | `CompressionType::Best` + `FilterType::Adaptive` — exactly `encode_single_image`'s PNG arm. **This is production's real PNG encode cost.** |
+| encode/webp | 24.66 ms | unchanged, re-run for cross-check against the 23.79–24.26 ms range in the tables above — consistent |
+| encode/jpeg_baseline | 928 µs | unchanged, re-run for cross-check against 924–933 µs above — consistent |
+| encode/jpeg_progressive | 17.50 ms | unchanged, re-run for cross-check — consistent |
+| encode/jpeg_444 | 1.28 ms | unchanged, re-run for cross-check — consistent |
+| encode/jpeg_444_progressive | 23.77 ms | unchanged, re-run for cross-check — consistent |
+
+`png_best` / `png_default` ≈ **56×** on this synthetic 800×450 gradient+noise
+fixture (`benches/fixtures.rs::photo_like`, resized). A separate check on 24
+real downloaded photos (not this repeatable synthetic corpus) put the same
+ratio at roughly 40×; both numbers say the same thing — `Best` costs one to
+two orders of magnitude more than `Fast` — and the exact multiplier is
+fixture-dependent (compressibility of the source pixels changes how much
+extra work `Best`'s slower DEFLATE search actually does), so neither is "the"
+canonical ratio. Use `png_best`'s absolute number, not the ratio, when
+reasoning about production PNG cost.
+
+The `pipeline flat -> resize_png` rows elsewhere in this file (32.81 ms /
+8.58 ms / 8.64 ms at various points above) are **not** affected by this
+correction in the same way — `flat` is `fixtures.rs`'s solid-colour fixture,
+which `Best` compresses to almost nothing almost immediately (DEFLATE on a
+constant input is cheap regardless of compression level), so that pipeline
+number was never dominated by the `Fast`-vs-`Best` gap the way a
+noise/photo-like PNG source is. It's mentioned here only so a reader doesn't
+assume it needs the same ×56 correction applied — it doesn't, and doing so
+would overstate the pipeline cost.
+
+**Other bench/production mismatches checked for while fixing this one (none
+found beyond PNG):** every other case in `benches/encode.rs` and
+`benches/decode.rs` was compared line-by-line against
+`src/services/image/handler.rs`'s actual encoder/decoder construction —
+`encode_webp` (calls `ImageService::encode_webp` directly, matches),
+`encode_jpeg_*` (calls `ImageService::encode_jpeg` directly with the same
+quality/progressive/subsampling knobs `encode_single_image` resolves,
+matches), `decode/jpeg` (calls `ImageService::mozjpeg_decode(bytes, 8)`,
+matching the `scale_num == 8`/no-DCT-reduction case `decode_jpeg_scaled`
+falls back to, matches), `decode/png` and `decode/webp` (call
+`image::load_from_memory_with_format`, the same call
+`decode_with_image_crate` makes for those formats — `decode_with_image_crate`
+does a little more work around it, reading ICC/EXIF/orientation off the
+decoder and applying #26's allocation-guard reservation before the pixel
+decode, but the pixel-decode cost itself, which is what these benches
+measure, is the same call). AVIF and GIF have no bench case in
+`benches/encode.rs` at all (not a mismatch — nothing there to measure the
+wrong path — just missing coverage): GIF still goes through plain `write_to`
+in production exactly as `write_to` would measure it, and AVIF goes through
+`AvifEncoder::new_with_speed_quality` with `DEFAULT_AVIF_QUALITY`/
+`DEFAULT_AVIF_SPEED`. Neither was added here, to keep this change scoped to
+the PNG defect and the audit that found it.
