@@ -56,14 +56,16 @@ plus plain `#[test]` (or `#[tokio::test]` for anything `async`) functions.
 
 ### Integration tests in `tests/`
 
-Three files today, each a separate compiled crate exercising the real
+Five files today, each a separate compiled crate exercising the real
 public API rather than internals:
 
 | File | Covers |
 |---|---|
 | `tests/storage_key_validation.rs` | GH #23 - arbitrary file read via an unvalidated `key`, through the real `StorageService` backed by a real `local_fs` backend (traversal, absolute paths, percent-decoded forms). |
 | `tests/storage_local_fs_atomicity.rs` | GH #38 - non-atomic local_fs writes and directories mis-treated as cache hits, through `StorageService` on a real temp directory. |
+| `tests/storage_s3_handler.rs` | The S3/MinIO backend (`src/services/storage/s3_handler.rs`), previously untested: `upload_image_with_ttl`, `check_cache`, `get_image`, `delete`, and the S3 error-mapping contract, against an in-process fake-S3 HTTP server driving a real `aws_sdk_s3::Client` (not a trait-level double - see the file's own module doc for why). |
 | `tests/fixtures_smoke.rs` | The deterministic fixture image generator shared with the criterion benches (`benches/fixtures.rs` - imported via `#[path = "../benches/fixtures.rs"]`) and the `benchmark` load-test bin: confirms fixtures decode and are byte-identical across runs. |
+| `tests/dssim_harness.rs` | A throwaway, `#[ignore]`d manual-verification harness for #63 stage 2 (mozjpeg DCT-scaled decode) - dumps pipeline output for the real photo corpus to a path named by `DSSIM_OUT`, for offline `dssim` comparison. Its own header comment says "delete before merging"; it is not part of the regular suite (`cargo test` skips `#[ignore]`d tests by default) and not a pattern to follow for new tests. |
 
 Rather than mocking storage/network dependencies, these tests spin up
 real backends against real temp directories (`local_fs`) or a real
@@ -108,6 +110,29 @@ binary against a running server, not a criterion bench - see its own
 (with staleness caveats - read `BASELINE.md` there before diffing a fresh
 run against it and attributing the whole delta to your own change).
 
+#### Two fixture kinds: `synthetic` and `photo`
+
+`benches/decode.rs`, `benches/encode.rs` and `benches/pipeline.rs` each run
+their cases against two distinct fixture kinds, named literally
+`"synthetic"`/`"photo"` in their `BenchmarkId`s (`benches/decode.rs:79`,
+`benches/encode.rs:66`) so they show up as separate rows/groups in
+criterion's own report:
+
+- **`synthetic`** - `benches/fixtures.rs`'s deterministic, code-generated
+  images (`gradient_noise_rgb`, `photo_like`, ...), seeded so every run is
+  byte-identical across machines. Nothing here is a committed binary asset.
+- **`photo`** - two real, public-domain NASA photographs committed under
+  `benches/fixtures/real/` (`blue-marble.jpg`, `earthrise.jpg`; provenance
+  and licence in `benches/fixtures/real/ATTRIBUTION.md`), loaded through
+  `fixtures::real_photo_sized`/`real_photo_secondary_sized`.
+
+Both exist because i.i.d. per-pixel noise compresses toward an
+incompressible floor that flattens real differences between codecs -  a
+distortion that turns out to affect encode *cost*, not just output size
+(`benches/encode.rs:1-8`). The `photo` kind is what actually exercises
+libwebp/dav1d/AOM/mozjpeg the way a real request would; `synthetic` stays
+for fast, deterministic micro-comparisons.
+
 ### Three-way harness against imgproxy (`bench-imgproxy/`)
 
 A `docker compose`-based harness that runs `imgproxy`, `emgr` on
@@ -115,7 +140,14 @@ A `docker compose`-based harness that runs `imgproxy`, `emgr` on
 generated image corpus, driven by [k6](https://k6.io/). This is
 end-to-end (over HTTP, through Docker) rather than in-process, so it
 measures something criterion can't - including the local_fs-vs-S3
-storage-backend difference. Not run in CI; see
+storage-backend difference. `bench-imgproxy/fixtures/generate.py`'s corpus
+now includes WebP and AVIF source images (`photo_1080p.webp`,
+`photo_1080p.avif`) alongside the JPEG sources, so decode of every
+supported format is exercised, not just JPEG-in. The driver's `FORMATS`
+env var controls which *output* formats each request cycles through and
+now defaults to `jpg,png,webp,avif` (`bench-imgproxy/driver/k6-script.js:75`)
+- set `FORMATS=jpg,png,webp` to reproduce a pre-AVIF-era run. Not run in
+CI; see
 [`bench-imgproxy/README.md`](https://github.com/vaam-store/image-resizer/blob/main/bench-imgproxy/README.md)
 for the full quick start and what the harness does and does not prove -
 its own `results/` directory (gitignored) holds past run output.

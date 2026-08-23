@@ -129,13 +129,13 @@ value for just that one field.
 
 | Variable | Description | Default |
 |---|---|---|
-| `PERFORMANCE_PROFILE` | One of `high_throughput`, `low_latency`, `memory_efficient`. Unset falls back to per-field defaults below rather than a named preset. | _unset_ |
+| `PERFORMANCE_PROFILE` | One of `high_throughput`, `low_latency`, `memory_efficient` (case-insensitive). Unset (or blank/whitespace-only) falls back to per-field defaults below rather than a named preset. **An unrecognised, non-blank value (e.g. a typo like `hgh_throughput`) refuses to start the process at all**, mirroring `SigningConfig`/`MetricsAuthConfig`'s fail-closed convention, rather than silently falling back to per-field defaults with a different effective configuration than the operator asked for — issue #83. | _unset_ |
 | `MAX_CONCURRENT_DOWNLOADS` | Maximum concurrent source-image downloads. | `20` |
 | `MAX_CONCURRENT_PROCESSING` | Maximum concurrent image-processing tasks. | Host core count |
 | `HTTP_TIMEOUT_SECS` | Timeout for the source-image HTTP client. | `30` |
 | `MAX_IMAGE_SIZE_MB` | Maximum accepted source image size. | `50` |
 | `CPU_THREAD_POOL_SIZE` | CPU-bound thread pool size for decode/resize/encode. | Host core count |
-| `ENABLE_HTTP2` | Enable HTTP/2 for the source-image HTTP client. | `false` |
+| `ENABLE_HTTP2` | Enable HTTP/2 for the source-image HTTP client. | `true` (`false` under the `memory_efficient` profile, which trades it away for lower per-connection memory) |
 | `CONNECTION_POOL_SIZE` | Source-image HTTP client's per-host connection pool size. | `50` |
 | `KEEP_ALIVE_TIMEOUT_SECS` | Source-image HTTP client's keep-alive timeout. | `60` |
 

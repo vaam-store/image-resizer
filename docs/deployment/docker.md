@@ -53,6 +53,31 @@ If you ever need to bump either base image, bump both in lockstep and
 actually run the resulting image before merging - don't rely on CI's
 static checks to catch a glibc mismatch, they won't.
 
+### Native codec build tools - builder-only, runtime image is unchanged
+
+The four native codec libraries this service links against - `mozjpeg`
+(JPEG), `libwebp` (WebP), and `libavif` + AOM + dav1d (AVIF encode/decode) -
+are all built from source, as part of the normal `cargo build`, by their
+respective `*-sys` crates' own `build.rs`. That needs real build tooling
+present in the **builder** stage only:
+
+- `nasm` - `mozjpeg-sys` needs it to build libjpeg-turbo's x86_64 SIMD
+  paths (not needed on aarch64, but CI also builds `linux/amd64`, so it's
+  installed unconditionally).
+- `cmake` - `libavif-sys`/`libaom-sys` build `libavif`/AOM through it.
+- `meson` + `ninja-build` - `libdav1d-sys` builds dav1d through them.
+
+All four end up **statically linked into the compiled binary** - the
+builder never installs a runtime package for any of them (no
+`libjpeg-turbo8`, `libwebp7`, `libaom3`, `libdav1d7`, ...), and the
+`gcr.io/distroless/cc-debian12` runtime stage below only ever `COPY
+--from=`s the compiled `emgr`/`healthcheck` binaries, never a shared
+library. This is why the runtime image's own shape (base, size, contents)
+is unaffected by any of this: none of the four `deploy` stages, the
+`base_deploy` they build on, or the runtime `HEALTHCHECK`/`ENTRYPOINT`
+setup needed any change for #63/#66/#67/#68 to land - only the builder
+stage's `apt-get install` line and the Rust dependency graph did.
+
 ## Running the container
 
 `emgr` fails closed at startup - see

@@ -748,10 +748,11 @@ impl ImageService {
     ///   encoder overrides `set_exif_metadata` but not `set_icc_profile`,
     ///   `image-0.25.10/src/codecs/avif/encoder.rs`) - the two are
     ///   genuinely independent capabilities on this encoder, not a package
-    ///   deal. AVIF is encode-only in this crate (no `avif-native` decode
-    ///   feature - see `ImageFormat::Avif`'s own doc comment,
-    ///   `src/models/params.rs`), so this only matters when converting a
-    ///   JPEG/PNG/WebP *source*'s metadata into an AVIF *output*.
+    ///   deal. (This previously noted that AVIF was encode-only. It is not
+    ///   any more - #67 added decode via libavif/dav1d, see
+    ///   `crate::services::image::avif_codec` and the AVIF arm of
+    ///   `decode_with_limits` above - so an AVIF *source*'s metadata now
+    ///   reaches this path too, not only JPEG/PNG/WebP sources.)
     /// - **WebP**: **unsupported, always** - this crate's lossy WebP output
     ///   goes through the standalone `webp` crate (`Self::encode_webp`), not
     ///   `image`'s own `WebPEncoder` (see that function's own doc comment
@@ -7596,10 +7597,11 @@ mod tests {
 
     /// The exact GPS `GPSLatitudeRef` marker byte (`fixtures::jpeg_with_gps_exif`
     /// encodes latitude ref `"N"`) - a small, distinctive fingerprint used
-    /// by the AVIF test below, which (unlike JPEG/PNG/WebP) this crate has
-    /// no decoder for at all (`ImageFormat::Avif`'s own doc comment,
-    /// `src/models/params.rs`: AVIF is encode-only here), so raw byte
-    /// presence is the only way to check its output.
+    /// by the AVIF test below. That test checks raw byte presence rather
+    /// than decoding the output: #67 did add an AVIF decoder
+    /// (`crate::services::image::avif_codec`), but round-tripping through
+    /// it would test the decoder as much as the metadata write, so the
+    /// fingerprint check is deliberately kept.
     const GPS_LATITUDE_REF_NORTH: &[u8] = b"N\0\0\0";
 
     /// #5: `sm` absent must default to *stripping* EXIF - imgproxy's own

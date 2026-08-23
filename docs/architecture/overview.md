@@ -25,7 +25,7 @@ sequenceDiagram
     Note over emgr: src/modules/router/router.rs:48<br/>route "/{signature}/{*rest}"
     emgr->>emgr: url::split + verify_signature<br/>(src/modules/api/resize.rs:45-47,<br/>src/modules/signing/verify.rs:31)
     emgr->>emgr: SignedRequest::parse_with_config<br/>(src/modules/url/mod.rs)
-    emgr->>emgr: CacheService::generate_key<br/>(src/services/cache/handler.rs:139)
+    emgr->>emgr: CacheService::generate_key<br/>(src/services/cache/handler.rs:173)
     emgr->>Cache: check_cache(key)<br/>(src/services/resize/handler.rs:183)
     alt cache hit
         Cache-->>emgr: true
@@ -33,12 +33,12 @@ sequenceDiagram
     else cache miss
         Cache-->>emgr: false
         emgr->>emgr: become single-flight leader<br/>(src/services/resize/handler.rs:205-233)
-        emgr->>Guard: fetch_validated(source url)<br/>(src/services/image/handler.rs:173)
+        emgr->>Guard: fetch_validated(source url)<br/>(src/services/image/handler.rs:204)
         Guard->>Guard: scheme + allowlist + resolve_validated_addr<br/>(src/services/image/source_guard.rs:147,180,356)
         Guard->>Origin: GET (pinned to validated addr)
         Origin-->>Guard: image bytes (streamed, size-capped)
         Guard-->>emgr: Bytes
-        emgr->>emgr: spawn_blocking: decode/resize/encode<br/>(src/services/image/handler.rs:407, 622)
+        emgr->>emgr: spawn_blocking: decode/resize/encode<br/>(src/services/image/handler.rs:438, 620-621)
         emgr->>Storage: upload_image_with_ttl(key, bytes)<br/>(src/services/resize/handler.rs:281)
         Storage-->>emgr: ok
         emgr-->>Client: 301 Location: storage/key<br/>(src/modules/api/resize.rs:139)
@@ -64,23 +64,30 @@ processed image directly on the original connection and has no server-side resul
 every request is reprocessed from scratch.
 
 This is not an incidental implementation detail; it is the architectural choice that produces both
-`emgr`'s strongest and weakest measured numbers, from `.bench-baseline/BASELINE.md`'s "Post-#67
-baseline" (2026-08-21, `local_fs` backend, medians of 3 runs):
+`emgr`'s strongest and weakest measured numbers. Across the three-way `bench-imgproxy/` runs recorded
+in `.bench-baseline/BASELINE.md` (several 2-VU, medians-of-3 sweeps across the `local_fs`/`s3`
+backends and both the pre- and post-AVIF `FORMATS` sweeps — the exact ratio moves with backend and
+fixture mix, roughly 3.3x-3.7x cold and 2.6x-2.9x throughput across those runs), the current
+headline position is:
 
-| Path | emgr (local_fs) | imgproxy | Ratio |
+| Path | emgr | imgproxy | Ratio |
 |---|---:|---:|---:|
-| Cold (cache miss), p50 | 66.82 ms | 20.50 ms | emgr 3.26x **slower** |
-| Warm (cache hit), p50 | 0.39 ms | 20.10 ms | emgr 51x **faster** |
+| Cold (cache miss), p50 | — | — | emgr **~3.48x slower** |
+| Cold (cache miss), throughput | — | — | emgr **~2.86x lower** |
+| Warm (cache hit), p50 | 0.39 ms | ~21 ms | not a processing comparison — see below |
 
 - **Cold path cost.** A cache miss pays for *two* HTTP round trips per delivered image
-  (`req/image = 2.00` in the baseline table) instead of imgproxy's one: the client requests the
-  resize, gets a 301, and re-fetches from storage. Part of the 66.82 ms is genuine decode/resize/
-  encode work, but part of it is this two-hop delivery shape itself — the same shape that makes the
-  warm path so cheap.
+  (`req/image = 2.00` in the baseline tables) instead of imgproxy's one: the client requests the
+  resize, gets a 301, and re-fetches from storage. Part of the cold-path time is genuine
+  decode/resize/encode work, but part of it is this two-hop delivery shape itself — the same shape
+  that makes the warm path so cheap.
 - **Warm path payoff.** A cache hit costs a single `check_cache` lookup (`src/services/resize/
   handler.rs:183`) and a redirect — no decode, no resize, no encode. `emgr` never touches the image
   pipeline for a repeat request; imgproxy has no equivalent and reprocesses every single request,
-  identical bytes or not.
+  identical bytes or not. **The warm figure above is not a processing-speed comparison and must not
+  be read as one**: imgproxy has no server-side result cache at all, so "0.39 ms vs ~21 ms" measures
+  an architectural difference (skip the whole pipeline vs. reprocess from scratch), not which engine
+  encodes faster.
 - **The trade is inherent, not a bug to fix.** The cold penalty cannot be removed without giving up
   the warm win — they are the same architecture viewed from two angles. Which one dominates in
   practice depends on production cache-hit rate, a number neither benchmark measures
@@ -88,7 +95,7 @@ baseline" (2026-08-21, `local_fs` backend, medians of 3 runs):
 - In production, imgproxy is normally deployed behind an external CDN that would absorb repeat
   requests the way `emgr`'s built-in cache does natively — so the honest framing is "`emgr`'s
   built-in result cache vs. imgproxy's reliance on an external one," not "`emgr` processes images
-  faster" (it measurably does not, cold: 3.26x slower).
+  faster" (it measurably does not — cold: ~3.48x slower p50, ~2.86x lower throughput).
 
 ## Storage backends
 
@@ -107,7 +114,7 @@ by Cargo feature and, when more than one is compiled in, by the `STORAGE_TYPE` e
 The trait also carries an optional per-entry TTL (`upload_image_with_ttl`); `None` means "never
 expires," the only behaviour available before TTL support existed, and still the default —
 `ResizeService` has no config knob feeding a real duration into it today (`src/services/resize/
-handler.rs:139-146`).
+handler.rs:126-135`).
 
 ## Concurrency model
 
@@ -116,10 +123,10 @@ handler.rs:139-146`).
 - **CPU-bound work on `spawn_blocking`.** Decode/resize/encode runs on tokio's managed blocking
   thread pool, not a hand-rolled `rayon` pool — `rayon`'s value proposition is intra-job work-
   stealing parallelism, and nothing in this pipeline fans a single image's work out across threads
-  (`src/services/image/handler.rs:327-345`). `rayon` is not a dependency of this crate.
+  (`src/services/image/handler.rs:358-373`). `rayon` is not a dependency of this crate.
 - **Two independent semaphores** bound in-flight work: `download_semaphore` caps concurrent source
   fetches, `processing_semaphore` caps concurrent CPU-bound decode/resize/encode jobs
-  (`src/services/image/handler.rs:96-105`). Both shed load with an error rather than queue when
+  (`src/services/image/handler.rs:117-127`). Both shed load with an error rather than queue when
   exhausted.
 - **Single-flight coalescing.** Once a cache miss is confirmed, concurrent requests for the same
   cache key share one leader's work instead of each downloading/processing/uploading independently
@@ -152,18 +159,18 @@ handler.rs:139-146`).
     attacker-controlled DNS answer at connect time can never be observed.
   - **Per-hop redirect revalidation:** redirects are followed manually (`reqwest`'s own redirect
     handling is disabled), and every check above re-runs for each hop's new location
-    (`fetch_validated`, `src/services/image/handler.rs:173-234`) — an `ALLOWED_SOURCES` match is
+    (`fetch_validated`, `src/services/image/handler.rs:204-278`) — an `ALLOWED_SOURCES` match is
     recomputed per hop, so a bypass on one allowlisted host never carries over to a redirect target
     that doesn't independently match.
 - **Streaming download size cap.** `Content-Length` is checked as a cheap early rejection, but the
   real enforcement streams the body and aborts once the running total exceeds the cap — closing the
   gap a dishonest origin or chunked transfer encoding (no `Content-Length`) would otherwise leave
-  open (`download_image`, `src/services/image/handler.rs:281-317`).
+  open (`download_image`, `src/services/image/handler.rs:291-347`).
 - **Decompression-bomb guard.** Image dimensions are read from the header only
   (`peek_dimensions`/`ImageReader::into_dimensions`) and checked against `MAX_SRC_RESOLUTION_MP`
   *before* any full decode is attempted, so a small-on-disk/huge-decoded source is rejected without
-  ever allocating the decoded buffer (`src/services/image/handler.rs:2669-2682`, `process_image_
-  blocking_with_limits`).
+  ever allocating the decoded buffer (`process_image_blocking_with_limits`'s call site,
+  `src/services/image/handler.rs:617-618`; `check_source_resolution`, `:3007-3024`).
 - **Strict storage-key grammar** (`src/services/storage/key_validation.rs`) rejects any key that
   doesn't match exactly what `CacheService::generate_key` can produce, closing IDOR/traversal
   against both the download route and every storage backend.
@@ -182,9 +189,16 @@ handler.rs:139-146`).
 - **Resampling** uses the `fast_image_resize` crate rather than `image`'s own `DynamicImage::resize`
   kernel — several times faster at equivalent measured quality (DSSIM); see `.bench-baseline/
   BASELINE.md`'s "Current baseline" section.
-- **WebP** encode/decode goes through the `webp` crate (real lossy libwebp), not the `image` crate's
+- **WebP encode** goes through the `webp` crate (real lossy libwebp), not the `image` crate's
   lossless-only WebP encoder. See `adr/0001-image-engine.md` (original rationale) and `adr/0003-
   webp-measurement.md` (corrected byte-size measurement on real photos).
+- **WebP decode** (#66) goes through a dedicated real-libwebp FFI path
+  (`ImageService::decode_webp_libwebp`/`libwebp_decode`, `src/services/image/handler.rs:3294`),
+  replacing the `image` crate's pure-Rust `image-webp` decoder — ~29% *slower* on the synthetic
+  fixture but ~2.24x *faster* on 24 real Kodak photographs (scratch-crate measurement, pixel-identical
+  DSSIM 0.0, `adr/0003-webp-measurement.md`), with a fallback to the `image`-crate decoder on any
+  libwebp failure. The synthetic-vs-real inversion is why the criterion suite now benches both
+  fixture kinds — see [Testing](../development/testing.md#two-fixture-kinds-synthetic-and-photo).
 - **AVIF encode and decode** both go through `libavif` (`src/services/image/avif_codec.rs`) — AOM
   for encode (replacing the pure-Rust `ravif`/`rav1e` encoder `adr/0004-avif-measurement.md`
   measured) and dav1d for decode (previously unsupported). See that module's own doc comment for
@@ -200,12 +214,15 @@ fully attacker-controlled — a fixed delimiter byte (e.g. `|` or `\0`) could ap
 itself and be used to forge a byte stream that collides with a different, legitimate parameter
 combination. A 4-byte big-endian length prefix makes every field boundary unambiguous regardless of
 the field's own content, so the mapping from `(field_1, .., field_n)` to the hashed stream is
-injective. The leading version byte (currently `9`) is bumped whenever the hashed layout or the
-encoder/decoder producing the cached bytes changes in a way that would otherwise let old and new
-entries collide or serve stale output — see the version history documented directly in that file's
-`CACHE_KEY_VERSION` doc comment, including a case where a bump was deliberately *not* taken (issue
-#67's decoder swap) because the output was measured perceptually identical and a bump would have
-forced a full reprocessing storm for zero visible benefit.
+injective. The leading version byte (currently `11`, `CACHE_KEY_VERSION`, `src/services/cache/
+handler.rs:147`) is bumped whenever the hashed layout or the encoder/decoder producing the cached
+bytes changes in a way that would otherwise let old and new entries collide or serve stale output —
+see the version history documented directly in that file's `CACHE_KEY_VERSION` doc comment,
+including a case where a bump was deliberately *not* taken (issue #67's WebP decoder swap to
+libwebp) because the output was measured perceptually identical (DSSIM 0.0 across 24 real photos)
+and a bump would have forced a full reprocessing storm for zero visible benefit. The two most recent
+bumps: v10 for #5's metadata-strip-by-default cutover, v11 for the AVIF encoder moving from
+`ravif`/`rav1e` to `libavif`/AOM.
 
 ## Request lifecycle, including rejections
 
@@ -219,7 +236,7 @@ stateDiagram-v2
     PathReceived --> Saturated: concurrency cap exceeded<br/>src/modules/router/middlewares.rs:119-135
     Saturated --> [*]: 503 service at capacity
 
-    PathReceived --> SplitPath: url::split<br/>src/modules/url/mod.rs:73
+    PathReceived --> SplitPath: url::split<br/>src/modules/url/mod.rs:76
     SplitPath --> BadGrammar: malformed path
     BadGrammar --> [*]: 400 Bad Request<br/>src/modules/api/resize.rs:129 (url_parse_error)
 
@@ -241,14 +258,14 @@ stateDiagram-v2
     Fetching --> SsrfBlocked: scheme/allowlist/IP-range<br/>rejected, src/services/image/source_guard.rs
     SsrfBlocked --> [*]: 400 Bad Request<br/>(SourceRejected downcast,<br/>src/modules/utils/err.rs:109-115)
 
-    Fetching --> OversizedSource: streamed size exceeds<br/>MAX_IMAGE_SIZE_MB, src/services/image/handler.rs:281-317
+    Fetching --> OversizedSource: streamed size exceeds<br/>MAX_IMAGE_SIZE_MB, src/services/image/handler.rs:291-347
     OversizedSource --> [*]: 400 Bad Request<br/>("too large", src/modules/utils/err.rs:120-124)
 
     Fetching --> Decoding: source fetched
-    Decoding --> OverResolutionSource: header-only dimension check<br/>fails MAX_SRC_RESOLUTION_MP,<br/>src/services/image/handler.rs:2669-2682
+    Decoding --> OverResolutionSource: header-only dimension check<br/>fails MAX_SRC_RESOLUTION_MP,<br/>src/services/image/handler.rs:617-618,3007-3024
     OverResolutionSource --> [*]: 400 Bad Request<br/>("too large", src/modules/utils/err.rs:120-124)
 
-    Decoding --> Processing: spawn_blocking decode/resize/encode<br/>src/services/image/handler.rs:407,622
+    Decoding --> Processing: spawn_blocking decode/resize/encode<br/>src/services/image/handler.rs:438,620-621
     Processing --> Uploading: upload_image_with_ttl<br/>src/services/resize/handler.rs:281
     Uploading --> Delivered: 301 redirect to storage
     Delivered --> [*]

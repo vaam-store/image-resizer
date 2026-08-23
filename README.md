@@ -73,11 +73,18 @@ Never a redirect back to the caller-supplied source ([GH #25](https://github.com
 - **Resize**: [`fast_image_resize`](https://docs.rs/fast_image_resize) (SIMD), not the `image` crate's own resize kernel — roughly 5x faster on a downscale (`resize_fir/downscale lanczos3`: 3.43ms vs. the `image`-crate kernel's 17ms; see [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md)).
 - **JPEG decode**: [`mozjpeg`](https://docs.rs/mozjpeg)/libjpeg-turbo, with DCT-scaled decode at 1/2, 1/4, or 1/8 resolution when the requested output is a ≥2x downscale, falling back to a full-size mozjpeg decode otherwise.
 - **JPEG encode**: `mozjpeg` at the `JCP_FASTEST` profile by default — smaller and faster than the old `image`-crate encoder on every axis measured. Explicitly-requested progressive output (`jpgo:1:...`) gets the full `JCP_MAX_COMPRESSION` profile instead, since that cost (~19x baseline) is opt-in only.
-- **WebP**: the [`webp`](https://docs.rs/webp) crate — real libwebp, lossy and lossless, plus animated WebP via `AnimEncoder`.
-- **AVIF**: encode only, via the `image` crate's `AvifEncoder`.
+- **WebP encode**: the [`webp`](https://docs.rs/webp) crate — real libwebp, lossy and lossless, plus animated WebP via `AnimEncoder`.
+- **WebP decode**: real `libwebp` via FFI, not the `image` crate's pure-Rust `image-webp` decoder — falls back to it only if the libwebp path fails.
+- **AVIF encode and decode**: both directions via [`libavif`](src/services/image/avif_codec.rs) — AOM for encode, dav1d for decode. AVIF is now a supported *source* format, not just an output one; it used to be rejected outright. This replaced the pure-Rust `ravif`/`rav1e` encoder this service previously shipped.
 - **PNG / GIF**: the `image` crate.
 
-See [ADR 0001](adr/0001-image-engine.md) (engine choice), [ADR 0003](adr/0003-webp-measurement.md) (WebP byte-size, re-measured), and [ADR 0004](adr/0004-avif-measurement.md) (AVIF byte-size/encode-time, measured) for the reasoning and data behind these choices.
+**All four native codec libraries (mozjpeg, libwebp, libavif, AOM/dav1d) are compiled from source and statically linked** — the runtime container ships no codec `.so` files.
+
+**HEIC is not supported** — neither as a source nor as an output format.
+
+**Metadata (EXIF) is stripped from output by default** (`sm:` option, [GH #5](https://github.com/vaam-store/image-resizer/issues/5)) — a privacy-motivated default, not an accident of a format lacking a metadata-write path. A caller who wants EXIF preserved opts in with `sm:0`.
+
+See [ADR 0001](adr/0001-image-engine.md) (engine choice), [ADR 0003](adr/0003-webp-measurement.md) (WebP byte-size, re-measured) for the reasoning and data behind these choices.
 
 ## Storage backends
 
@@ -146,39 +153,34 @@ Full grammar and every response code: [API reference](docs/user-guide/api-refere
 
 ## Performance
 
-**Cold cache** (per delivered image, medians of 3 runs, imgproxy v4.0.13, darwin/arm64 — see [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md)):
+**Cold cache** (per delivered image, imgproxy v4.0.13, three-way `bench-imgproxy/` harness — see [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md) for every run, backend, and `FORMATS` configuration this is drawn from):
 
-| Engine | p50 | images/s |
-|---|---:|---:|
-| imgproxy | 20.50 ms | 64.51 |
-| emgr (local_fs) | 66.82 ms | 23.56 |
+**emgr is roughly 3.48x slower on p50 and delivers roughly 2.86x less throughput than imgproxy on a cold cache.** This project does not claim parity with imgproxy on raw processing speed, and this README will not pretend otherwise. The exact ratio moves with storage backend (`local_fs` vs `s3`) and which output formats are in play, but the gap has consistently been in the 3x-4x (p50) / ~2.6x-2.9x (throughput) range across every measured configuration.
 
-**emgr is 3.26x slower on p50 and delivers 2.74x less throughput than imgproxy on a cold cache.** This project does not claim parity with imgproxy on raw processing speed, and this README will not pretend otherwise.
+**Warm cache** (repeat request for an already-processed image): **emgr ~0.39 ms vs. imgproxy ~21 ms.**
 
-**Warm cache**, same run set:
+**This is not a processing-speed win — it's a different architecture, and the warm number must never be read as one.** imgproxy has no result cache at all and reprocesses every request from scratch; a production imgproxy deployment normally sits behind a CDN to absorb repeat requests. emgr instead redirects a repeat request straight to its own storage-backed cache before the pipeline ever runs. The cold cost and the warm win are **the same trade-off** seen from two sides: emgr's request path is process → write to storage → `301` → client re-fetches from storage, which is exactly why a cache miss costs an extra round trip (cold) and why a cache hit is nearly free (warm). You cannot remove one without losing the other. Which number matters more depends on your cache-hit rate in production — a number these benchmarks don't measure for you.
 
-| Engine | p50 | images/s |
-|---|---:|---:|
-| imgproxy | 20.10 ms | 64.94 |
-| emgr (local_fs) | 0.39 ms | 4852 |
-
-This is not a processing-speed win — it's a different architecture. imgproxy has no result cache and reprocesses every request; a production imgproxy deployment normally sits behind a CDN to absorb repeat requests. emgr instead redirects a repeat request straight to its own storage-backed cache before the pipeline ever runs. The cold cost and the warm win are **the same trade-off** seen from two sides: emgr's request path is process → write to storage → `301` → client re-fetches from storage, which is exactly why a cache miss costs an extra round trip (cold) and why a cache hit is nearly free (warm). You cannot remove one without losing the other. Which number matters more depends on your cache-hit rate in production — a number these benchmarks don't measure for you.
-
-Micro-benchmarks (single-operation, criterion, darwin/arm64):
+Micro-benchmarks (single-operation, criterion, darwin/arm64, synthetic fixture — see [Testing](docs/development/testing.md#two-fixture-kinds-synthetic-and-photo) for why real photographs measure differently, often faster, for the same operation):
 
 | Operation | Time |
 |---|---:|
-| JPEG decode, 1920x1080 | 7.20 ms |
-| JPEG encode (baseline) | 933 µs |
-| JPEG encode (progressive) | 17.81 ms |
-| PNG encode | 1.71 ms |
-| WebP encode | 24.26 ms |
+| JPEG decode, 1920x1080 | 7.32 ms |
+| JPEG encode (baseline) | 930 µs |
+| JPEG encode (progressive) | 17.58 ms |
+| PNG encode (production path: `CompressionType::Best`) | 98.93 ms |
+| WebP encode | 23.66 ms |
+| WebP decode, 1920x1080 (libwebp) | 32.27 ms |
+| AVIF encode (`DEFAULT_AVIF_SPEED = 6`) | 65.89 ms |
+| AVIF decode, 1920x1080 (dav1d) | 55.13 ms |
 | Resize, downscale, Lanczos3 (`fast_image_resize`) | 3.43 ms |
 | Resize, downscale, Triangle→Bilinear (`fast_image_resize`) | 1.15 ms |
-| Full pipeline, photo → thumbnail JPEG | 6.17 ms |
-| Full pipeline, 4K photo → large downscale | 19.65 ms |
+| Full pipeline, photo → thumbnail JPEG | 6.15 ms |
+| Full pipeline, 4K photo → large downscale | 19.59 ms |
 
-Full methodology, every measured number, and the traps that produced misleading intermediate readings along the way (encoder-profile defaults, redirect-blended metrics, DCT-scale thresholds) are in [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md), the mechanism-level writeup in [`PERFORMANCE_OPTIMIZATIONS.md`](PERFORMANCE_OPTIMIZATIONS.md), the tunable knobs in [`docs/configuration/performance.md`](docs/configuration/performance.md), and the end-to-end harness itself in [`bench-imgproxy/README.md`](bench-imgproxy/README.md).
+PNG's number above is the one that used to read as 1.71 ms in this table — that measured the `image` crate's default `CompressionType::Fast`, which production never uses; `encode_single_image` builds an explicit `CompressionType::Best` encoder, ~56x more expensive on this fixture. See `.bench-baseline/BASELINE.md`'s "PNG encode correction" section for the full story.
+
+Full methodology, every measured number, and the traps that produced misleading intermediate readings along the way (encoder-profile defaults, redirect-blended metrics, DCT-scale thresholds, the PNG compression-level trap above) are in [`.bench-baseline/BASELINE.md`](.bench-baseline/BASELINE.md), the mechanism-level writeup in [`PERFORMANCE_OPTIMIZATIONS.md`](PERFORMANCE_OPTIMIZATIONS.md), the tunable knobs in [`docs/configuration/performance.md`](docs/configuration/performance.md), and the end-to-end harness itself in [`bench-imgproxy/README.md`](bench-imgproxy/README.md).
 
 ## Observability
 
