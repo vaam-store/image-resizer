@@ -9,15 +9,13 @@
 /// `.{extension}` (`crate::modules::url::source`), not a query parameter.
 ///
 /// #49 adds three variants on top of the original `{Jpg, Png, Webp}`:
-/// - `Avif` - encode-only. `image`'s AVIF *decoder* lives behind the
-///   separate `avif-native` cargo feature (`dav1d`, a C library) which this
-///   crate does not enable (see `Cargo.lock` - no `dav1d`/`mp4parse`
-///   present); only the pure-Rust `ravif`-backed encoder (the plain `avif`
-///   feature, already on via `image`'s own default features - see
-///   `Cargo.toml`'s `image` dependency, which does not disable
-///   `default-features`) is available. An AVIF *source* URL therefore still
-///   fails to decode - unchanged from before this issue, just now
-///   documented as a deliberate limitation rather than an oversight.
+/// - `Avif` - encode *and* decode, both via `libavif`
+///   (`src/services/image/avif_codec.rs`, #67/#68): AOM for encode
+///   (replacing the pure-Rust `ravif`/`rav1e` encoder this crate shipped
+///   before #68) and dav1d for decode (previously entirely unsupported -
+///   an AVIF *source* URL failed outright). `image`'s own `avif`/
+///   `avif-native` features are not used for either direction any more -
+///   see `Cargo.toml`'s `image`/`libavif-sys` dependency comments.
 /// - `Gif` - decode and encode, including multi-frame animation
 ///   (`ImageService::process_image_blocking_with_limits`,
 ///   `src/services/image/handler.rs`).

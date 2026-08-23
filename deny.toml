@@ -17,12 +17,12 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
-    # `paste` is unmaintained. NOT a vulnerability — an abandoned-crate notice,
-    # no exploitability claim. Reaches us only transitively
-    # (rav1e -> pulp -> paste), so there is no direct action available until
-    # those upstreams migrate. Revisit when rav1e drops it.
-    # Every other advisory present on 2026-08-19 was cleared by `cargo update`.
-    "RUSTSEC-2024-0436",
+    # RUSTSEC-2024-0436 (`paste` unmaintained, reached only transitively via
+    # rav1e -> pulp -> paste) previously ignored here no longer applies:
+    # #67/#68 removed `ravif`/`rav1e` entirely (replaced by `libavif-sys` -
+    # see Cargo.toml's `image`/`libavif-sys` dependency comments), which
+    # also removed `paste` from the dependency graph - `cargo tree -i paste`
+    # now finds nothing. Entry deleted rather than left as dead config.
 
     # RUSTSEC-2026-0258/0098/0099/0104 (h2 empty DATA frames; rustls-webpki
     # name-constraint and CRL-panic issues) were previously ignored here: GH #56
@@ -51,14 +51,6 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
-    # Permissive, OSI-approved, FSF-free. Pulled in transitively via
-    # image -> ravif -> rav1e -> libfuzzer-sys (rav1e's own fuzz harness,
-    # not something this crate calls). `image`'s default features enable
-    # avif support even though Cargo.toml only lists jpeg/png/webp - the
-    # Cargo.toml owner may want `default-features = false` on the `image`
-    # dependency to drop this (and the rest of the avif/rav1e stack)
-    # entirely rather than allow-listing around it.
-    "NCSA",
 
     # mozjpeg / mozjpeg-sys (#63 stage 2), for DCT-scaled JPEG decode. IJG is
     # permissive and OSI-recognised, but UNLIKE every other licence above it

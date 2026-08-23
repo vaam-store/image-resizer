@@ -201,10 +201,21 @@ bounds *queued*, not in-flight, waste.
 - **WebP** goes through the [`webp`](https://docs.rs/webp) crate (real
   libwebp) instead of the `image` crate's lossless-only WebP encoder (#32,
   #60) - lossy and lossless static images via `webp::Encoder`, animated WebP
-  via `webp::AnimEncoder`/`AnimFrame`. See `adr/0001-image-engine.md` and
-  `adr/0003-webp-measurement.md` for why and how this was measured.
-- **AVIF** is encode-only, via `image::codecs::avif::AvifEncoder`. See
-  `adr/0004-avif-measurement.md`.
+  via `webp::AnimEncoder`/`AnimFrame`. **Decode** (#66) also goes through
+  libwebp (`ImageService::libwebp_decode`) instead of `image-webp`'s
+  pure-Rust decoder - measured 2.24x faster median on the Kodak corpus (24
+  real photos), DSSIM delta 0.00000000 (pixel-identical) against the old
+  decoder. See `adr/0001-image-engine.md` and `adr/0003-webp-measurement.md`
+  for why and how the encode side was measured.
+- **AVIF** is now encode *and* decode (#67/#68), via `libavif`
+  (`src/services/image/avif_codec.rs`) - AOM for encode (replacing the
+  pure-Rust `ravif`/`rav1e` encoder `adr/0004-avif-measurement.md` measured)
+  and dav1d for decode (previously unsupported entirely). See that module's
+  own doc comment for the codec/dependency choice and the AVIF encode/decode
+  work's own change report for the re-measured numbers against the old
+  `ravif` baseline - materially different from `adr/0004`'s figures at some
+  AOM speed settings, matched at others; see that report for the full
+  speed/size tradeoff.
 - **Upscale guard, off by default** (#36): a request naming output
   dimensions larger than the source image is capped to the source's
   dimensions per axis unless the request opts in via `enlarge: true`

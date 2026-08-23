@@ -22,9 +22,17 @@ FROM rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a9
 # unconditionally. Without it the amd64 build either fails or silently falls
 # back to scalar C, which would quietly give up most of the 2.2x scaled-decode
 # win this dependency was added for.
+#
+# cmake and meson/ninja-build (#67/#68) are required to build libavif-sys's
+# vendored libavif+AOM (both via cmake, `libavif-sys`/`libaom-sys`'s own
+# build.rs) and dav1d (via meson/ninja, `libdav1d-sys`'s build.rs) from
+# source. pkg-config/perl/python3 (meson's own runtime dependency) are
+# already present in this base image - verified with
+# `docker run --rm <this image> which pkg-config perl python3`, not
+# assumed - so only the three build-system binaries themselves are added.
 # DL3008 (pin apt versions) is ignored repo-wide in .hadolint.yaml.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends nasm \
+  && apt-get install -y --no-install-recommends nasm cmake meson ninja-build \
   && rm -rf /var/lib/apt/lists/*
 
 ENV APP_NAME=emgr
