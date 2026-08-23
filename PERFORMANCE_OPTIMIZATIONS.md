@@ -314,9 +314,10 @@ routing, source fetch, storage round trips, or the redirect hop. The full
 three-way comparison against imgproxy (`bench-imgproxy/`, a k6 harness) is
 also tracked in `.bench-baseline/BASELINE.md`, and is summarized honestly in
 the [README's Performance section](README.md#performance) - emgr is
-measurably slower than imgproxy on a cold cache (3.26x on p50) and
-measurably faster on a warm one (imgproxy has no result cache of its own),
-which is the same architectural trade-off seen from two sides, not two
+measurably slower than imgproxy on a cold cache (~3.48x on p50, ~2.86x less
+throughput) and measurably faster on a warm one (imgproxy has no result
+cache of its own, so that comparison is architectural, not a processing-speed
+win), which is the same architectural trade-off seen from two sides, not two
 independent facts.
 
 No throughput/memory/CPU-utilization multiplier is claimed anywhere in this

@@ -71,8 +71,10 @@ Implements the imgproxy-compatible signed-URL grammar
   an oracle) and `SignedRequest::parse`/`parse_with_config` (full options+source grammar, presets
   and the processing-option allowlist applied ahead of the plain grammar parse).
 - **`options.rs`** — `ProcessingOptions`, parsing `/`-delimited `code:arg1:arg2` segments (`rs`,
-  `q`, `bl`, `g`, `el`, `fq`, `webpo`, crop/gravity, rotate/flip/trim/extend/padding/zoom/dpr/
-  min-width/min-height, watermark, preset references).
+  `q`, `bl`, `g`, `el`, `bg`, `ar`, `sm` (strip-metadata, default `true` — issue #5), `fq`, `webpo`,
+  `jpgo`/`mb` (JPEG progressive/chroma-subsampling tuning and max-bytes search — issue #76),
+  crop/gravity, rotate/flip/trim/extend/padding/zoom/dpr/min-width/min-height, watermark, preset
+  references).
 - **`presets.rs`** — `PresetRegistry` (parses the `PRESETS` env var: named, reusable option-segment
   lists, imgproxy-compatible; a preset named `default` is auto-prepended to every request) and
   `AllowedOptions` (parses `ALLOWED_PROCESSING_OPTIONS`, an allowlist of which option codes a
@@ -132,11 +134,26 @@ path, and the decode/resize/encode pipeline:
   (decompression-bomb guard) before any full decode; EXIF autorotate, trim, and explicit crop are
   applied in that order (matching imgproxy's own pipeline ordering) before the actual resize;
   animated GIF/WebP sources are detected and routed to `encode_animation` separately.
-- `decode_with_limits`/`decode_jpeg_scaled` — mozjpeg-first JPEG decode (DCT-scaled when a resize
-  makes a smaller decode safe), falling back to the `image`-crate decoder (`decode_with_image_crate`,
-  also the only path for PNG/WebP) on any mozjpeg failure.
+- `decode_with_limits` — dispatches by source format, each with a fallback to the plain
+  `image`-crate decoder (`decode_with_image_crate`) on failure:
+  - **JPEG** — `decode_jpeg_scaled` (mozjpeg/libjpeg-turbo, DCT-scaled when a resize makes a smaller
+    decode safe, full-size otherwise; issue #67).
+  - **WebP** — `decode_webp_libwebp` (real libwebp via FFI, issue #66) — replaces the `image`
+    crate's pure-Rust `image-webp` decoder.
+  - **AVIF** — `avif_codec::decode` (`libavif`/dav1d, issue #67/#68) — the first release where AVIF
+    is accepted as a *source* format at all; previously any `.avif` source was rejected outright.
+  - **PNG/GIF** — always `decode_with_image_crate` (the `image` crate's own decoders); untouched by
+    the above.
 - `encode_with_max_bytes` — binary-searches JPEG quality down until encoded output fits a
   requested `max_bytes` budget (issue #76), bounded to a fixed number of extra encode attempts.
+
+### `image/avif_codec.rs`
+
+AVIF encode and decode via `libavif`, both directions (issue #67/#68): `encode` (AOM backend,
+`DEFAULT_AVIF_SPEED = 6`) and `decode`/`peek_dimensions` (dav1d backend, the latter re-running the
+same megapixel-overflow-checked resolution guard `ImageService::check_source_resolution` does, as
+defense in depth around `libavif`'s own header parse). Replaces the pure-Rust `ravif`/`rav1e`
+encoder and adds AVIF source decode, which this service previously had no path for at all.
 
 ### `image/source_guard.rs`
 
@@ -149,9 +166,10 @@ model this covers and why redirect revalidation and DNS pinning are both necessa
 ### `cache/handler.rs` — `CacheService`
 
 `generate_key(params)` — the SHA-256, length-prefixed, versioned cache key described in
-`overview.md`'s "Cache key design". `CACHE_KEY_VERSION` is currently `9`; its doc comment on this
-file is the authoritative history of what each version bump added and, in one case (issue #67),
-why a bump was deliberately *not* taken.
+`overview.md`'s "Cache key design". `CACHE_KEY_VERSION` is currently `11`; its doc comment on this
+file is the authoritative history of what each version bump added — including v10 (metadata-strip
+default, issue #5), v11 (the AVIF encoder cutover to `libavif`/AOM) — and, in one case (issue #67's
+WebP decoder swap to libwebp), why a bump was deliberately *not* taken.
 
 ### `storage/`
 
