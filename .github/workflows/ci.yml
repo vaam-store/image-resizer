@@ -114,6 +114,21 @@ jobs:
       # `helm dependency build` (not `update`) - both charts commit a
       # Chart.lock, so this resolves exactly the pinned `common` library
       # version rather than re-resolving against whatever is newest.
+      # `helm dependency build` resolves `Chart.yaml`'s dependencies against
+      # repositories the running machine already knows about. A developer's
+      # laptop usually has them from earlier work, so this step passes
+      # locally and fails on a clean runner with "no repository definition
+      # for ...". Adding the repo explicitly is what makes the job
+      # reproducible rather than dependent on ambient local state - which is
+      # the entire point of adding it to CI.
+      #
+      # helm/serverless's `common` comes from an OCI registry, which needs no
+      # `helm repo add`; only helm/emgr's bjw-s-labs repository does.
+      - name: helm repo add
+        run: |
+          helm repo add bjw-s-labs https://bjw-s-labs.github.io/helm-charts
+          helm repo update
+
       - name: helm dependency build
         run: |
           helm dependency build ./helm/emgr
