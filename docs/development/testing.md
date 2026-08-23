@@ -65,7 +65,6 @@ public API rather than internals:
 | `tests/storage_local_fs_atomicity.rs` | GH #38 - non-atomic local_fs writes and directories mis-treated as cache hits, through `StorageService` on a real temp directory. |
 | `tests/storage_s3_handler.rs` | The S3/MinIO backend (`src/services/storage/s3_handler.rs`), previously untested: `upload_image_with_ttl`, `check_cache`, `get_image`, `delete`, and the S3 error-mapping contract, against an in-process fake-S3 HTTP server driving a real `aws_sdk_s3::Client` (not a trait-level double - see the file's own module doc for why). |
 | `tests/fixtures_smoke.rs` | The deterministic fixture image generator shared with the criterion benches (`benches/fixtures.rs` - imported via `#[path = "../benches/fixtures.rs"]`) and the `benchmark` load-test bin: confirms fixtures decode and are byte-identical across runs. |
-| `tests/dssim_harness.rs` | A throwaway, `#[ignore]`d manual-verification harness for #63 stage 2 (mozjpeg DCT-scaled decode) - dumps pipeline output for the real photo corpus to a path named by `DSSIM_OUT`, for offline `dssim` comparison. Its own header comment says "delete before merging"; it is not part of the regular suite (`cargo test` skips `#[ignore]`d tests by default) and not a pattern to follow for new tests. |
 
 Rather than mocking storage/network dependencies, these tests spin up
 real backends against real temp directories (`local_fs`) or a real
