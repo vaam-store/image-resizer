@@ -124,7 +124,7 @@ serde_json = "1"
 
 opentelemetry = { version = "0.29", optional = true }
 opentelemetry-otlp = { version = "0.29", optional = true, features = ["tokio", "metrics", "trace", "grpc-tonic", "gzip-tonic"] }
-opentelemetry_sdk = { version = "0.29", optional = true, features = ["tokio", "metrics", "rt-tokio", "trace"] }
+opentelemetry_sdk = { version = "0.30", optional = true, features = ["tokio", "metrics", "rt-tokio", "trace"] }
 opentelemetry-prometheus = { version = "0.29", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "fmt"] }
 tracing-opentelemetry = { version = "0.30", optional = true }
