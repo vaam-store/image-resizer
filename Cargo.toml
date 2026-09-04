@@ -135,7 +135,7 @@ tower_governor = "0.8"
 webp = "0.3"
 hmac = "0.12"
 subtle = "2.6"
-base64 = "0.22"
+base64 = "0.23"
 fast_image_resize = { version = "6.1", features = ["image"] }
 mozjpeg = "0.10"
 
