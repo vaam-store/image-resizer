@@ -140,7 +140,7 @@ fast_image_resize = { version = "6.1", features = ["image"] }
 mozjpeg = "0.10"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [profile.prod]
 inherits = "release"
