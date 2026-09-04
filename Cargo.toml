@@ -133,7 +133,7 @@ prometheus = { version = "0.14", optional = true }
 dashmap = "6"
 tower_governor = "0.8"
 webp = "0.3"
-hmac = "0.12"
+hmac = "0.13"
 subtle = "2.6"
 base64 = "0.22"
 fast_image_resize = { version = "6.1", features = ["image"] }
