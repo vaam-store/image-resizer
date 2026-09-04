@@ -61,7 +61,7 @@ tower-http = { version = "0.6", features = ["compression-full", "cors"] }
 
 tokio = { version = "1", features = ["full"] }
 
-reqwest = { version = "0.12", features = ["json", "stream", "http2", "gzip"] } # Optimized HTTP client
+reqwest = { version = "0.13", features = ["json", "stream", "http2", "gzip"] } # Optimized HTTP client
 # default-features = false (#67/#68): `image`'s own `default` feature set
 # pulls in `default-formats`, which includes `avif` (ravif/rav1e) among
 # many formats this crate never uses (bmp/dds/exr/ff/hdr/ico/pnm/qoi/tga/
