@@ -1302,7 +1302,7 @@ dependencies = [
  "mimalloc",
  "mozjpeg",
  "num_cpus",
- "opentelemetry 0.29.1",
+ "opentelemetry 0.30.0",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
  "opentelemetry_sdk 0.29.0",
