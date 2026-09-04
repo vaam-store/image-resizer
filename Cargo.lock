@@ -650,17 +650,14 @@ dependencies = [
 
 [[package]]
 name = "axum-otel-metrics"
-version = "0.11.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbac42c74b691b2a03a2ddece369c85c2b9ca90fc9109798f41038da7ac9f8fd"
+checksum = "d0d74d40b1ff9bd3e8f782aa6798d22ff6a7d1b53049e0e239f5332dab2dd83d"
 dependencies = [
  "axum",
- "futures-util",
- "http 1.5.0",
  "http-body 1.1.0",
- "opentelemetry 0.29.1",
+ "opentelemetry 0.32.0",
  "opentelemetry-semantic-conventions",
- "opentelemetry_sdk 0.29.0",
  "pin-project-lite",
  "tower 0.5.3",
 ]
@@ -2516,6 +2513,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "js-sys",
+]
+
+[[package]]
 name = "opentelemetry-http"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2576,9 +2582,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.29.0"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84b29a9f89f1a954936d5aa92f19b2feec3c8f3971d3e96206640db7f9706ae3"
+checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
 
 [[package]]
 name = "opentelemetry_sdk"
